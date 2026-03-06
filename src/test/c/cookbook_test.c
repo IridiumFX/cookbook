@@ -4,6 +4,9 @@
 #include "cookbook_db.h"
 #include "cookbook_store.h"
 #include "cookbook_semver.h"
+#include "cookbook_sha256.h"
+#include "cookbook_auth.h"
+#include <sodium.h>
 
 static int tests_run    = 0;
 static int tests_failed = 0;
@@ -155,6 +158,262 @@ static void test_store_not_found(void) {
     store->close(store);
 }
 
+/* ---- parameterized query tests ---- */
+
+static void test_db_parameterized_exec(void) {
+    cookbook_db *db = cookbook_db_open_sqlite(NULL);
+    cookbook_db_migrate(db);
+
+    cookbook_db_param params[] = {
+        COOKBOOK_P_TEXT("org.test"),
+        COOKBOOK_P_TEXT("tester")
+    };
+    cookbook_db_status st = db->exec_p(db,
+        "INSERT INTO groups (group_id, owner_sub) VALUES (?1, ?2)",
+        params, 2);
+    ASSERT(st == COOKBOOK_DB_OK, "parameterized insert group");
+
+    /* verify it was inserted */
+    int count = 0;
+    cookbook_db_param qp[] = { COOKBOOK_P_TEXT("org.test") };
+    st = db->query_p(db,
+        "SELECT group_id FROM groups WHERE group_id = ?1",
+        qp, 1, count_cb, &count);
+    ASSERT(st == COOKBOOK_DB_OK, "parameterized query group");
+    ASSERT(count == 1, "found parameterized group");
+
+    /* test constraint violation via parameterized */
+    st = db->exec_p(db,
+        "INSERT INTO groups (group_id, owner_sub) VALUES (?1, ?2)",
+        params, 2);
+    ASSERT(st == COOKBOOK_DB_CONSTRAINT, "parameterized duplicate rejected");
+
+    db->close(db);
+}
+
+static void test_db_parameterized_artifact(void) {
+    cookbook_db *db = cookbook_db_open_sqlite(NULL);
+    cookbook_db_migrate(db);
+
+    cookbook_db_param gp[] = {
+        COOKBOOK_P_TEXT("org.acme"),
+        COOKBOOK_P_TEXT("alice")
+    };
+    db->exec_p(db,
+        "INSERT INTO groups (group_id, owner_sub) VALUES (?1, ?2)",
+        gp, 2);
+
+    cookbook_db_param ap[] = {
+        COOKBOOK_P_TEXT("org.acme:core:1.0.0:noarch"),
+        COOKBOOK_P_TEXT("org.acme"),
+        COOKBOOK_P_TEXT("core"),
+        COOKBOOK_P_TEXT("1.0.0"),
+        COOKBOOK_P_TEXT("noarch"),
+        COOKBOOK_P_TEXT("abcdef1234567890"),
+        COOKBOOK_P_INT(0),
+        COOKBOOK_P_TEXT("published"),
+        COOKBOOK_P_INT(1024)
+    };
+    cookbook_db_status st = db->exec_p(db,
+        "INSERT INTO artifacts "
+        "(coord_id, group_id, artifact, version, triple, sha256, "
+        " snapshot, status, size_bytes) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        ap, 9);
+    ASSERT(st == COOKBOOK_DB_OK, "parameterized insert artifact");
+
+    int count = 0;
+    cookbook_db_param qp[] = { COOKBOOK_P_TEXT("org.acme") };
+    st = db->query_p(db,
+        "SELECT coord_id FROM artifacts WHERE group_id = ?1",
+        qp, 1, count_cb, &count);
+    ASSERT(st == COOKBOOK_DB_OK, "parameterized query artifacts");
+    ASSERT(count == 1, "found parameterized artifact");
+
+    db->close(db);
+}
+
+/* ---- SHA-256 tests ---- */
+
+static void test_sha256_empty(void) {
+    char hex[65];
+    cookbook_sha256_hex("", 0, hex);
+    ASSERT(strcmp(hex,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") == 0,
+        "SHA-256 of empty string");
+}
+
+static void test_sha256_abc(void) {
+    char hex[65];
+    cookbook_sha256_hex("abc", 3, hex);
+    ASSERT(strcmp(hex,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") == 0,
+        "SHA-256 of 'abc'");
+}
+
+static void test_sha256_long(void) {
+    /* "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq" */
+    const char *msg =
+        "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    char hex[65];
+    cookbook_sha256_hex(msg, strlen(msg), hex);
+    ASSERT(strcmp(hex,
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1") == 0,
+        "SHA-256 of NIST test vector");
+}
+
+/* ---- auth tests ---- */
+
+static void test_base64url_roundtrip(void) {
+    const char *input = "hello world";
+    char encoded[64];
+    size_t elen = cookbook_base64url_encode(input, strlen(input),
+                                            encoded, sizeof(encoded));
+    ASSERT(elen > 0, "base64url encode non-empty");
+    ASSERT(strcmp(encoded, "aGVsbG8gd29ybGQ") == 0, "base64url encode correct");
+
+    char decoded[64];
+    size_t dlen = cookbook_base64url_decode(encoded, elen, decoded, sizeof(decoded));
+    ASSERT(dlen == strlen(input), "base64url decode length");
+    ASSERT(memcmp(decoded, input, dlen) == 0, "base64url roundtrip");
+}
+
+static void test_jwt_create_verify(void) {
+    if (sodium_init() < -1) return;
+
+    unsigned char pk[32], sk[64];
+    cookbook_keygen(pk, sk);
+
+    char *token = cookbook_jwt_create("alice", "org.acme,org.beta", 3600, sk);
+    ASSERT(token != NULL, "JWT create succeeds");
+
+    /* verify with correct key */
+    cookbook_jwt_claims claims;
+    int rc = cookbook_jwt_verify(token, pk, &claims);
+    ASSERT(rc == 0, "JWT verify succeeds");
+    ASSERT(claims.valid == 1, "JWT claims valid");
+    ASSERT(strcmp(claims.sub, "alice") == 0, "JWT sub=alice");
+    ASSERT(strstr(claims.groups, "org.acme") != NULL, "JWT has org.acme group");
+    ASSERT(claims.exp > 0, "JWT has expiry");
+
+    /* group check */
+    ASSERT(cookbook_jwt_has_group(&claims, "org.acme") == 1,
+           "JWT has_group org.acme");
+    ASSERT(cookbook_jwt_has_group(&claims, "org.beta") == 1,
+           "JWT has_group org.beta");
+    ASSERT(cookbook_jwt_has_group(&claims, "org.gamma") == 0,
+           "JWT !has_group org.gamma");
+
+    /* verify with wrong key should fail */
+    unsigned char pk2[32], sk2[64];
+    cookbook_keygen(pk2, sk2);
+    cookbook_jwt_claims claims2;
+    rc = cookbook_jwt_verify(token, pk2, &claims2);
+    ASSERT(rc != 0, "JWT verify with wrong key fails");
+
+    free(token);
+}
+
+static void test_ed25519_sign_verify(void) {
+    if (sodium_init() < -1) return;
+
+    unsigned char pk[32], sk[64];
+    cookbook_keygen(pk, sk);
+
+    const char *msg = "test message for signing";
+    unsigned char sig[64];
+    ASSERT(cookbook_sign(msg, strlen(msg), sig, sk) == 0, "Ed25519 sign");
+    ASSERT(cookbook_verify(msg, strlen(msg), sig, pk) == 0, "Ed25519 verify");
+
+    /* tamper with signature */
+    sig[0] ^= 0xff;
+    ASSERT(cookbook_verify(msg, strlen(msg), sig, pk) != 0,
+           "Ed25519 verify tampered fails");
+}
+
+/* ---- mirror manifest / metrics integration tests ---- */
+
+/* These test the server's mirror manifest and metrics endpoints via
+   the server handler functions (which we can't call directly from here
+   since they require civetweb). Instead, we test the underlying data
+   queries that power them. */
+
+static int mirror_count_cb(const cookbook_db_row *row, void *ctx) {
+    int *count = (int *)ctx;
+    (*count)++;
+    return 0;
+}
+
+static void test_mirror_query(void) {
+    cookbook_db *db = cookbook_db_open_sqlite(NULL);
+    cookbook_db_migrate(db);
+
+    /* insert test data */
+    db->exec(db,
+        "INSERT INTO groups (group_id, owner_sub) "
+        "VALUES ('org.acme', 'alice')");
+
+    cookbook_db_param ap1[] = {
+        COOKBOOK_P_TEXT("org.acme:core:1.0.0:noarch"),
+        COOKBOOK_P_TEXT("org.acme"),
+        COOKBOOK_P_TEXT("core"),
+        COOKBOOK_P_TEXT("1.0.0"),
+        COOKBOOK_P_TEXT("noarch"),
+        COOKBOOK_P_TEXT("aabbccdd"),
+        COOKBOOK_P_INT(0),
+        COOKBOOK_P_TEXT("published"),
+        COOKBOOK_P_INT(1024)
+    };
+    db->exec_p(db,
+        "INSERT INTO artifacts "
+        "(coord_id, group_id, artifact, version, triple, sha256, "
+        " snapshot, status, size_bytes) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        ap1, 9);
+
+    cookbook_db_param ap2[] = {
+        COOKBOOK_P_TEXT("org.acme:core:2.0.0:noarch"),
+        COOKBOOK_P_TEXT("org.acme"),
+        COOKBOOK_P_TEXT("core"),
+        COOKBOOK_P_TEXT("2.0.0"),
+        COOKBOOK_P_TEXT("noarch"),
+        COOKBOOK_P_TEXT("eeff0011"),
+        COOKBOOK_P_INT(0),
+        COOKBOOK_P_TEXT("published"),
+        COOKBOOK_P_INT(2048)
+    };
+    db->exec_p(db,
+        "INSERT INTO artifacts "
+        "(coord_id, group_id, artifact, version, triple, sha256, "
+        " snapshot, status, size_bytes) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        ap2, 9);
+
+    /* query all published — should find 2 */
+    int count = 0;
+    db->query(db,
+        "SELECT DISTINCT group_id, artifact, version, triple "
+        "FROM artifacts WHERE status = 'published' AND yanked = 0",
+        mirror_count_cb, &count);
+    ASSERT(count == 2, "mirror manifest finds 2 published artifacts");
+
+    /* query specific coordinate */
+    count = 0;
+    cookbook_db_param qp[] = {
+        COOKBOOK_P_TEXT("org.acme"),
+        COOKBOOK_P_TEXT("core"),
+        COOKBOOK_P_TEXT("1.0.0")
+    };
+    db->query_p(db,
+        "SELECT group_id, artifact, version, triple "
+        "FROM artifacts WHERE group_id = ?1 AND artifact = ?2 "
+        "AND version = ?3 AND status = 'published'",
+        qp, 3, mirror_count_cb, &count);
+    ASSERT(count == 1, "mirror manifest finds specific version");
+
+    db->close(db);
+}
+
 /* ---- semver tests ---- */
 
 static void test_semver_parse(void) {
@@ -278,6 +537,15 @@ int main(void) {
     test_db_artifacts_crud();
     test_store_put_get();
     test_store_not_found();
+    test_db_parameterized_exec();
+    test_db_parameterized_artifact();
+    test_sha256_empty();
+    test_sha256_abc();
+    test_sha256_long();
+    test_base64url_roundtrip();
+    test_jwt_create_verify();
+    test_ed25519_sign_verify();
+    test_mirror_query();
     test_semver_parse();
     test_semver_compare();
     test_range_caret();

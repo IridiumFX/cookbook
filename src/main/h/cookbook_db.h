@@ -22,10 +22,36 @@ typedef enum {
     COOKBOOK_DB_NOT_FOUND
 } cookbook_db_status;
 
+/* Parameter binding for parameterized queries. */
+typedef enum {
+    COOKBOOK_DB_PARAM_TEXT,
+    COOKBOOK_DB_PARAM_INT,
+    COOKBOOK_DB_PARAM_NULL
+} cookbook_db_param_type;
+
+typedef struct {
+    cookbook_db_param_type type;
+    const char           *text;
+    int64_t               integer;
+} cookbook_db_param;
+
+#define COOKBOOK_P_TEXT(s)  ((cookbook_db_param){COOKBOOK_DB_PARAM_TEXT, (s), 0})
+#define COOKBOOK_P_INT(i)  ((cookbook_db_param){COOKBOOK_DB_PARAM_INT, NULL, (i)})
+#define COOKBOOK_P_NULL()  ((cookbook_db_param){COOKBOOK_DB_PARAM_NULL, NULL, 0})
+
 struct cookbook_db {
+    /* Raw SQL (for DDL, migrations only — NOT for user-supplied data). */
     cookbook_db_status (*exec)(cookbook_db *db, const char *sql);
     cookbook_db_status (*query)(cookbook_db *db, const char *sql,
                                cookbook_db_row_cb cb, void *ctx);
+
+    /* Parameterized queries — use these for all data operations. */
+    cookbook_db_status (*exec_p)(cookbook_db *db, const char *sql,
+                                const cookbook_db_param *params, int nparams);
+    cookbook_db_status (*query_p)(cookbook_db *db, const char *sql,
+                                 const cookbook_db_param *params, int nparams,
+                                 cookbook_db_row_cb cb, void *ctx);
+
     void              (*close)(cookbook_db *db);
 };
 

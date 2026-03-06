@@ -12,6 +12,12 @@ typedef struct {
     const char     *registry_id;   /* e.g. "central" */
     cookbook_db     *db;
     cookbook_store  *store;
+    int             max_upload_mb;        /* 0 = unlimited */
+    int             pending_timeout_sec;  /* stale pending cleanup; 0 = 3600 */
+    int             jwt_ttl_sec;          /* JWT lifetime; 0 = 3600 */
+    int             rate_limit_per_min;   /* per-sub rate limit; 0 = unlimited */
+    const unsigned char *registry_pk;     /* 32-byte Ed25519 public key */
+    const unsigned char *registry_sk;     /* 64-byte Ed25519 secret key */
 } cookbook_server_opts;
 
 /* Create and start the server. Returns NULL on failure. */

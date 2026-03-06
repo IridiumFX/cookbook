@@ -30,6 +30,7 @@ static const char *SCHEMA_SQL =
     "  descriptor_sha256 TEXT,"
     "  signed            INTEGER DEFAULT 0,"
     "  size_bytes        INTEGER,"
+    "  pending_since     TEXT,"
     "  published_at      TEXT,"
     "  published_by      TEXT,"
     "  UNIQUE (group_id, artifact, version, triple)"

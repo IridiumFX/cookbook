@@ -30,6 +30,37 @@ if(NOT WIN32)
     target_link_libraries(sqlite3 PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 endif()
 
+# ---------- vendor: libsodium (ISC) ----------
+
+file(GLOB_RECURSE SODIUM_SOURCES vendor/libsodium/src/libsodium/*.c)
+add_library(sodium STATIC ${SODIUM_SOURCES})
+target_include_directories(sodium PUBLIC
+    vendor/libsodium/src/libsodium/include
+    vendor/libsodium/src/libsodium/include/sodium
+)
+target_include_directories(sodium PRIVATE
+    vendor/libsodium/src/libsodium
+)
+target_compile_definitions(sodium PRIVATE
+    SODIUM_STATIC=1
+    CONFIGURED=1
+    DEV_MODE=0
+    HAVE_C_VARARRAYS=1
+    HAVE_CATCHABLE_SEGV=1
+    HAVE_INLINE_ASM=1
+    HAVE_TI_MODE=1
+    HAVE_PTHREAD=1
+)
+if(WIN32)
+    target_compile_definitions(sodium PRIVATE HAVE_RAISE=1)
+    target_link_libraries(sodium PUBLIC advapi32)
+else()
+    target_compile_definitions(sodium PRIVATE HAVE_POSIX_MEMALIGN=1 HAVE_MMAP=1 HAVE_MPROTECT=1 HAVE_MADVISE=1 HAVE_NANOSLEEP=1)
+    find_package(Threads REQUIRED)
+    target_link_libraries(sodium PUBLIC Threads::Threads)
+endif()
+target_compile_definitions(sodium PUBLIC SODIUM_STATIC=1)
+
 # ---------- vendor: civetweb (MIT) ----------
 
 add_library(civetweb STATIC vendor/civetweb/civetweb.c)
@@ -50,8 +81,9 @@ endif()
 # ---------- library ----------
 
 file(GLOB COOKBOOK_SOURCES src/main/c/*.c)
-# exclude main.c from the library — it belongs to the server executable
+# exclude main.c and cookbook_import.c — they are standalone executables
 list(FILTER COOKBOOK_SOURCES EXCLUDE REGEX ".*main\\.c$")
+list(FILTER COOKBOOK_SOURCES EXCLUDE REGEX ".*cookbook_import\\.c$")
 
 file(GLOB COOKBOOK_HEADERS src/main/h/*.h)
 
@@ -64,7 +96,7 @@ target_include_directories(cookbook
 )
 
 target_compile_definitions(cookbook PRIVATE BUILDING_COOKBOOK)
-target_link_libraries(cookbook PRIVATE sqlite3 civetweb pasta)
+target_link_libraries(cookbook PRIVATE sqlite3 civetweb pasta sodium)
 
 if(NOT BUILD_SHARED_LIBS)
     target_compile_definitions(cookbook PUBLIC COOKBOOK_STATIC)
@@ -73,7 +105,14 @@ endif()
 # ---------- server executable ----------
 
 add_executable(cookbook_server src/main/c/main.c)
-target_link_libraries(cookbook_server PRIVATE cookbook sqlite3 civetweb pasta)
+target_link_libraries(cookbook_server PRIVATE cookbook sqlite3 civetweb pasta sodium)
+
+# ---------- import tool (§A.4) ----------
+
+add_executable(cookbook_import src/main/c/cookbook_import.c)
+if(WIN32)
+    target_link_libraries(cookbook_import PRIVATE ws2_32)
+endif()
 
 # ---------- test ----------
 
@@ -82,7 +121,7 @@ enable_testing()
 file(GLOB COOKBOOK_TEST_SOURCES src/test/c/*.c)
 
 add_executable(cookbook_test ${COOKBOOK_TEST_SOURCES})
-target_link_libraries(cookbook_test PRIVATE cookbook sqlite3 civetweb pasta)
+target_link_libraries(cookbook_test PRIVATE cookbook sqlite3 civetweb pasta sodium)
 
 target_compile_definitions(cookbook_test PRIVATE
     COOKBOOK_TEST_RESOURCES="${CMAKE_CURRENT_SOURCE_DIR}/src/test/resources"
@@ -98,7 +137,7 @@ add_test(NAME cookbook_test COMMAND cookbook_test)
 
 # ---------- install ----------
 
-install(TARGETS cookbook cookbook_server
+install(TARGETS cookbook cookbook_server cookbook_import
     EXPORT cookbookTargets
     LIBRARY  DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE  DESTINATION ${CMAKE_INSTALL_LIBDIR}

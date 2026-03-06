@@ -30,12 +30,13 @@
 | civetweb | 1.16 | MIT | HTTP server |
 | libsodium | 1.0.21 | ISC | Ed25519 signing, JWT, HMAC-SHA256 |
 
-## Planned dependencies (not yet integrated)
+## Optional dependencies (system-provided)
 
-| Dependency | License | Purpose |
-|------------|---------|---------|
-| libcurl | MIT | S3 object store client |
-| libpq | PostgreSQL License | PostgreSQL metadata backend |
+| Dependency | License | Purpose | Status |
+|------------|---------|---------|--------|
+| libpq | PostgreSQL License | PostgreSQL metadata backend | Optional; stub when absent |
+
+*Note: S3 support was implemented without libcurl — uses raw sockets + libsodium HMAC-SHA256 for AWS Signature V4.*
 
 ---
 
@@ -147,10 +148,10 @@
 23. ~~**#16** Registry countersign~~
 24. ~~**#28** Rate limiting~~
 
-### Phase D — Production backends
+### Phase D — Production backends ✓
 
-25. **#21** PostgreSQL backend (requires libpq)
-26. **#22** S3 object store backend (requires libcurl)
+25. ~~**#21** PostgreSQL backend (optional libpq; stub when unavailable)~~
+26. ~~**#22** S3 object store backend (raw sockets + libsodium HMAC-SHA256; no libcurl)~~
 27. ~~**#25** Mirror manifest endpoint~~
 28. ~~**#3** Prometheus metrics~~
 29. ~~**#26** cookbook-import CLI tool~~
@@ -158,3 +159,5 @@
 ### Phase E — Content negotiation (blocked on now spec)
 
 30. **#8** application/x-pasta support (blocked on now spec §23)
+    - Proposal submitted: see `docs/proposal-pasta-content-negotiation.md`
+    - Awaiting decisions on: media type name, JSON mapping rules, canonical serialization, ASCII enforcement

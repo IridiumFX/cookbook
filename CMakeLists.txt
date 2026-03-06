@@ -78,12 +78,30 @@ else()
     target_link_libraries(civetweb PUBLIC Threads::Threads)
 endif()
 
+# ---------- optional: PostgreSQL (libpq) ----------
+
+find_package(PostgreSQL QUIET)
+if(PostgreSQL_FOUND)
+    message(STATUS "PostgreSQL found: ${PostgreSQL_VERSION_STRING}")
+    set(COOKBOOK_HAS_POSTGRES ON)
+else()
+    message(STATUS "PostgreSQL not found — building without PG backend")
+    set(COOKBOOK_HAS_POSTGRES OFF)
+endif()
+
 # ---------- library ----------
 
 file(GLOB COOKBOOK_SOURCES src/main/c/*.c)
 # exclude main.c and cookbook_import.c — they are standalone executables
 list(FILTER COOKBOOK_SOURCES EXCLUDE REGEX ".*main\\.c$")
 list(FILTER COOKBOOK_SOURCES EXCLUDE REGEX ".*cookbook_import\\.c$")
+
+# exclude the PG file that doesn't match current config
+if(COOKBOOK_HAS_POSTGRES)
+    list(FILTER COOKBOOK_SOURCES EXCLUDE REGEX ".*cookbook_db_postgres_stub\\.c$")
+else()
+    list(FILTER COOKBOOK_SOURCES EXCLUDE REGEX ".*cookbook_db_postgres\\.c$")
+endif()
 
 file(GLOB COOKBOOK_HEADERS src/main/h/*.h)
 
@@ -97,6 +115,16 @@ target_include_directories(cookbook
 
 target_compile_definitions(cookbook PRIVATE BUILDING_COOKBOOK)
 target_link_libraries(cookbook PRIVATE sqlite3 civetweb pasta sodium)
+
+if(COOKBOOK_HAS_POSTGRES)
+    target_compile_definitions(cookbook PRIVATE COOKBOOK_HAS_POSTGRES)
+    target_link_libraries(cookbook PRIVATE PostgreSQL::PostgreSQL)
+endif()
+
+# S3 store needs ws2_32 on Windows for sockets
+if(WIN32)
+    target_link_libraries(cookbook PRIVATE ws2_32)
+endif()
 
 if(NOT BUILD_SHARED_LIBS)
     target_compile_definitions(cookbook PUBLIC COOKBOOK_STATIC)

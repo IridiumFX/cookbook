@@ -73,6 +73,12 @@ int main(int argc, char **argv) {
     const char *registry_id = env_or("COOKBOOK_REGISTRY_ID", "central");
     const char *db_url      = env_or("COOKBOOK_DB_URL", NULL);
     const char *storage_dir = env_or("COOKBOOK_STORAGE_DIR", "./data/objects");
+    const char *storage_type = env_or("COOKBOOK_STORAGE_TYPE", "fs");
+    const char *s3_bucket   = env_or("COOKBOOK_S3_BUCKET", NULL);
+    const char *s3_region   = env_or("COOKBOOK_S3_REGION", "us-east-1");
+    const char *s3_access   = env_or("COOKBOOK_S3_ACCESS_KEY", NULL);
+    const char *s3_secret   = env_or("COOKBOOK_S3_SECRET_KEY", NULL);
+    const char *s3_endpoint = env_or("COOKBOOK_S3_ENDPOINT", NULL);
     const char *max_mb_str  = env_or("COOKBOOK_MAX_ARTIFACT_MB", "0");
     int         max_upload_mb = atoi(max_mb_str);
     const char *pending_str = env_or("COOKBOOK_PENDING_TIMEOUT_SEC", "3600");
@@ -111,9 +117,13 @@ int main(int argc, char **argv) {
 
     /* database */
     cookbook_db *db;
-    if (db_url && strstr(db_url, "postgres://")) {
-        fprintf(stderr, "cookbook: PostgreSQL backend not yet implemented\n");
-        return 1;
+    if (db_url && (strstr(db_url, "postgres://") || strstr(db_url, "postgresql://"))) {
+        db = cookbook_db_open_postgres(db_url);
+        if (!db) {
+            fprintf(stderr, "cookbook: failed to connect to PostgreSQL: %s\n", db_url);
+            return 1;
+        }
+        printf("cookbook: database: PostgreSQL\n");
     } else {
         const char *sqlite_path = db_url ? db_url : "cookbook.db";
         db = cookbook_db_open_sqlite(sqlite_path);
@@ -132,13 +142,33 @@ int main(int argc, char **argv) {
     }
 
     /* object store */
-    cookbook_store *store = cookbook_store_open_fs(storage_dir);
-    if (!store) {
-        fprintf(stderr, "cookbook: failed to open storage: %s\n", storage_dir);
-        db->close(db);
-        return 1;
+    cookbook_store *store;
+    if (strcmp(storage_type, "s3") == 0) {
+        if (!s3_bucket || !s3_access || !s3_secret) {
+            fprintf(stderr, "cookbook: S3 storage requires "
+                    "COOKBOOK_S3_BUCKET, COOKBOOK_S3_ACCESS_KEY, "
+                    "COOKBOOK_S3_SECRET_KEY\n");
+            db->close(db);
+            return 1;
+        }
+        store = cookbook_store_open_s3(s3_bucket, s3_region,
+                                       s3_access, s3_secret, s3_endpoint);
+        if (!store) {
+            fprintf(stderr, "cookbook: failed to open S3 storage: %s/%s\n",
+                    s3_endpoint ? s3_endpoint : "s3.amazonaws.com", s3_bucket);
+            db->close(db);
+            return 1;
+        }
+        printf("cookbook: storage: s3://%s (region: %s)\n", s3_bucket, s3_region);
+    } else {
+        store = cookbook_store_open_fs(storage_dir);
+        if (!store) {
+            fprintf(stderr, "cookbook: failed to open storage: %s\n", storage_dir);
+            db->close(db);
+            return 1;
+        }
+        printf("cookbook: storage: %s\n", storage_dir);
     }
-    printf("cookbook: storage: %s\n", storage_dir);
 
     /* build listen URL */
     char listen_url[256];

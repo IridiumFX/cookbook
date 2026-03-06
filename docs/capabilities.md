@@ -2,7 +2,7 @@
 
 **Version**: 0.1.0
 **Last updated**: 2026-03-06
-**Phases complete**: A (Correctness), B (Metadata completeness), C (Auth and signing), D (partial — metrics, mirror, import)
+**Phases complete**: A (Correctness), B (Metadata completeness), C (Auth and signing), D (Production backends)
 
 ---
 
@@ -154,7 +154,7 @@ Returns the registry's Ed25519 public key in hex encoding. Used by clients to ve
 
 ## Data model
 
-### Metadata backend (SQLite)
+### Metadata backends
 
 Full spec section 4.1 schema:
 
@@ -163,17 +163,21 @@ Full spec section 4.1 schema:
 - **artifact_semver**: Parsed semver components (major, minor, patch, pre-release, build metadata) for efficient range queries.
 - **publisher_keys**: Ed25519 public keys registered per publisher subject.
 
-All data operations use parameterized queries (`sqlite3_prepare_v2`) to prevent SQL injection.
+**SQLite** (default): All data operations use parameterized queries (`sqlite3_prepare_v2`) to prevent SQL injection. WAL mode enabled for concurrent reads.
 
-### Object store (filesystem)
+**PostgreSQL** (optional): Full vtable implementation using libpq. Automatically translates `?N` placeholders to PostgreSQL `$N` syntax and `INSERT OR IGNORE` to `INSERT ... ON CONFLICT DO NOTHING`. Enabled when libpq is found at build time; graceful stub when unavailable. Connect via `COOKBOOK_DB_URL=postgres://user:pass@host:5432/dbname`.
 
-Spec section 4.2 layout. Objects stored at:
+### Object store backends
+
+**Filesystem** (default): Spec section 4.2 layout. Objects stored at:
 
 ```
 {COOKBOOK_STORAGE_DIR}/{group}/{artifact}/{version}/{filename}
 ```
 
 Compatible with `now cache --mirror` output. Sidecar files (`.sha256`, `.sig`, `.countersig`, stripped descriptors) are stored alongside their parent artifacts.
+
+**S3-compatible** (optional): Uses AWS Signature V4 over raw sockets with HMAC-SHA256 (libsodium) and SHA-256. No libcurl dependency. Works with AWS S3, MinIO, and other S3-compatible stores. Path-style addressing for custom endpoints; virtual-hosted for AWS. Enable via `COOKBOOK_STORAGE_TYPE=s3` with appropriate `COOKBOOK_S3_*` environment variables.
 
 ### Two-phase write protocol
 
@@ -216,8 +220,14 @@ All configuration is via environment variables:
 |----------|---------|-------------|
 | `COOKBOOK_PORT` | `8080` | HTTP listen port |
 | `COOKBOOK_REGISTRY_ID` | `central` | Registry identifier |
-| `COOKBOOK_DB_URL` | `cookbook.db` | SQLite database path (or future `postgres://` URL) |
-| `COOKBOOK_STORAGE_DIR` | `./data/objects` | Filesystem object store root |
+| `COOKBOOK_DB_URL` | `cookbook.db` | SQLite path, or `postgres://` connection URL |
+| `COOKBOOK_STORAGE_TYPE` | `fs` | Object store backend: `fs` or `s3` |
+| `COOKBOOK_STORAGE_DIR` | `./data/objects` | Filesystem object store root (when type=fs) |
+| `COOKBOOK_S3_BUCKET` | *(none)* | S3 bucket name (when type=s3) |
+| `COOKBOOK_S3_REGION` | `us-east-1` | S3 region |
+| `COOKBOOK_S3_ACCESS_KEY` | *(none)* | S3 access key ID |
+| `COOKBOOK_S3_SECRET_KEY` | *(none)* | S3 secret access key |
+| `COOKBOOK_S3_ENDPOINT` | *(none)* | Custom S3 endpoint (e.g., `minio:9000`) |
 | `COOKBOOK_MAX_ARTIFACT_MB` | `0` (unlimited) | Maximum upload size in MB |
 | `COOKBOOK_PENDING_TIMEOUT_SEC` | `3600` | Stale pending artifact cleanup interval |
 | `COOKBOOK_JWT_TTL_SEC` | `3600` | JWT token lifetime in seconds |
@@ -232,7 +242,7 @@ All configuration is via environment variables:
 - **Build system**: CMake 3.20+ with Ninja
 - **Presets**: `default` (Debug), `release` (Release)
 - **Platforms**: Windows (MinGW), Linux, macOS, FreeBSD
-- **Output**: `libcookbook` shared library + `cookbook_server` executable
+- **Output**: `libcookbook` shared library + `cookbook_server` + `cookbook_import` executables
 
 ### Vendored dependencies
 
@@ -241,13 +251,19 @@ All configuration is via environment variables:
 | libpasta | git submodule | MIT | Pasta descriptor parsing |
 | SQLite | 3.49.1 | Public domain | Metadata backend |
 | civetweb | 1.16 | MIT | HTTP server |
-| libsodium | 1.0.21 | ISC | Ed25519, JWT, HMAC-SHA256 |
+| libsodium | 1.0.21 | ISC | Ed25519, JWT, HMAC-SHA256, S3 Sig V4 |
+
+### Optional system dependencies
+
+| Dependency | License | Purpose |
+|------------|---------|---------|
+| libpq | PostgreSQL License | PostgreSQL metadata backend (auto-detected by CMake) |
 
 ---
 
 ## Test suite
 
-90 tests covering:
+95 tests covering:
 
 - Semver parsing and range evaluation
 - Database operations (raw and parameterized)
@@ -259,6 +275,8 @@ All configuration is via environment variables:
 - JWT create/verify lifecycle
 - Ed25519 sign/verify
 - Mirror manifest data queries
+- S3 store open/close and parameter validation
+- PostgreSQL stub graceful failure
 
 ---
 
@@ -287,8 +305,6 @@ Automatically skips `.sha256` and `.countersig` sidecar files (the registry gene
 
 ---
 
-## Not yet implemented (Phase D remainder and E)
+## Not yet implemented (Phase E)
 
-- PostgreSQL metadata backend (requires libpq)
-- S3 object store backend (requires libcurl)
 - `application/x-pasta` content negotiation (blocked on now spec section 23)

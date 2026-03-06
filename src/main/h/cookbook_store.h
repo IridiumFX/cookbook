@@ -30,4 +30,14 @@ struct cookbook_store {
    NULL or empty root_dir defaults to "./data/objects". */
 COOKBOOK_API cookbook_store *cookbook_store_open_fs(const char *root_dir);
 
+/* S3-compatible backend — uses AWS Signature V4 over raw sockets.
+   Works with AWS S3, MinIO, and other S3-compatible stores.
+   endpoint is optional — NULL defaults to s3.amazonaws.com.
+   For MinIO/custom, pass "host:port" (uses path-style addressing). */
+COOKBOOK_API cookbook_store *cookbook_store_open_s3(const char *bucket,
+                                                    const char *region,
+                                                    const char *access_key,
+                                                    const char *secret_key,
+                                                    const char *endpoint);
+
 #endif /* COOKBOOK_STORE_H */

@@ -57,6 +57,12 @@ struct cookbook_db {
 
 COOKBOOK_API cookbook_db *cookbook_db_open_sqlite(const char *path);
 
+/* PostgreSQL backend — requires libpq.
+   conninfo is a standard libpq connection string, e.g.
+   "postgres://user:pass@host:5432/dbname" or keyword=value pairs.
+   Returns NULL if libpq is not available or connection fails. */
+COOKBOOK_API cookbook_db *cookbook_db_open_postgres(const char *conninfo);
+
 COOKBOOK_API cookbook_db_status cookbook_db_migrate(cookbook_db *db);
 
 #endif /* COOKBOOK_DB_H */

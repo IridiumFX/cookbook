@@ -414,6 +414,42 @@ static void test_mirror_query(void) {
     db->close(db);
 }
 
+/* ---- S3 store open/close (no real server needed) ---- */
+
+static void test_s3_store_open_null(void) {
+    /* missing required params should return NULL */
+    cookbook_store *s;
+    s = cookbook_store_open_s3(NULL, "us-east-1", "key", "secret", NULL);
+    ASSERT(s == NULL, "S3 open with NULL bucket fails");
+    s = cookbook_store_open_s3("bucket", "us-east-1", NULL, "secret", NULL);
+    ASSERT(s == NULL, "S3 open with NULL access_key fails");
+    s = cookbook_store_open_s3("bucket", "us-east-1", "key", NULL, NULL);
+    ASSERT(s == NULL, "S3 open with NULL secret_key fails");
+}
+
+static void test_s3_store_open_close(void) {
+    /* opening with valid params should succeed (doesn't connect yet) */
+    cookbook_store *s = cookbook_store_open_s3("test-bucket", "us-east-1",
+                                              "AKIA_TEST", "secret123",
+                                              "localhost:9000");
+    ASSERT(s != NULL, "S3 open with valid params succeeds");
+    if (s) s->close(s);
+}
+
+/* ---- PostgreSQL stub test ---- */
+
+static void test_postgres_stub(void) {
+    /* when built without libpq, open should return NULL gracefully */
+    cookbook_db *db = cookbook_db_open_postgres("postgres://localhost/test");
+#ifdef COOKBOOK_HAS_POSTGRES
+    /* if PG is available, this would try to connect (and likely fail
+       in test env), so we just skip */
+    if (db) db->close(db);
+#else
+    ASSERT(db == NULL, "PG stub returns NULL when libpq unavailable");
+#endif
+}
+
 /* ---- semver tests ---- */
 
 static void test_semver_parse(void) {
@@ -546,6 +582,9 @@ int main(void) {
     test_jwt_create_verify();
     test_ed25519_sign_verify();
     test_mirror_query();
+    test_s3_store_open_null();
+    test_s3_store_open_close();
+    test_postgres_stub();
     test_semver_parse();
     test_semver_compare();
     test_range_caret();

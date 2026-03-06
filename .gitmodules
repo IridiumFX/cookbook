@@ -1,0 +1,3 @@
+[submodule "vendor/pasta"]
+	path = vendor/pasta
+	url = https://github.com/IridiumFX/Pasta.git

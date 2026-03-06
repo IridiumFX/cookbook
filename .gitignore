@@ -1,0 +1,32 @@
+# Build outputs
+build/
+cmake-build-*/
+
+# IDE
+.idea/
+
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.o
+*.obj
+*.a
+*.lib
+
+# CMake user presets
+CMakeUserPresets.json
+
+# Runtime data
+*.db
+*.db-shm
+*.db-wal
+data/
+
+# Claude Code
+.claude/
+
+# Specs extraction artifacts
+specs/*.md
+specs/*.ps1

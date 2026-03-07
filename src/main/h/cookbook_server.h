@@ -30,4 +30,14 @@ COOKBOOK_API int cookbook_server_poll(cookbook_server *srv, int timeout_ms);
 /* Stop and free the server. */
 COOKBOOK_API void cookbook_server_stop(cookbook_server *srv);
 
+/* #8: content negotiation utilities (exposed for testing) */
+
+/* Validate that input is pure US-ASCII (no byte > 0x7F and no NUL).
+   Returns 0 if valid, or the 1-based offset of the first bad byte. */
+COOKBOOK_API size_t cookbook_validate_ascii(const char *data, size_t len);
+
+/* Serialize a PastaValue tree to JSON. Returns malloc'd string, NULL on error. */
+struct PastaValue;
+COOKBOOK_API char *cookbook_pasta_to_json(const struct PastaValue *v);
+
 #endif /* COOKBOOK_SERVER_H */

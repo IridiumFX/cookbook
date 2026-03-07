@@ -1,8 +1,8 @@
 # cookbook — Current Capabilities
 
 **Version**: 0.1.0
-**Last updated**: 2026-03-06
-**Phases complete**: A (Correctness), B (Metadata completeness), C (Auth and signing), D (Production backends)
+**Last updated**: 2026-03-07
+**Phases complete**: A (Correctness), B (Metadata completeness), C (Auth and signing), D (Production backends), E (Content negotiation)
 
 ---
 
@@ -25,6 +25,12 @@ Resolves a semver range to the best matching published version. Supports:
 
 Snapshot versions are excluded from resolution unless `?snapshot=true` is passed.
 
+Supports content negotiation via `Accept` header:
+- `Accept: application/x-pasta` — returns Pasta format
+- `Accept: application/json` — returns JSON format (default)
+- `Accept: */*` or missing — returns Pasta format
+- `?pretty` query parameter for pretty-printed Pasta output
+
 Returns `200` with the resolved version, or `404` if no match is found.
 
 ### Artifact download
@@ -34,6 +40,14 @@ GET /artifact/{group}/{artifact}/{version}/{filename}
 ```
 
 Serves archive files, descriptors (`now.pasta`), SHA-256 checksums (`.sha256`), signatures (`.sig`), and countersignatures (`.countersig`).
+
+Descriptor files (`now.pasta`) support content negotiation via `Accept` header:
+- `Accept: application/x-pasta` or `application/pasta` — returns canonical Pasta (compact) with `Content-Type: application/x-pasta`
+- `Accept: application/json` — returns JSON representation via recursive `PastaValue` tree walk
+- `Accept: text/plain` — returns Pasta (backwards compatibility)
+- `Accept: */*` or missing — returns Pasta (default)
+- Unsupported types return `406 Not Acceptable`
+- `?pretty` query parameter returns pretty-printed Pasta output
 
 Yanked artifacts are still served but include an `X-Now-Yanked: true` response header.
 
@@ -49,6 +63,7 @@ Stores an artifact file into the object store and registers metadata in the data
 - **Immutability**: Duplicate PUTs to the same coordinate return `409 Conflict`.
 - **Max upload size**: Enforced via `COOKBOOK_MAX_ARTIFACT_MB` (returns `413` if exceeded).
 - **SHA-256 on ingest**: Computes SHA-256 over the uploaded body and stores a `.sha256` sidecar file.
+- **ASCII enforcement**: `now.pasta` uploads are validated at the HTTP layer — bytes > `0x7F` and NUL (`0x00`) are rejected with `400 Bad Request` and a message indicating the byte offset.
 - **Descriptor validation**: If the uploaded file is `now.pasta`, it is parsed and validated:
   - Group, artifact, and version fields must match the URL path.
   - Artifact names must be lowercase alphanumeric with hyphens.
@@ -263,7 +278,7 @@ All configuration is via environment variables:
 
 ## Test suite
 
-95 tests covering:
+219 unit tests covering:
 
 - Semver parsing and range evaluation
 - Database operations (raw and parameterized)
@@ -277,6 +292,17 @@ All configuration is via environment variables:
 - Mirror manifest data queries
 - S3 store open/close and parameter validation
 - PostgreSQL stub graceful failure
+- ASCII validation (valid ASCII, UTF-8 rejection, NUL rejection, offset reporting)
+- Pasta-to-JSON serialization (primitives, nested structures, string escaping, empty containers, numbers, deep nesting)
+- Pasta sorted key output (PASTA_SORTED flag, lexicographic ordering, nested map sorting)
+- Semver edge cases (large versions, 0.0.0, build metadata only, reject malformed)
+- Semver comparison details (equal, minor/patch diff, pre-release ordering, build metadata ignored)
+- Range exact match, ^0.0.x caret, bounded inclusive/exclusive variants
+- DB yank/status transitions, NULL parameter handling, pending→published lifecycle
+- Store overwrite semantics, 64KB large value roundtrip
+- JWT expired token rejection, group boundary matching (no prefix/substring matching)
+- Base64url edge cases (empty, single byte, binary roundtrip with all 256 byte values)
+- ASCII validation boundary bytes (0x7F valid, 0x80 invalid, all printable ASCII)
 
 ---
 
@@ -305,6 +331,29 @@ Automatically skips `.sha256` and `.countersig` sidecar files (the registry gene
 
 ---
 
-## Not yet implemented (Phase E)
+### Stress test driver
 
-- `application/x-pasta` content negotiation (blocked on now spec section 23)
+```
+cookbook_stress [options]
+
+Options:
+  -c, --concurrency <n>   Number of concurrent workers (default: 8)
+  -n, --requests <n>      Total requests per phase (default: 1000)
+  -p, --port <port>       Server port (default: 19080)
+  -q, --quiet             Only print summary
+```
+
+Starts an in-process cookbook server and runs 4 phases of concurrent HTTP requests:
+
+1. **PUBLISH** — PUT unique `now.pasta` descriptors (concurrent writers)
+2. **RESOLVE** — GET `/resolve/` with semver ranges (concurrent readers)
+3. **GET** — fetch published descriptors by coordinate
+4. **CONNEG** — GET descriptors with varying `Accept` headers (pasta, json, text/plain, */*)
+
+Reports throughput (req/s), status code distribution, and latency percentiles (p50/p95/p99/max).
+
+---
+
+## Known limitations
+
+- **IANA registration**: Using `application/x-pasta` as interim media type. Will switch to `application/pasta` after IANA registration (coordinated with Pasta and `now` v1.0).

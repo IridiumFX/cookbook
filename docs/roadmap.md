@@ -156,8 +156,18 @@
 28. ~~**#3** Prometheus metrics~~
 29. ~~**#26** cookbook-import CLI tool~~
 
-### Phase E — Content negotiation (blocked on now spec)
+### Phase E — Content negotiation ✓
 
-30. **#8** application/x-pasta support (blocked on now spec §23)
-    - Proposal submitted: see `docs/proposal-pasta-content-negotiation.md`
-    - Awaiting decisions on: media type name, JSON mapping rules, canonical serialization, ASCII enforcement
+30. ~~**#8** application/x-pasta support~~
+    - Proposal: `docs/proposal-pasta-content-negotiation.md`
+    - Response: `specs/response-pasta-content-negotiation.md`
+    - All 7 decisions from spec response implemented:
+      1. Media type: `application/x-pasta` (accepts `application/pasta` alias)
+      2. Canonical form: compact + sorted keys (`PASTA_COMPACT | PASTA_SORTED`)
+      3. JSON mapping: trivial 1:1 via `pasta_to_json()` (~90 lines)
+      4. Charset: US-ASCII enforced on PUT (reject >0x7F and 0x00 with 400)
+      5. Versioning: in-document `spec-version` field (no media type param)
+      6. Scope: content negotiation on `/resolve/` and `/artifact/.../now.pasta`
+      7. 406 safety: only when Accept present with no supported types
+    - Pretty-print via `?pretty` query parameter
+    - 219 unit tests + stress test driver (4 concurrent phases)

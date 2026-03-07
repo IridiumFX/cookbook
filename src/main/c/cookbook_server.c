@@ -79,6 +79,181 @@ struct cookbook_server {
 #define METRIC_ADD(m,v) __sync_add_and_fetch(&(m), (long)(v))
 #endif
 
+/* ==== #8: content negotiation ==== */
+
+typedef enum {
+    CT_PASTA,   /* application/x-pasta (canonical) */
+    CT_JSON,    /* application/json */
+    CT_UNKNOWN  /* unsupported */
+} content_pref;
+
+/* Parse Accept header and return the preferred content type.
+   Returns CT_PASTA for missing Accept or *\/*. */
+static content_pref parse_accept(const struct mg_request_info *ri) {
+    const char *accept = NULL;
+    for (int i = 0; i < ri->num_headers; i++) {
+        if (strcasecmp(ri->http_headers[i].name, "Accept") == 0) {
+            accept = ri->http_headers[i].value;
+            break;
+        }
+    }
+
+    /* no Accept header → default to Pasta */
+    if (!accept || !*accept) return CT_PASTA;
+
+    /* check for specific types, tracking highest quality value */
+    double q_pasta = -1.0, q_json = -1.0, q_text = -1.0, q_star = -1.0;
+
+    /* simple Accept parser: split on comma, check each media range */
+    char buf[1024];
+    snprintf(buf, sizeof(buf), "%s", accept);
+    char *saveptr = NULL;
+    char *tok = strtok_r(buf, ",", &saveptr);
+    while (tok) {
+        /* trim leading whitespace */
+        while (*tok == ' ') tok++;
+
+        double q = 1.0;
+        char *qp = strstr(tok, ";q=");
+        if (!qp) qp = strstr(tok, "; q=");
+        if (qp) {
+            q = atof(qp + (qp[1] == 'q' ? 3 : 4));
+        }
+
+        if (strstr(tok, "application/x-pasta") ||
+            strstr(tok, "application/pasta"))
+            q_pasta = q;
+        else if (strstr(tok, "application/json"))
+            q_json = q;
+        else if (strstr(tok, "text/plain"))
+            q_text = q;
+        else if (strstr(tok, "*/*"))
+            q_star = q;
+
+        tok = strtok_r(NULL, ",", &saveptr);
+    }
+
+    /* text/plain maps to pasta (backwards compat) */
+    if (q_text > q_pasta) q_pasta = q_text;
+    /* *\/* maps to pasta (default) */
+    if (q_star >= 0.0 && q_pasta < 0.0 && q_json < 0.0)
+        q_pasta = q_star;
+
+    if (q_pasta < 0.0 && q_json < 0.0)
+        return CT_UNKNOWN;  /* no supported type → 406 */
+    if (q_json > q_pasta)
+        return CT_JSON;
+    return CT_PASTA;
+}
+
+/* Serialize a PastaValue tree to JSON. Returns malloc'd string. */
+static char *pasta_to_json(const PastaValue *v) {
+    if (!v) return strdup("null");
+
+    switch (pasta_type(v)) {
+    case PASTA_NULL:
+        return strdup("null");
+    case PASTA_BOOL:
+        return strdup(pasta_get_bool(v) ? "true" : "false");
+    case PASTA_NUMBER: {
+        char buf[64];
+        double n = pasta_get_number(v);
+        if (n == (double)(long long)n && n >= -1e15 && n <= 1e15)
+            snprintf(buf, sizeof(buf), "%lld", (long long)n);
+        else
+            snprintf(buf, sizeof(buf), "%.17g", n);
+        return strdup(buf);
+    }
+    case PASTA_STRING: {
+        const char *s = pasta_get_string(v);
+        size_t slen = pasta_get_string_len(v);
+        /* worst case: every char needs escaping (\n → 2 chars) + quotes + NUL */
+        char *out = malloc(slen * 2 + 3);
+        if (!out) return NULL;
+        size_t j = 0;
+        out[j++] = '"';
+        for (size_t i = 0; i < slen; i++) {
+            char c = s[i];
+            if (c == '"')       { out[j++] = '\\'; out[j++] = '"'; }
+            else if (c == '\\') { out[j++] = '\\'; out[j++] = '\\'; }
+            else if (c == '\n') { out[j++] = '\\'; out[j++] = 'n'; }
+            else if (c == '\r') { out[j++] = '\\'; out[j++] = 'r'; }
+            else if (c == '\t') { out[j++] = '\\'; out[j++] = 't'; }
+            else out[j++] = c;
+        }
+        out[j++] = '"';
+        out[j] = '\0';
+        return out;
+    }
+    case PASTA_ARRAY: {
+        size_t cap = 256, len = 0;
+        char *out = malloc(cap);
+        if (!out) return NULL;
+        out[len++] = '[';
+        size_t count = pasta_count(v);
+        for (size_t i = 0; i < count; i++) {
+            char *elem = pasta_to_json(pasta_array_get(v, i));
+            if (!elem) { free(out); return NULL; }
+            size_t elen = strlen(elem);
+            while (len + elen + 3 > cap) { cap *= 2; out = realloc(out, cap); }
+            if (i > 0) out[len++] = ',';
+            memcpy(out + len, elem, elen);
+            len += elen;
+            free(elem);
+        }
+        if (len + 2 > cap) { cap += 2; out = realloc(out, cap); }
+        out[len++] = ']';
+        out[len] = '\0';
+        return out;
+    }
+    case PASTA_MAP: {
+        size_t cap = 256, len = 0;
+        char *out = malloc(cap);
+        if (!out) return NULL;
+        out[len++] = '{';
+        size_t count = pasta_count(v);
+        for (size_t i = 0; i < count; i++) {
+            const char *key = pasta_map_key(v, i);
+            char *val = pasta_to_json(pasta_map_value(v, i));
+            if (!val) { free(out); return NULL; }
+            size_t klen = strlen(key), vlen = strlen(val);
+            /* "key":val, */
+            while (len + klen + vlen + 6 > cap) { cap *= 2; out = realloc(out, cap); }
+            if (i > 0) out[len++] = ',';
+            out[len++] = '"';
+            memcpy(out + len, key, klen); len += klen;
+            out[len++] = '"'; out[len++] = ':';
+            memcpy(out + len, val, vlen); len += vlen;
+            free(val);
+        }
+        if (len + 2 > cap) { cap += 2; out = realloc(out, cap); }
+        out[len++] = '}';
+        out[len] = '\0';
+        return out;
+    }
+    }
+    return strdup("null");
+}
+
+/* Validate that input is pure ASCII (no byte > 0x7F and no NUL).
+   Returns 0 if valid, or the 1-based offset of the first bad byte. */
+static size_t validate_ascii(const char *data, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)data[i];
+        if (c == 0x00 || c > 0x7F) return i + 1;
+    }
+    return 0;
+}
+
+/* exported wrappers for testing */
+size_t cookbook_validate_ascii(const char *data, size_t len) {
+    return validate_ascii(data, len);
+}
+
+char *cookbook_pasta_to_json(const PastaValue *v) {
+    return pasta_to_json(v);
+}
+
 /* ==== helpers ==== */
 
 static size_t url_decode(char *buf, size_t len) {
@@ -426,7 +601,7 @@ static char *strip_descriptor(const char *body, size_t body_len,
         }
     }
 
-    char *result = pasta_write(stripped, PASTA_PRETTY);
+    char *result = pasta_write(stripped, PASTA_COMPACT | PASTA_SORTED);
     pasta_free(stripped);
     pasta_free(root);
 
@@ -790,9 +965,52 @@ static int handle_resolve(struct mg_connection *conn, void *cbdata) {
     } else {
         METRIC_INC(srv->metrics.responses_2xx);
         METRIC_INC(srv->metrics.artifacts_resolved);
+
+        /* #8: content negotiation on /resolve/ */
+        content_pref pref = parse_accept(ri);
+        if (pref == CT_UNKNOWN) {
+            METRIC_INC(srv->metrics.responses_4xx);
+            send_json(conn, 406,
+                "{\"error\":\"Not Acceptable — "
+                "supported: application/x-pasta, "
+                "application/json\"}\n");
+            free(path); free(group); free(artifact); free(range_str);
+            return 1;
+        }
+
         char response[8320];
         snprintf(response, sizeof(response),
                  "{\"versions\":[%s]}\n", result_buf);
+
+        if (pref == CT_PASTA) {
+            /* Parse the JSON response and re-emit as Pasta */
+            PastaResult pr;
+            PastaValue *root = pasta_parse(response, strlen(response), &pr);
+            if (root) {
+                int flags = PASTA_COMPACT | PASTA_SORTED;
+                if (ri->query_string &&
+                    strstr(ri->query_string, "pretty"))
+                    flags = PASTA_PRETTY | PASTA_SORTED;
+                char *pasta_out = pasta_write(root, flags);
+                pasta_free(root);
+                if (pasta_out) {
+                    size_t plen = strlen(pasta_out);
+                    mg_printf(conn,
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/x-pasta\r\n"
+                        "Content-Length: %zu\r\n"
+                        "\r\n",
+                        plen);
+                    mg_write(conn, pasta_out, plen);
+                    free(pasta_out);
+                    free(path); free(group); free(artifact);
+                    free(range_str);
+                    return 1;
+                }
+            }
+            /* fallback to JSON if Pasta serialization fails */
+        }
+
         send_json(conn, 200, response);
     }
 
@@ -879,26 +1097,59 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
         return 1;
     }
 
-    /* parse group/artifact/version/filename from path */
-    char *group = NULL, *artifact = NULL, *ver_file = NULL;
-    if (split_coord(path, &group, &artifact, &ver_file) != 0 || !ver_file) {
-        send_json(conn, 400, "{\"error\":\"Malformed path\"}\n");
-        free(path); free(group); free(artifact); free(ver_file);
-        return 1;
-    }
-
-    /* ver_file is "version/filename" — split it */
-    char *slash = strchr(ver_file, '/');
+    /* parse group/artifact/version/filename from path.
+       Path format: {group_path}/{artifact}/{version}/{filename}
+       where group_path may contain slashes (e.g., org/acme → org.acme).
+       We peel off the last 3 segments: artifact, version, filename. */
+    char *group = NULL, *artifact = NULL;
     char *version_str = NULL, *filename = NULL;
-    if (slash) {
-        *slash = '\0';
-        version_str = ver_file;
-        filename = slash + 1;
-    } else {
-        send_json(conn, 400, "{\"error\":\"Malformed artifact path\"}\n");
-        free(path); free(group); free(artifact); free(ver_file);
+    {
+        const char *s3 = strrchr(path, '/');
+        if (!s3 || s3 == path) goto bad_art_path;
+        const char *s2 = s3 - 1;
+        while (s2 > path && *s2 != '/') s2--;
+        if (*s2 != '/') goto bad_art_path;
+        const char *s1 = s2 - 1;
+        while (s1 > path && *s1 != '/') s1--;
+
+        size_t art_len = (size_t)(s2 - (*s1 == '/' ? s1 + 1 : s1));
+        size_t ver_len = (size_t)(s3 - s2 - 1);
+        size_t fn_len  = strlen(s3 + 1);
+
+        if (*s1 == '/') {
+            size_t grp_len = (size_t)(s1 - path);
+            group = malloc(grp_len + 1);
+            memcpy(group, path, grp_len);
+            group[grp_len] = '\0';
+            for (size_t i = 0; i < grp_len; i++)
+                if (group[i] == '/') group[i] = '.';
+
+            artifact = malloc(art_len + 1);
+            memcpy(artifact, s1 + 1, art_len);
+            artifact[art_len] = '\0';
+        } else {
+            /* s1 == path start → only 3 segments, not enough */
+            goto bad_art_path;
+        }
+
+        version_str = malloc(ver_len + 1);
+        memcpy(version_str, s2 + 1, ver_len);
+        version_str[ver_len] = '\0';
+
+        filename = malloc(fn_len + 1);
+        memcpy(filename, s3 + 1, fn_len);
+        filename[fn_len] = '\0';
+
+        goto art_path_ok;
+    bad_art_path:
+        send_json(conn, 400,
+            "{\"error\":\"Malformed artifact path\"}\n");
+        free(path); free(group); free(artifact);
+        free(version_str); free(filename);
         return 1;
+    art_path_ok: ;
     }
+    char *ver_file = version_str; /* alias for cleanup */
 
     /* build object store key: registry_id/path */
     size_t key_len = strlen(srv->registry_id) + 1 + strlen(path);
@@ -921,7 +1172,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
             if (strstr(path, ".sha256")) ct = "text/plain";
             else if (strstr(path, ".sig")) ct = "application/octet-stream";
             else if (filename && strcmp(filename, "now.pasta") == 0) {
-                ct = "text/plain";
+                ct = "application/x-pasta";
                 is_pasta = 1;
             }
             else if (strstr(path, ".tar.gz")) ct = "application/gzip";
@@ -954,6 +1205,91 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
                 }
             }
 
+            /* #8: content negotiation for now.pasta descriptors */
+            if (is_pasta) {
+                content_pref pref = parse_accept(ri);
+                if (pref == CT_UNKNOWN) {
+                    METRIC_INC(srv->metrics.responses_4xx);
+                    send_json(conn, 406,
+                        "{\"error\":\"Not Acceptable — "
+                        "supported: application/x-pasta, "
+                        "application/json, text/plain\"}\n");
+                    if (stripped) free(stripped);
+                    srv->store->free_buf(data);
+                    free(key); free(path); free(group);
+                    free(artifact); free(ver_file); free(filename);
+                    return 1;
+                }
+                if (pref == CT_JSON) {
+                    /* serve JSON representation */
+                    PastaResult pr;
+                    PastaValue *root = pasta_parse(
+                        (const char *)serve_data, serve_len, &pr);
+                    if (root) {
+                        char *json = pasta_to_json(root);
+                        pasta_free(root);
+                        if (json) {
+                            size_t jlen = strlen(json);
+                            METRIC_INC(srv->metrics.responses_2xx);
+                            METRIC_ADD(srv->metrics.bytes_downloaded,
+                                       (long)jlen);
+                            mg_printf(conn,
+                                "HTTP/1.1 200 OK\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Content-Length: %zu\r\n"
+                                "%s"
+                                "\r\n",
+                                jlen,
+                                yctx.yanked
+                                    ? "X-Now-Yanked: true\r\n" : "");
+                            mg_write(conn, json, jlen);
+                            free(json);
+                            if (stripped) free(stripped);
+                            srv->store->free_buf(data);
+                            free(key); free(path); free(group);
+                            free(artifact); free(ver_file); free(filename);
+                            return 1;
+                        }
+                    }
+                    /* fallback to Pasta if parse/serialize fails */
+                }
+                /* CT_PASTA: check ?pretty query param */
+                if (ri->query_string &&
+                    strstr(ri->query_string, "pretty")) {
+                    PastaResult pr;
+                    PastaValue *root = pasta_parse(
+                        (const char *)serve_data, serve_len, &pr);
+                    if (root) {
+                        char *pretty = pasta_write(root,
+                            PASTA_PRETTY | PASTA_SORTED);
+                        pasta_free(root);
+                        if (pretty) {
+                            size_t plen = strlen(pretty);
+                            METRIC_INC(srv->metrics.responses_2xx);
+                            METRIC_ADD(srv->metrics.bytes_downloaded,
+                                       (long)plen);
+                            mg_printf(conn,
+                                "HTTP/1.1 200 OK\r\n"
+                                "Content-Type: application/x-pasta\r\n"
+                                "Content-Length: %zu\r\n"
+                                "%s"
+                                "\r\n",
+                                plen,
+                                yctx.yanked
+                                    ? "X-Now-Yanked: true\r\n" : "");
+                            mg_write(conn, pretty, plen);
+                            free(pretty);
+                            if (stripped) free(stripped);
+                            srv->store->free_buf(data);
+                            free(key); free(path); free(group);
+                            free(artifact); free(ver_file); free(filename);
+                            return 1;
+                        }
+                    }
+                    /* fallback to raw if pretty-print fails */
+                }
+            }
+
             METRIC_INC(srv->metrics.responses_2xx);
             METRIC_ADD(srv->metrics.bytes_downloaded, (long)serve_len);
             mg_printf(conn,
@@ -976,7 +1312,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
         if (validate_group(group) != 0 || validate_artifact(artifact) != 0) {
             send_json(conn, 400,
                 "{\"error\":\"Invalid group or artifact identifier\"}\n");
-            free(key); free(path); free(group); free(artifact); free(ver_file);
+            free(key); free(path); free(group); free(artifact); free(ver_file); free(filename);
             return 1;
         }
 
@@ -989,7 +1325,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
                 send_json(conn, 401,
                     "{\"error\":\"Valid Bearer JWT required\"}\n");
                 free(key); free(path); free(group); free(artifact);
-                free(ver_file);
+                free(ver_file); free(filename);
                 return 1;
             }
 
@@ -1000,7 +1336,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
                 send_json(conn, 403,
                     "{\"error\":\"JWT does not authorize this group\"}\n");
                 free(key); free(path); free(group); free(artifact);
-                free(ver_file);
+                free(ver_file); free(filename);
                 return 1;
             }
 
@@ -1010,7 +1346,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
                 send_json(conn, 429,
                     "{\"error\":\"Rate limit exceeded\"}\n");
                 free(key); free(path); free(group); free(artifact);
-                free(ver_file);
+                free(ver_file); free(filename);
                 return 1;
             }
         }
@@ -1019,7 +1355,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
         if (srv->store->exists(srv->store, key) == COOKBOOK_STORE_OK) {
             send_json(conn, 409,
                 "{\"error\":\"Release coordinate already published\"}\n");
-            free(key); free(path); free(group); free(artifact); free(ver_file);
+            free(key); free(path); free(group); free(artifact); free(ver_file); free(filename);
             return 1;
         }
 
@@ -1035,8 +1371,24 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
                 send_json(conn, 400, "{\"error\":\"Empty body\"}\n");
             }
             free(body); free(key); free(path);
-            free(group); free(artifact); free(ver_file);
+            free(group); free(artifact); free(ver_file); free(filename);
             return 1;
+        }
+
+        /* #8: reject non-ASCII bytes on now.pasta PUT */
+        if (filename && strcmp(filename, "now.pasta") == 0) {
+            size_t bad = validate_ascii(body, body_len);
+            if (bad) {
+                char err[256];
+                snprintf(err, sizeof(err),
+                    "{\"error\":\"Non-ASCII byte at offset %zu"
+                    " — Pasta requires US-ASCII input\"}\n", bad);
+                METRIC_INC(srv->metrics.responses_4xx);
+                send_json(conn, 400, err);
+                free(body); free(key); free(path);
+                free(group); free(artifact); free(ver_file); free(filename);
+                return 1;
+            }
         }
 
         /* compute SHA-256 */
@@ -1049,7 +1401,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
         if (sst != COOKBOOK_STORE_OK) {
             send_json(conn, 500, "{\"error\":\"Storage error\"}\n");
             free(body); free(key); free(path);
-            free(group); free(artifact); free(ver_file);
+            free(group); free(artifact); free(ver_file); free(filename);
             return 1;
         }
 
@@ -1089,7 +1441,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
                 srv->store->del(srv->store, key);
                 send_json(conn, 400, err);
                 free(body); free(key); free(path);
-                free(group); free(artifact); free(ver_file);
+                free(group); free(artifact); free(ver_file); free(filename);
                 return 1;
             }
 
@@ -1122,7 +1474,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
                             "valid semver, group/artifact must match naming "
                             "rules\"}\n");
                         free(body); free(key); free(path);
-                        free(group); free(artifact); free(ver_file);
+                        free(group); free(artifact); free(ver_file); free(filename);
                         return 1;
                     }
 
@@ -1228,7 +1580,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
     free(path);
     free(group);
     free(artifact);
-    free(ver_file);
+    free(ver_file); free(filename);
     return 1;
 }
 

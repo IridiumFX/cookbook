@@ -147,6 +147,8 @@ endif()
 enable_testing()
 
 file(GLOB COOKBOOK_TEST_SOURCES src/test/c/*.c)
+# exclude stress test from unit test binary
+list(FILTER COOKBOOK_TEST_SOURCES EXCLUDE REGEX ".*cookbook_stress\\.c$")
 
 add_executable(cookbook_test ${COOKBOOK_TEST_SOURCES})
 target_link_libraries(cookbook_test PRIVATE cookbook sqlite3 civetweb pasta sodium)
@@ -155,8 +157,16 @@ target_compile_definitions(cookbook_test PRIVATE
     COOKBOOK_TEST_RESOURCES="${CMAKE_CURRENT_SOURCE_DIR}/src/test/resources"
 )
 
+# ---------- stress test ----------
+
+add_executable(cookbook_stress src/test/c/cookbook_stress.c)
+target_link_libraries(cookbook_stress PRIVATE cookbook sqlite3 civetweb pasta sodium)
 if(WIN32)
-    set_target_properties(cookbook cookbook_server cookbook_test PROPERTIES
+    target_link_libraries(cookbook_stress PRIVATE ws2_32)
+endif()
+
+if(WIN32)
+    set_target_properties(cookbook cookbook_server cookbook_test cookbook_stress PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
 endif()

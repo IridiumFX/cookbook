@@ -3,9 +3,11 @@
 #include "cookbook.h"
 #include "cookbook_db.h"
 #include "cookbook_store.h"
+#include "cookbook_server.h"
 #include "cookbook_semver.h"
 #include "cookbook_sha256.h"
 #include "cookbook_auth.h"
+#include "pasta.h"
 #include <sodium.h>
 
 static int tests_run    = 0;
@@ -562,6 +564,665 @@ static void test_range_bounded(void) {
     ASSERT(cookbook_range_satisfies(&r, &v) == 0, "0.9.0 fails [1,2)");
 }
 
+/* ---- #8: content negotiation tests ---- */
+
+static void test_validate_ascii(void) {
+    /* valid ASCII */
+    ASSERT(cookbook_validate_ascii("hello", 5) == 0, "pure ASCII is valid");
+    ASSERT(cookbook_validate_ascii("", 0) == 0, "empty is valid");
+    ASSERT(cookbook_validate_ascii("a = 1\nb = 2\n", 12) == 0,
+           "ASCII with newlines");
+
+    /* byte > 0x7F */
+    ASSERT(cookbook_validate_ascii("caf\xC3\xA9", 5) == 4,
+           "reject UTF-8 multi-byte at offset 4");
+    ASSERT(cookbook_validate_ascii("\x80", 1) == 1,
+           "reject 0x80 at offset 1");
+    ASSERT(cookbook_validate_ascii("ab\xFF", 3) == 3,
+           "reject 0xFF at offset 3");
+
+    /* NUL byte */
+    ASSERT(cookbook_validate_ascii("ab\x00" "cd", 5) == 3,
+           "reject NUL at offset 3");
+    ASSERT(cookbook_validate_ascii("\x00", 1) == 1,
+           "reject NUL at offset 1");
+}
+
+static void test_pasta_to_json_primitives(void) {
+    /* null */
+    char *j = cookbook_pasta_to_json(NULL);
+    ASSERT(j && strcmp(j, "null") == 0, "NULL → \"null\"");
+    free(j);
+
+    /* parse a small Pasta doc and convert to JSON */
+    PastaResult pr;
+    const char *src = "{ name: \"test\", count: 42, flag: true, empty: null }";
+    PastaValue *root = pasta_parse(src, strlen(src), &pr);
+    ASSERT(root != NULL, "parse small Pasta doc");
+    if (root) {
+        j = cookbook_pasta_to_json(root);
+        ASSERT(j != NULL, "JSON serialization succeeds");
+        /* verify key fields are present */
+        ASSERT(strstr(j, "\"name\"") != NULL, "JSON has name key");
+        ASSERT(strstr(j, "\"test\"") != NULL, "JSON has test value");
+        ASSERT(strstr(j, "\"count\"") != NULL, "JSON has count key");
+        ASSERT(strstr(j, "42") != NULL, "JSON has 42");
+        ASSERT(strstr(j, "true") != NULL, "JSON has true");
+        ASSERT(strstr(j, "null") != NULL, "JSON has null");
+        free(j);
+        pasta_free(root);
+    }
+}
+
+static void test_pasta_to_json_nested(void) {
+    PastaResult pr;
+    const char *src =
+        "{ versions: [ { version: \"1.0.0\", triples: [\"noarch\"] } ] }";
+    PastaValue *root = pasta_parse(src, strlen(src), &pr);
+    ASSERT(root != NULL, "parse nested Pasta");
+    if (root) {
+        char *j = cookbook_pasta_to_json(root);
+        ASSERT(j != NULL, "nested JSON serialization");
+        ASSERT(strstr(j, "\"versions\"") != NULL, "has versions key");
+        ASSERT(strstr(j, "\"1.0.0\"") != NULL, "has version value");
+        ASSERT(strstr(j, "\"noarch\"") != NULL, "has triple value");
+        ASSERT(j[0] == '{', "starts with {");
+        free(j);
+        pasta_free(root);
+    }
+}
+
+static void test_pasta_to_json_escaping(void) {
+    PastaResult pr;
+    const char *src = "{ msg: \"line1\\nline2\\ttab\" }";
+    PastaValue *root = pasta_parse(src, strlen(src), &pr);
+    ASSERT(root != NULL, "parse Pasta with escapes");
+    if (root) {
+        char *j = cookbook_pasta_to_json(root);
+        ASSERT(j != NULL, "escape JSON serialization");
+        ASSERT(strstr(j, "\\n") != NULL, "JSON has \\n escape");
+        ASSERT(strstr(j, "\\t") != NULL, "JSON has \\t escape");
+        free(j);
+        pasta_free(root);
+    }
+}
+
+/* ---- additional semver edge cases ---- */
+
+static void test_semver_parse_edge_cases(void) {
+    cookbook_semver sv;
+
+    /* large version numbers */
+    ASSERT(cookbook_semver_parse("999.999.999", &sv) == 0, "parse large version");
+    ASSERT(sv.major == 999 && sv.minor == 999 && sv.patch == 999,
+           "large version fields");
+
+    /* version 0.0.0 */
+    ASSERT(cookbook_semver_parse("0.0.0", &sv) == 0, "parse 0.0.0");
+    ASSERT(sv.major == 0 && sv.minor == 0 && sv.patch == 0, "0.0.0 fields");
+
+    /* pre-release only (no build metadata) */
+    ASSERT(cookbook_semver_parse("1.0.0-rc.1", &sv) == 0, "parse rc.1");
+    ASSERT(strcmp(sv.pre_release, "rc.1") == 0, "pre_release=rc.1");
+    ASSERT(sv.build_meta[0] == '\0', "no build_meta");
+
+    /* build metadata only (no pre-release) */
+    ASSERT(cookbook_semver_parse("1.0.0+sha.abc123", &sv) == 0,
+           "parse build meta only");
+    ASSERT(sv.pre_release[0] == '\0', "no pre_release");
+    ASSERT(strcmp(sv.build_meta, "sha.abc123") == 0, "build_meta=sha.abc123");
+
+    /* reject edge cases */
+    ASSERT(cookbook_semver_parse("", &sv) != 0, "reject empty");
+    ASSERT(cookbook_semver_parse("v1.0.0", &sv) != 0, "reject v-prefix");
+    ASSERT(cookbook_semver_parse("1.0", &sv) != 0, "reject two-part");
+    ASSERT(cookbook_semver_parse("1.0.0.0", &sv) != 0, "reject four-part");
+    ASSERT(cookbook_semver_parse("-1.0.0", &sv) != 0, "reject negative");
+    ASSERT(cookbook_semver_parse("1.0.0-", &sv) != 0, "reject trailing dash");
+}
+
+static void test_semver_compare_detailed(void) {
+    cookbook_semver a, b;
+
+    /* equal versions */
+    cookbook_semver_parse("1.2.3", &a);
+    cookbook_semver_parse("1.2.3", &b);
+    ASSERT(cookbook_semver_compare(&a, &b) == 0, "1.2.3 == 1.2.3");
+
+    /* minor difference */
+    cookbook_semver_parse("1.2.0", &a);
+    cookbook_semver_parse("1.3.0", &b);
+    ASSERT(cookbook_semver_compare(&a, &b) < 0, "1.2.0 < 1.3.0");
+
+    /* patch difference */
+    cookbook_semver_parse("1.2.3", &a);
+    cookbook_semver_parse("1.2.4", &b);
+    ASSERT(cookbook_semver_compare(&a, &b) < 0, "1.2.3 < 1.2.4");
+
+    /* pre-release numeric ordering: 1 < 2 < 11 */
+    cookbook_semver_parse("1.0.0-alpha.1", &a);
+    cookbook_semver_parse("1.0.0-alpha.2", &b);
+    ASSERT(cookbook_semver_compare(&a, &b) < 0, "alpha.1 < alpha.2");
+
+    /* pre-release: alpha < beta < rc */
+    cookbook_semver_parse("1.0.0-beta", &a);
+    cookbook_semver_parse("1.0.0-rc", &b);
+    ASSERT(cookbook_semver_compare(&a, &b) < 0, "beta < rc");
+
+    /* build metadata ignored in comparison */
+    cookbook_semver_parse("1.0.0+build1", &a);
+    cookbook_semver_parse("1.0.0+build2", &b);
+    ASSERT(cookbook_semver_compare(&a, &b) == 0,
+           "build metadata ignored in compare");
+
+    /* symmetry */
+    cookbook_semver_parse("2.0.0", &a);
+    cookbook_semver_parse("1.0.0", &b);
+    ASSERT(cookbook_semver_compare(&a, &b) > 0, "2.0.0 > 1.0.0");
+}
+
+static void test_range_exact(void) {
+    cookbook_range r;
+    cookbook_semver v;
+
+    ASSERT(cookbook_range_parse("1.2.3", &r) == 0, "parse exact 1.2.3");
+    ASSERT(r.type == COOKBOOK_RANGE_EXACT, "type is exact");
+
+    cookbook_semver_parse("1.2.3", &v);
+    ASSERT(cookbook_range_satisfies(&r, &v) == 1, "1.2.3 satisfies exact 1.2.3");
+
+    cookbook_semver_parse("1.2.4", &v);
+    ASSERT(cookbook_range_satisfies(&r, &v) == 0, "1.2.4 fails exact 1.2.3");
+
+    cookbook_semver_parse("1.2.2", &v);
+    ASSERT(cookbook_range_satisfies(&r, &v) == 0, "1.2.2 fails exact 1.2.3");
+}
+
+static void test_range_caret_zero(void) {
+    cookbook_range r;
+    cookbook_semver v;
+
+    /* ^0.0.3 means >=0.0.3, <0.0.4 (only patch bumps allowed) */
+    ASSERT(cookbook_range_parse("^0.0.3", &r) == 0, "parse ^0.0.3");
+    cookbook_semver_parse("0.0.3", &v);
+    ASSERT(cookbook_range_satisfies(&r, &v) == 1, "0.0.3 satisfies ^0.0.3");
+    cookbook_semver_parse("0.0.4", &v);
+    ASSERT(cookbook_range_satisfies(&r, &v) == 0, "0.0.4 fails ^0.0.3");
+    cookbook_semver_parse("0.1.0", &v);
+    ASSERT(cookbook_range_satisfies(&r, &v) == 0, "0.1.0 fails ^0.0.3");
+}
+
+static void test_range_bounded_inclusive(void) {
+    cookbook_range r;
+    cookbook_semver v;
+
+    /* [1.0.0,2.0.0] — upper inclusive */
+    ASSERT(cookbook_range_parse("[1.0.0,2.0.0]", &r) == 0,
+           "parse [1.0.0,2.0.0]");
+
+    cookbook_semver_parse("2.0.0", &v);
+    ASSERT(cookbook_range_satisfies(&r, &v) == 1,
+           "2.0.0 satisfies [1.0.0,2.0.0] (upper inclusive)");
+
+    /* (1.0.0,2.0.0) — both exclusive */
+    ASSERT(cookbook_range_parse("(1.0.0,2.0.0)", &r) == 0,
+           "parse (1.0.0,2.0.0)");
+
+    cookbook_semver_parse("1.0.0", &v);
+    ASSERT(cookbook_range_satisfies(&r, &v) == 0,
+           "1.0.0 fails (1.0.0,2.0.0) (lower exclusive)");
+    cookbook_semver_parse("1.0.1", &v);
+    ASSERT(cookbook_range_satisfies(&r, &v) == 1,
+           "1.0.1 satisfies (1.0.0,2.0.0)");
+}
+
+/* ---- additional DB tests ---- */
+
+static void test_db_yanked_status(void) {
+    cookbook_db *db = cookbook_db_open_sqlite(NULL);
+    cookbook_db_migrate(db);
+
+    db->exec(db,
+        "INSERT INTO groups (group_id, owner_sub) "
+        "VALUES ('org.yank', 'alice')");
+
+    cookbook_db_param ap[] = {
+        COOKBOOK_P_TEXT("org.yank:lib:1.0.0:noarch"),
+        COOKBOOK_P_TEXT("org.yank"),
+        COOKBOOK_P_TEXT("lib"),
+        COOKBOOK_P_TEXT("1.0.0"),
+        COOKBOOK_P_TEXT("noarch"),
+        COOKBOOK_P_TEXT("deadbeef"),
+        COOKBOOK_P_INT(0),
+        COOKBOOK_P_TEXT("published"),
+        COOKBOOK_P_INT(512)
+    };
+    db->exec_p(db,
+        "INSERT INTO artifacts "
+        "(coord_id, group_id, artifact, version, triple, sha256, "
+        " snapshot, status, size_bytes) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", ap, 9);
+
+    /* yank it */
+    cookbook_db_param yp[] = {
+        COOKBOOK_P_TEXT("org.yank"),
+        COOKBOOK_P_TEXT("lib"),
+        COOKBOOK_P_TEXT("1.0.0")
+    };
+    cookbook_db_status st = db->exec_p(db,
+        "UPDATE artifacts SET yanked = 1 "
+        "WHERE group_id = ?1 AND artifact = ?2 AND version = ?3",
+        yp, 3);
+    ASSERT(st == COOKBOOK_DB_OK, "yank succeeds");
+
+    /* verify yanked=1 */
+    int count = 0;
+    db->query_p(db,
+        "SELECT coord_id FROM artifacts WHERE yanked = 1 "
+        "AND group_id = ?1", yp, 1, count_cb, &count);
+    ASSERT(count == 1, "yanked artifact found");
+
+    /* verify excluded from published+non-yanked query */
+    count = 0;
+    db->query_p(db,
+        "SELECT coord_id FROM artifacts WHERE yanked = 0 "
+        "AND status = 'published' AND group_id = ?1", yp, 1,
+        count_cb, &count);
+    ASSERT(count == 0, "yanked artifact excluded from resolve");
+
+    db->close(db);
+}
+
+static void test_db_null_params(void) {
+    cookbook_db *db = cookbook_db_open_sqlite(NULL);
+    cookbook_db_migrate(db);
+
+    /* NULL into NOT NULL column should fail with constraint error */
+    cookbook_db_param gp[] = {
+        COOKBOOK_P_TEXT("org.null"),
+        COOKBOOK_P_NULL()
+    };
+    cookbook_db_status st = db->exec_p(db,
+        "INSERT INTO groups (group_id, owner_sub) VALUES (?1, ?2)",
+        gp, 2);
+    ASSERT(st == COOKBOOK_DB_CONSTRAINT, "NULL into NOT NULL rejected");
+
+    /* NULL in a nullable column (descriptor_sha256) should work */
+    db->exec(db,
+        "INSERT INTO groups (group_id, owner_sub) "
+        "VALUES ('org.null', 'alice')");
+    cookbook_db_param ap[] = {
+        COOKBOOK_P_TEXT("org.null:lib:1.0.0:noarch"),
+        COOKBOOK_P_TEXT("org.null"),
+        COOKBOOK_P_TEXT("lib"),
+        COOKBOOK_P_TEXT("1.0.0"),
+        COOKBOOK_P_TEXT("noarch"),
+        COOKBOOK_P_TEXT("aabb"),
+        COOKBOOK_P_NULL(),              /* descriptor_sha256 */
+        COOKBOOK_P_INT(0),
+        COOKBOOK_P_TEXT("published"),
+        COOKBOOK_P_INT(128)
+    };
+    st = db->exec_p(db,
+        "INSERT INTO artifacts "
+        "(coord_id, group_id, artifact, version, triple, sha256, "
+        " descriptor_sha256, snapshot, status, size_bytes) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)", ap, 10);
+    ASSERT(st == COOKBOOK_DB_OK, "NULL in nullable column accepted");
+
+    db->close(db);
+}
+
+static void test_db_pending_to_published(void) {
+    cookbook_db *db = cookbook_db_open_sqlite(NULL);
+    cookbook_db_migrate(db);
+
+    db->exec(db,
+        "INSERT INTO groups (group_id, owner_sub) "
+        "VALUES ('org.phase', 'alice')");
+
+    /* insert as pending */
+    cookbook_db_param ap[] = {
+        COOKBOOK_P_TEXT("org.phase:app:1.0.0:noarch"),
+        COOKBOOK_P_TEXT("org.phase"),
+        COOKBOOK_P_TEXT("app"),
+        COOKBOOK_P_TEXT("1.0.0"),
+        COOKBOOK_P_TEXT("noarch"),
+        COOKBOOK_P_TEXT("aabbccdd"),
+        COOKBOOK_P_INT(0),
+        COOKBOOK_P_TEXT("pending"),
+        COOKBOOK_P_INT(256)
+    };
+    db->exec_p(db,
+        "INSERT INTO artifacts "
+        "(coord_id, group_id, artifact, version, triple, sha256, "
+        " snapshot, status, size_bytes) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", ap, 9);
+
+    /* verify pending */
+    int count = 0;
+    cookbook_db_param qp[] = { COOKBOOK_P_TEXT("org.phase") };
+    db->query_p(db,
+        "SELECT coord_id FROM artifacts WHERE status = 'pending' "
+        "AND group_id = ?1", qp, 1, count_cb, &count);
+    ASSERT(count == 1, "pending artifact found");
+
+    /* transition to published */
+    cookbook_db_param up[] = {
+        COOKBOOK_P_TEXT("org.phase:app:1.0.0:noarch")
+    };
+    db->exec_p(db,
+        "UPDATE artifacts SET status = 'published' WHERE coord_id = ?1",
+        up, 1);
+
+    count = 0;
+    db->query_p(db,
+        "SELECT coord_id FROM artifacts WHERE status = 'published' "
+        "AND group_id = ?1", qp, 1, count_cb, &count);
+    ASSERT(count == 1, "published artifact found");
+
+    db->close(db);
+}
+
+/* ---- additional store tests ---- */
+
+static void test_store_overwrite(void) {
+    const char *dir = COOKBOOK_TEST_RESOURCES "/tmp_store2";
+    cookbook_store *store = cookbook_store_open_fs(dir);
+    ASSERT(store != NULL, "open store for overwrite test");
+
+    const char *key = "central/overwrite/test.txt";
+    store->put(store, key, "first", 5);
+
+    /* overwrite with different content */
+    cookbook_store_status st = store->put(store, key, "second", 6);
+    ASSERT(st == COOKBOOK_STORE_OK, "overwrite put succeeds");
+
+    void *buf = NULL;
+    size_t len = 0;
+    store->get(store, key, &buf, &len);
+    ASSERT(len == 6, "overwrite length correct");
+    ASSERT(buf && memcmp(buf, "second", 6) == 0, "overwrite content correct");
+    store->free_buf(buf);
+
+    store->del(store, key);
+    store->close(store);
+}
+
+static void test_store_large_value(void) {
+    const char *dir = COOKBOOK_TEST_RESOURCES "/tmp_store3";
+    cookbook_store *store = cookbook_store_open_fs(dir);
+    ASSERT(store != NULL, "open store for large value test");
+
+    /* 64KB value */
+    size_t sz = 65536;
+    char *big = malloc(sz);
+    for (size_t i = 0; i < sz; i++) big[i] = (char)(i & 0x7F);
+
+    const char *key = "central/large/blob.bin";
+    cookbook_store_status st = store->put(store, key, big, sz);
+    ASSERT(st == COOKBOOK_STORE_OK, "large put succeeds");
+
+    void *buf = NULL;
+    size_t len = 0;
+    st = store->get(store, key, &buf, &len);
+    ASSERT(st == COOKBOOK_STORE_OK, "large get succeeds");
+    ASSERT(len == sz, "large roundtrip length");
+    ASSERT(buf && memcmp(buf, big, sz) == 0, "large roundtrip content");
+    store->free_buf(buf);
+
+    store->del(store, key);
+    free(big);
+    store->close(store);
+}
+
+/* ---- additional auth tests ---- */
+
+static void test_jwt_expired(void) {
+    if (sodium_init() < -1) return;
+
+    unsigned char pk[32], sk[64];
+    cookbook_keygen(pk, sk);
+
+    /* create a token with -1 second TTL — should be expired */
+    char *token = cookbook_jwt_create("bob", "org.acme", -1, sk);
+    ASSERT(token != NULL, "JWT create with negative TTL");
+
+    cookbook_jwt_claims claims;
+    int rc = cookbook_jwt_verify(token, pk, &claims);
+    /* either verify fails or claims.valid is 0 */
+    ASSERT(rc != 0 || claims.valid == 0, "expired JWT rejected");
+    free(token);
+}
+
+static void test_jwt_group_boundary(void) {
+    if (sodium_init() < -1) return;
+
+    unsigned char pk[32], sk[64];
+    cookbook_keygen(pk, sk);
+
+    char *token = cookbook_jwt_create("alice", "org.acme.core", 3600, sk);
+    ASSERT(token != NULL, "JWT create with dotted group");
+
+    cookbook_jwt_claims claims;
+    cookbook_jwt_verify(token, pk, &claims);
+
+    /* exact match should work */
+    ASSERT(cookbook_jwt_has_group(&claims, "org.acme.core") == 1,
+           "exact group match");
+    /* prefix should NOT match */
+    ASSERT(cookbook_jwt_has_group(&claims, "org.acme") == 0,
+           "prefix group does not match");
+    /* substring should NOT match */
+    ASSERT(cookbook_jwt_has_group(&claims, "org.acme.cor") == 0,
+           "substring group does not match");
+    /* empty group */
+    ASSERT(cookbook_jwt_has_group(&claims, "") == 0,
+           "empty group does not match");
+
+    free(token);
+}
+
+static void test_base64url_edge_cases(void) {
+    /* empty input */
+    char encoded[64];
+    size_t elen = cookbook_base64url_encode("", 0, encoded, sizeof(encoded));
+    ASSERT(elen == 0, "base64url empty encode is empty");
+
+    /* single byte */
+    elen = cookbook_base64url_encode("A", 1, encoded, sizeof(encoded));
+    ASSERT(elen > 0, "base64url single byte encodes");
+    char decoded[64];
+    size_t dlen = cookbook_base64url_decode(encoded, elen,
+                                            decoded, sizeof(decoded));
+    ASSERT(dlen == 1 && decoded[0] == 'A', "base64url single byte roundtrip");
+
+    /* two bytes (tests padding=1 scenario) */
+    elen = cookbook_base64url_encode("AB", 2, encoded, sizeof(encoded));
+    dlen = cookbook_base64url_decode(encoded, elen, decoded, sizeof(decoded));
+    ASSERT(dlen == 2 && decoded[0] == 'A' && decoded[1] == 'B',
+           "base64url two byte roundtrip");
+
+    /* binary data with all byte values 0-255 */
+    unsigned char binary[256];
+    for (int i = 0; i < 256; i++) binary[i] = (unsigned char)i;
+    char big_encoded[512];
+    elen = cookbook_base64url_encode(binary, 256, big_encoded,
+                                     sizeof(big_encoded));
+    ASSERT(elen > 0, "base64url binary encode");
+    unsigned char big_decoded[256];
+    dlen = cookbook_base64url_decode(big_encoded, elen, big_decoded,
+                                     sizeof(big_decoded));
+    ASSERT(dlen == 256, "base64url binary decode length");
+    ASSERT(memcmp(binary, big_decoded, 256) == 0,
+           "base64url binary roundtrip all bytes");
+}
+
+/* ---- additional ASCII validation tests ---- */
+
+static void test_validate_ascii_boundaries(void) {
+    /* 0x7F (DEL) is valid ASCII */
+    ASSERT(cookbook_validate_ascii("\x7F", 1) == 0,
+           "0x7F (DEL) is valid ASCII");
+
+    /* 0x01 (SOH) — valid ASCII control char */
+    ASSERT(cookbook_validate_ascii("\x01", 1) == 0,
+           "0x01 is valid ASCII");
+
+    /* 0x1F — last control char, valid */
+    ASSERT(cookbook_validate_ascii("\x1F", 1) == 0,
+           "0x1F is valid ASCII");
+
+    /* 0x80 — first non-ASCII */
+    ASSERT(cookbook_validate_ascii("\x80", 1) == 1,
+           "0x80 is first non-ASCII");
+
+    /* mixed valid + invalid at end */
+    ASSERT(cookbook_validate_ascii("hello\x80", 6) == 6,
+           "invalid at position 6");
+
+    /* all printable ASCII */
+    const char *printable =
+        " !\"#$%&'()*+,-./0123456789:;<=>?@"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`"
+        "abcdefghijklmnopqrstuvwxyz{|}~";
+    ASSERT(cookbook_validate_ascii(printable, strlen(printable)) == 0,
+           "all printable ASCII valid");
+}
+
+/* ---- additional pasta-to-json tests ---- */
+
+static void test_pasta_to_json_empty_containers(void) {
+    PastaResult pr;
+
+    /* empty map */
+    const char *s1 = "{}";
+    PastaValue *root = pasta_parse(s1, strlen(s1), &pr);
+    ASSERT(root != NULL, "parse empty map");
+    if (root) {
+        char *j = cookbook_pasta_to_json(root);
+        ASSERT(j && strcmp(j, "{}") == 0, "empty map → {}");
+        free(j);
+        pasta_free(root);
+    }
+
+    /* empty array */
+    const char *s2 = "{ items: [] }";
+    root = pasta_parse(s2, strlen(s2), &pr);
+    ASSERT(root != NULL, "parse empty array");
+    if (root) {
+        char *j = cookbook_pasta_to_json(root);
+        ASSERT(j != NULL, "empty array JSON");
+        ASSERT(strstr(j, "[]") != NULL, "JSON has []");
+        free(j);
+        pasta_free(root);
+    }
+}
+
+static void test_pasta_to_json_numbers(void) {
+    PastaResult pr;
+
+    /* integer */
+    const char *s1 = "{ val: 0 }";
+    PastaValue *root = pasta_parse(s1, strlen(s1), &pr);
+    ASSERT(root != NULL, "parse zero");
+    if (root) {
+        char *j = cookbook_pasta_to_json(root);
+        ASSERT(j && strstr(j, ":0}") != NULL, "zero in JSON");
+        free(j);
+        pasta_free(root);
+    }
+
+    /* negative */
+    const char *s2 = "{ val: -42 }";
+    root = pasta_parse(s2, strlen(s2), &pr);
+    ASSERT(root != NULL, "parse negative");
+    if (root) {
+        char *j = cookbook_pasta_to_json(root);
+        ASSERT(j && strstr(j, "-42") != NULL, "negative in JSON");
+        free(j);
+        pasta_free(root);
+    }
+
+    /* float */
+    const char *s3 = "{ val: 3.14 }";
+    root = pasta_parse(s3, strlen(s3), &pr);
+    ASSERT(root != NULL, "parse float");
+    if (root) {
+        char *j = cookbook_pasta_to_json(root);
+        ASSERT(j && strstr(j, "3.14") != NULL, "float in JSON");
+        free(j);
+        pasta_free(root);
+    }
+}
+
+static void test_pasta_to_json_deeply_nested(void) {
+    PastaResult pr;
+    const char *src =
+        "{ a: { b: { c: { d: [1, 2, { e: true }] } } } }";
+    PastaValue *root = pasta_parse(src, strlen(src), &pr);
+    ASSERT(root != NULL, "parse deeply nested");
+    if (root) {
+        char *j = cookbook_pasta_to_json(root);
+        ASSERT(j != NULL, "deeply nested JSON");
+        ASSERT(strstr(j, "\"a\"") != NULL, "has key a");
+        ASSERT(strstr(j, "\"e\"") != NULL, "has key e");
+        ASSERT(strstr(j, "true") != NULL, "has true at depth");
+        free(j);
+        pasta_free(root);
+    }
+}
+
+/* ---- additional sorted write tests ---- */
+
+static void test_pasta_sorted_nested(void) {
+    PastaResult pr;
+    const char *src =
+        "{ z_outer: { z_inner: 1, a_inner: 2 }, a_outer: 3 }";
+    PastaValue *root = pasta_parse(src, strlen(src), &pr);
+    ASSERT(root != NULL, "parse nested unsorted");
+    if (root) {
+        char *sorted = pasta_write(root, PASTA_COMPACT | PASTA_SORTED);
+        ASSERT(sorted != NULL, "nested sorted write");
+        if (sorted) {
+            /* outer keys sorted: a_outer before z_outer */
+            char *pa = strstr(sorted, "a_outer");
+            char *pz = strstr(sorted, "z_outer");
+            ASSERT(pa && pz && pa < pz,
+                   "outer keys sorted: a_outer < z_outer");
+            /* inner keys sorted: a_inner before z_inner */
+            char *pai = strstr(sorted, "a_inner");
+            char *pzi = strstr(sorted, "z_inner");
+            ASSERT(pai && pzi && pai < pzi,
+                   "inner keys sorted: a_inner < z_inner");
+            free(sorted);
+        }
+        pasta_free(root);
+    }
+}
+
+static void test_pasta_sorted_write(void) {
+    PastaResult pr;
+    const char *src = "{ zebra: 1, apple: 2, mango: 3 }";
+    PastaValue *root = pasta_parse(src, strlen(src), &pr);
+    ASSERT(root != NULL, "parse unsorted Pasta");
+    if (root) {
+        char *sorted = pasta_write(root, PASTA_COMPACT | PASTA_SORTED);
+        ASSERT(sorted != NULL, "sorted compact write");
+        if (sorted) {
+            /* apple should come before mango, mango before zebra */
+            char *pa = strstr(sorted, "apple");
+            char *pm = strstr(sorted, "mango");
+            char *pz = strstr(sorted, "zebra");
+            ASSERT(pa && pm && pz, "all keys present in sorted output");
+            ASSERT(pa < pm && pm < pz,
+                   "keys in lexicographic order: apple < mango < zebra");
+            free(sorted);
+        }
+        pasta_free(root);
+    }
+}
+
 int main(void) {
     printf("cookbook test suite\n\n");
 
@@ -591,6 +1252,29 @@ int main(void) {
     test_range_tilde();
     test_range_wildcard();
     test_range_bounded();
+    test_semver_parse_edge_cases();
+    test_semver_compare_detailed();
+    test_range_exact();
+    test_range_caret_zero();
+    test_range_bounded_inclusive();
+    test_db_yanked_status();
+    test_db_null_params();
+    test_db_pending_to_published();
+    test_store_overwrite();
+    test_store_large_value();
+    test_jwt_expired();
+    test_jwt_group_boundary();
+    test_base64url_edge_cases();
+    test_validate_ascii();
+    test_validate_ascii_boundaries();
+    test_pasta_to_json_primitives();
+    test_pasta_to_json_nested();
+    test_pasta_to_json_escaping();
+    test_pasta_to_json_empty_containers();
+    test_pasta_to_json_numbers();
+    test_pasta_to_json_deeply_nested();
+    test_pasta_sorted_write();
+    test_pasta_sorted_nested();
 
     printf("\n%d/%d tests passed\n", tests_run - tests_failed, tests_run);
     return tests_failed ? 1 : 0;

@@ -4,3 +4,9 @@
 [submodule "vendor/libsodium"]
 	path = vendor/libsodium
 	url = https://github.com/jedisct1/libsodium.git
+[submodule "vendor/basta"]
+	path = vendor/basta
+	url = https://github.com/IridiumFX/Basta.git
+[submodule "vendor/alforno"]
+	path = vendor/alforno
+	url = https://github.com/IridiumFX/alforno.git

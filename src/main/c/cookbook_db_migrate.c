@@ -25,6 +25,7 @@ static const char *SCHEMA_SQL =
     "  triple            TEXT NOT NULL,"
     "  snapshot          INTEGER DEFAULT 0,"
     "  yanked            INTEGER DEFAULT 0,"
+    "  yank_reason       TEXT,"
     "  status            TEXT DEFAULT 'pending',"
     "  sha256            TEXT NOT NULL,"
     "  descriptor_sha256 TEXT,"
@@ -47,6 +48,34 @@ static const char *SCHEMA_SQL =
 
     "CREATE INDEX IF NOT EXISTS idx_artifact_semver_range "
     "  ON artifact_semver(major, minor, patch);"
+
+    "CREATE TABLE IF NOT EXISTS credentials ("
+    "  subject     TEXT PRIMARY KEY,"
+    "  token_hash  TEXT NOT NULL,"
+    "  groups      TEXT NOT NULL,"
+    "  created_at  TEXT,"
+    "  revoked_at  TEXT"
+    ");"
+
+    "CREATE TABLE IF NOT EXISTS policies ("
+    "  subject     TEXT PRIMARY KEY,"
+    "  kind        TEXT NOT NULL DEFAULT 'user',"
+    "  pastlet     TEXT NOT NULL,"
+    "  updated_at  TEXT NOT NULL DEFAULT (datetime('now'))"
+    ");"
+
+    "CREATE TABLE IF NOT EXISTS peers ("
+    "  peer_id     TEXT PRIMARY KEY,"
+    "  name        TEXT NOT NULL,"
+    "  url         TEXT NOT NULL UNIQUE,"
+    "  mode        TEXT NOT NULL DEFAULT 'redirect',"
+    "  priority    INTEGER DEFAULT 100,"
+    "  enabled     INTEGER DEFAULT 1,"
+    "  public_key  TEXT,"
+    "  added_at    TEXT,"
+    "  last_seen   TEXT,"
+    "  last_status INTEGER DEFAULT 0"
+    ");"
 ;
 
 cookbook_db_status cookbook_db_migrate(cookbook_db *db) {

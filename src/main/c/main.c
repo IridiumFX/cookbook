@@ -88,6 +88,10 @@ int main(int argc, char **argv) {
     const char *rate_str    = env_or("COOKBOOK_RATE_LIMIT_PER_MIN", "0");
     int         rate_limit  = atoi(rate_str);
     const char *key_dir     = env_or("COOKBOOK_KEY_DIR", NULL);
+    const char *grid_str    = env_or("COOKBOOK_GRID_ENABLED", "0");
+    int         grid_enabled = atoi(grid_str);
+    const char *grid_hops_str = env_or("COOKBOOK_GRID_MAX_HOPS", "3");
+    int         grid_max_hops = atoi(grid_hops_str);
 
     /* registry Ed25519 key pair */
     unsigned char registry_pk[32], registry_sk[64];
@@ -185,7 +189,9 @@ int main(int argc, char **argv) {
         .jwt_ttl_sec         = jwt_ttl,
         .rate_limit_per_min  = rate_limit,
         .registry_pk         = has_key ? registry_pk : NULL,
-        .registry_sk         = has_key ? registry_sk : NULL
+        .registry_sk         = has_key ? registry_sk : NULL,
+        .grid_enabled        = grid_enabled,
+        .grid_max_hops       = grid_max_hops
     };
 
     cookbook_server *srv = cookbook_server_start(&opts);

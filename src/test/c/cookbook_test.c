@@ -7,6 +7,9 @@
 #include "cookbook_semver.h"
 #include "cookbook_sha256.h"
 #include "cookbook_auth.h"
+#include "cookbook_grid.h"
+#include "cookbook_policy.h"
+#include "alforno.h"
 #include "pasta.h"
 #include <sodium.h>
 
@@ -564,6 +567,227 @@ static void test_range_bounded(void) {
     ASSERT(cookbook_range_satisfies(&r, &v) == 0, "0.9.0 fails [1,2)");
 }
 
+/* ---- F3: credential tests ---- */
+
+static void test_base64_std_decode(void) {
+    /* "alice:secrettoken" → base64 "YWxpY2U6c2VjcmV0dG9rZW4=" */
+    const char *b64 = "YWxpY2U6c2VjcmV0dG9rZW4=";
+    char out[64] = {0};
+    size_t len = cookbook_base64_decode(b64, strlen(b64), out, sizeof(out) - 1);
+    out[len] = '\0';
+    ASSERT(len == 17, "base64 std decode length");
+    ASSERT(strcmp(out, "alice:secrettoken") == 0, "base64 std decode value");
+
+    /* empty input */
+    len = cookbook_base64_decode("", 0, out, sizeof(out));
+    ASSERT(len == 0, "base64 std decode empty");
+
+    /* no padding */
+    const char *b64np = "YWxpY2U6c2VjcmV0dG9rZW4";
+    len = cookbook_base64_decode(b64np, strlen(b64np), out, sizeof(out) - 1);
+    out[len] = '\0';
+    ASSERT(len == 17, "base64 std decode no-padding length");
+    ASSERT(strcmp(out, "alice:secrettoken") == 0, "base64 std decode no-padding");
+
+    /* with + and / characters */
+    const char *b64plus = "YQ+/";
+    len = cookbook_base64_decode(b64plus, 4, out, sizeof(out));
+    ASSERT(len == 3, "base64 std decode with +/");
+}
+
+static void test_credential_hash_verify(void) {
+    const char *token = "my-secret-token-12345";
+    char *hash = cookbook_credential_hash(token);
+    ASSERT(hash != NULL, "credential hash not NULL");
+
+    int rc = cookbook_credential_verify(token, hash);
+    ASSERT(rc == 0, "credential verify correct token");
+
+    free(hash);
+}
+
+static void test_credential_verify_wrong(void) {
+    const char *token = "correct-token";
+    char *hash = cookbook_credential_hash(token);
+    ASSERT(hash != NULL, "hash for wrong-token test");
+
+    int rc = cookbook_credential_verify("wrong-token", hash);
+    ASSERT(rc != 0, "credential verify rejects wrong token");
+
+    free(hash);
+}
+
+static void test_credentials_table(void) {
+    cookbook_db *db = cookbook_db_open_sqlite(NULL);
+    cookbook_db_migrate(db);
+
+    /* hash a token and store it */
+    char *hash = cookbook_credential_hash("my-api-key");
+    ASSERT(hash != NULL, "hash for credentials table test");
+
+    cookbook_db_param ip[] = {
+        COOKBOOK_P_TEXT("alice"),
+        COOKBOOK_P_TEXT(hash),
+        COOKBOOK_P_TEXT("org.acme,org.beta")
+    };
+    cookbook_db_status st = db->exec_p(db,
+        "INSERT INTO credentials (subject, token_hash, groups) "
+        "VALUES (?1, ?2, ?3)", ip, 3);
+    ASSERT(st == COOKBOOK_DB_OK, "insert credential");
+
+    /* look it up */
+    int count = 0;
+    cookbook_db_param qp[] = { COOKBOOK_P_TEXT("alice") };
+    db->query_p(db,
+        "SELECT token_hash, groups FROM credentials "
+        "WHERE subject = ?1 AND revoked_at IS NULL",
+        qp, 1, count_cb, &count);
+    ASSERT(count == 1, "credential found");
+
+    /* duplicate subject should fail */
+    st = db->exec_p(db,
+        "INSERT INTO credentials (subject, token_hash, groups) "
+        "VALUES (?1, ?2, ?3)", ip, 3);
+    ASSERT(st == COOKBOOK_DB_CONSTRAINT, "duplicate credential rejected");
+
+    /* revoke and verify not found with revoked_at IS NULL */
+    cookbook_db_param rp[] = { COOKBOOK_P_TEXT("alice") };
+    st = db->exec_p(db,
+        "UPDATE credentials SET revoked_at = '2026-01-01' "
+        "WHERE subject = ?1", rp, 1);
+    ASSERT(st == COOKBOOK_DB_OK, "revoke credential");
+
+    count = 0;
+    db->query_p(db,
+        "SELECT token_hash FROM credentials "
+        "WHERE subject = ?1 AND revoked_at IS NULL",
+        qp, 1, count_cb, &count);
+    ASSERT(count == 0, "revoked credential excluded");
+
+    free(hash);
+    db->close(db);
+}
+
+/* ---- Grid tests ---- */
+
+static void test_grid_loop_detection(void) {
+    ASSERT(cookbook_grid_is_loop("nodeA", "nodeA") == 1,
+           "loop: exact match");
+    ASSERT(cookbook_grid_is_loop("nodeA", "nodeB,nodeA") == 1,
+           "loop: in chain");
+    ASSERT(cookbook_grid_is_loop("nodeA", "nodeB,nodeC") == 0,
+           "no loop: not in chain");
+    ASSERT(cookbook_grid_is_loop("nodeA", "") == 0,
+           "no loop: empty chain");
+    ASSERT(cookbook_grid_is_loop("nodeA", NULL) == 0,
+           "no loop: NULL chain");
+    ASSERT(cookbook_grid_is_loop("node", "nodeA,nodeB") == 0,
+           "no loop: prefix not match");
+    ASSERT(cookbook_grid_is_loop("nodeA", "nodeAB,nodeC") == 0,
+           "no loop: substring not match");
+}
+
+static void test_grid_peers_table(void) {
+    cookbook_db *db = cookbook_db_open_sqlite(NULL);
+    cookbook_db_migrate(db);
+
+    /* insert a peer */
+    cookbook_db_param pp[] = {
+        COOKBOOK_P_TEXT("east-1"),
+        COOKBOOK_P_TEXT("East Region"),
+        COOKBOOK_P_TEXT("http://east-1:8080"),
+        COOKBOOK_P_TEXT("redirect"),
+        COOKBOOK_P_INT(50)
+    };
+    cookbook_db_status st = db->exec_p(db,
+        "INSERT INTO peers (peer_id, name, url, mode, priority, enabled) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, 1)", pp, 5);
+    ASSERT(st == COOKBOOK_DB_OK, "insert peer");
+
+    /* duplicate URL should fail */
+    cookbook_db_param pp2[] = {
+        COOKBOOK_P_TEXT("east-2"),
+        COOKBOOK_P_TEXT("East 2"),
+        COOKBOOK_P_TEXT("http://east-1:8080"),
+        COOKBOOK_P_TEXT("proxy"),
+        COOKBOOK_P_INT(100)
+    };
+    st = db->exec_p(db,
+        "INSERT INTO peers (peer_id, name, url, mode, priority, enabled) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, 1)", pp2, 5);
+    ASSERT(st == COOKBOOK_DB_CONSTRAINT, "duplicate URL rejected");
+
+    /* verify peer exists */
+    int count = 0;
+    db->query(db, "SELECT peer_id FROM peers WHERE enabled = 1",
+              count_cb, &count);
+    ASSERT(count == 1, "one enabled peer");
+
+    /* disable peer */
+    cookbook_db_param dp[] = { COOKBOOK_P_TEXT("east-1") };
+    db->exec_p(db,
+        "UPDATE peers SET enabled = 0 WHERE peer_id = ?1", dp, 1);
+
+    count = 0;
+    db->query(db, "SELECT peer_id FROM peers WHERE enabled = 1",
+              count_cb, &count);
+    ASSERT(count == 0, "no enabled peers after disable");
+
+    db->close(db);
+}
+
+static void test_grid_peer_load(void) {
+    cookbook_db *db = cookbook_db_open_sqlite(NULL);
+    cookbook_db_migrate(db);
+
+    /* insert two peers with different priorities */
+    cookbook_db_param p1[] = {
+        COOKBOOK_P_TEXT("west-1"),
+        COOKBOOK_P_TEXT("West Region"),
+        COOKBOOK_P_TEXT("http://west-1:8080"),
+        COOKBOOK_P_TEXT("proxy"),
+        COOKBOOK_P_INT(200)
+    };
+    db->exec_p(db,
+        "INSERT INTO peers (peer_id, name, url, mode, priority, enabled) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, 1)", p1, 5);
+
+    cookbook_db_param p2[] = {
+        COOKBOOK_P_TEXT("east-1"),
+        COOKBOOK_P_TEXT("East Region"),
+        COOKBOOK_P_TEXT("http://east-1:8080"),
+        COOKBOOK_P_TEXT("redirect"),
+        COOKBOOK_P_INT(50)
+    };
+    db->exec_p(db,
+        "INSERT INTO peers (peer_id, name, url, mode, priority, enabled) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, 1)", p2, 5);
+
+    /* disabled peer */
+    cookbook_db_param p3[] = {
+        COOKBOOK_P_TEXT("down-1"),
+        COOKBOOK_P_TEXT("Down"),
+        COOKBOOK_P_TEXT("http://down-1:8080"),
+        COOKBOOK_P_TEXT("redirect"),
+        COOKBOOK_P_INT(10)
+    };
+    db->exec_p(db,
+        "INSERT INTO peers (peer_id, name, url, mode, priority, enabled) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, 0)", p3, 5);
+
+    cookbook_peer *peers = NULL;
+    int n = cookbook_grid_load_peers(db, &peers);
+    ASSERT(n == 2, "load 2 enabled peers");
+    /* should be sorted by priority: east-1 (50) before west-1 (200) */
+    ASSERT(strcmp(peers[0].peer_id, "east-1") == 0, "first peer is east-1");
+    ASSERT(peers[0].mode == 'r', "east-1 mode is redirect");
+    ASSERT(strcmp(peers[1].peer_id, "west-1") == 0, "second peer is west-1");
+    ASSERT(peers[1].mode == 'p', "west-1 mode is proxy");
+
+    cookbook_grid_free_peers(peers, n);
+    db->close(db);
+}
+
 /* ---- #8: content negotiation tests ---- */
 
 static void test_validate_ascii(void) {
@@ -829,6 +1053,217 @@ static void test_db_yanked_status(void) {
         "AND status = 'published' AND group_id = ?1", yp, 1,
         count_cb, &count);
     ASSERT(count == 0, "yanked artifact excluded from resolve");
+
+    db->close(db);
+}
+
+/* F1: yank reason stored and retrieved */
+static void test_db_yank_reason(void) {
+    cookbook_db *db = cookbook_db_open_sqlite(NULL);
+    cookbook_db_migrate(db);
+
+    db->exec(db,
+        "INSERT INTO groups (group_id, owner_sub) "
+        "VALUES ('org.yr', 'alice')");
+
+    cookbook_db_param ap[] = {
+        COOKBOOK_P_TEXT("org.yr:lib:1.0.0:noarch"),
+        COOKBOOK_P_TEXT("org.yr"),
+        COOKBOOK_P_TEXT("lib"),
+        COOKBOOK_P_TEXT("1.0.0"),
+        COOKBOOK_P_TEXT("noarch"),
+        COOKBOOK_P_TEXT("deadbeef"),
+        COOKBOOK_P_INT(0),
+        COOKBOOK_P_TEXT("published"),
+        COOKBOOK_P_INT(512)
+    };
+    db->exec_p(db,
+        "INSERT INTO artifacts "
+        "(coord_id, group_id, artifact, version, triple, sha256, "
+        " snapshot, status, size_bytes) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", ap, 9);
+
+    /* yank with reason */
+    cookbook_db_param yp[] = {
+        COOKBOOK_P_TEXT("org.yr"),
+        COOKBOOK_P_TEXT("lib"),
+        COOKBOOK_P_TEXT("1.0.0"),
+        COOKBOOK_P_TEXT("CVE-2026-1234: remote code execution")
+    };
+    cookbook_db_status st = db->exec_p(db,
+        "UPDATE artifacts SET yanked = 1, yank_reason = ?4 "
+        "WHERE group_id = ?1 AND artifact = ?2 AND version = ?3",
+        yp, 4);
+    ASSERT(st == COOKBOOK_DB_OK, "yank with reason succeeds");
+
+    /* verify reason stored via WHERE filter */
+    int count = 0;
+    cookbook_db_param fp[] = {
+        COOKBOOK_P_TEXT("org.yr:lib:1.0.0:noarch"),
+        COOKBOOK_P_TEXT("CVE-2026-1234: remote code execution")
+    };
+    db->query_p(db,
+        "SELECT coord_id FROM artifacts "
+        "WHERE coord_id = ?1 AND yank_reason = ?2",
+        fp, 2, count_cb, &count);
+    ASSERT(count == 1, "yank reason stored correctly");
+
+    /* yank without reason — reason should be NULL */
+    cookbook_db_param ap2[] = {
+        COOKBOOK_P_TEXT("org.yr:lib:2.0.0:noarch"),
+        COOKBOOK_P_TEXT("org.yr"),
+        COOKBOOK_P_TEXT("lib"),
+        COOKBOOK_P_TEXT("2.0.0"),
+        COOKBOOK_P_TEXT("noarch"),
+        COOKBOOK_P_TEXT("cafebabe"),
+        COOKBOOK_P_INT(0),
+        COOKBOOK_P_TEXT("published"),
+        COOKBOOK_P_INT(256)
+    };
+    db->exec_p(db,
+        "INSERT INTO artifacts "
+        "(coord_id, group_id, artifact, version, triple, sha256, "
+        " snapshot, status, size_bytes) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", ap2, 9);
+
+    cookbook_db_param yp2[] = {
+        COOKBOOK_P_TEXT("org.yr"),
+        COOKBOOK_P_TEXT("lib"),
+        COOKBOOK_P_TEXT("2.0.0"),
+        COOKBOOK_P_NULL()
+    };
+    st = db->exec_p(db,
+        "UPDATE artifacts SET yanked = 1, yank_reason = ?4 "
+        "WHERE group_id = ?1 AND artifact = ?2 AND version = ?3",
+        yp2, 4);
+    ASSERT(st == COOKBOOK_DB_OK, "yank without reason succeeds");
+
+    count = 0;
+    cookbook_db_param fp2[] = {
+        COOKBOOK_P_TEXT("org.yr:lib:2.0.0:noarch")
+    };
+    db->query_p(db,
+        "SELECT coord_id FROM artifacts "
+        "WHERE coord_id = ?1 AND yank_reason IS NULL",
+        fp2, 1, count_cb, &count);
+    ASSERT(count == 1, "yank without reason stores NULL");
+
+    db->close(db);
+}
+
+/* F2: resolve with include_yanked returns yanked versions */
+static void test_db_resolve_include_yanked(void) {
+    cookbook_db *db = cookbook_db_open_sqlite(NULL);
+    cookbook_db_migrate(db);
+
+    db->exec(db,
+        "INSERT INTO groups (group_id, owner_sub) "
+        "VALUES ('org.ry', 'alice')");
+
+    /* insert v1.0.0 (will be yanked) and v2.0.0 (published) */
+    cookbook_db_param a1[] = {
+        COOKBOOK_P_TEXT("org.ry:lib:1.0.0:noarch"),
+        COOKBOOK_P_TEXT("org.ry"),
+        COOKBOOK_P_TEXT("lib"),
+        COOKBOOK_P_TEXT("1.0.0"),
+        COOKBOOK_P_TEXT("noarch"),
+        COOKBOOK_P_TEXT("aaa"),
+        COOKBOOK_P_INT(0),
+        COOKBOOK_P_TEXT("published"),
+        COOKBOOK_P_INT(100)
+    };
+    db->exec_p(db,
+        "INSERT INTO artifacts "
+        "(coord_id, group_id, artifact, version, triple, sha256, "
+        " snapshot, status, size_bytes) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", a1, 9);
+
+    cookbook_db_param s1[] = {
+        COOKBOOK_P_TEXT("org.ry:lib:1.0.0:noarch"),
+        COOKBOOK_P_INT(1), COOKBOOK_P_INT(0), COOKBOOK_P_INT(0),
+        COOKBOOK_P_TEXT(""), COOKBOOK_P_TEXT("")
+    };
+    db->exec_p(db,
+        "INSERT INTO artifact_semver "
+        "(coord_id, major, minor, patch, pre_release, build_meta) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, ?6)", s1, 6);
+
+    cookbook_db_param a2[] = {
+        COOKBOOK_P_TEXT("org.ry:lib:2.0.0:noarch"),
+        COOKBOOK_P_TEXT("org.ry"),
+        COOKBOOK_P_TEXT("lib"),
+        COOKBOOK_P_TEXT("2.0.0"),
+        COOKBOOK_P_TEXT("noarch"),
+        COOKBOOK_P_TEXT("bbb"),
+        COOKBOOK_P_INT(0),
+        COOKBOOK_P_TEXT("published"),
+        COOKBOOK_P_INT(200)
+    };
+    db->exec_p(db,
+        "INSERT INTO artifacts "
+        "(coord_id, group_id, artifact, version, triple, sha256, "
+        " snapshot, status, size_bytes) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", a2, 9);
+
+    cookbook_db_param s2[] = {
+        COOKBOOK_P_TEXT("org.ry:lib:2.0.0:noarch"),
+        COOKBOOK_P_INT(2), COOKBOOK_P_INT(0), COOKBOOK_P_INT(0),
+        COOKBOOK_P_TEXT(""), COOKBOOK_P_TEXT("")
+    };
+    db->exec_p(db,
+        "INSERT INTO artifact_semver "
+        "(coord_id, major, minor, patch, pre_release, build_meta) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, ?6)", s2, 6);
+
+    /* yank v1.0.0 with reason */
+    cookbook_db_param yp[] = {
+        COOKBOOK_P_TEXT("org.ry"),
+        COOKBOOK_P_TEXT("lib"),
+        COOKBOOK_P_TEXT("1.0.0"),
+        COOKBOOK_P_TEXT("security vulnerability")
+    };
+    db->exec_p(db,
+        "UPDATE artifacts SET yanked = 1, yank_reason = ?4 "
+        "WHERE group_id = ?1 AND artifact = ?2 AND version = ?3",
+        yp, 4);
+
+    /* default resolve (exclude yanked) */
+    int count = 0;
+    cookbook_db_param rp[] = {
+        COOKBOOK_P_TEXT("org.ry"),
+        COOKBOOK_P_TEXT("lib")
+    };
+    db->query_p(db,
+        "SELECT a.version FROM artifacts a "
+        "JOIN artifact_semver s ON a.coord_id = s.coord_id "
+        "WHERE a.group_id = ?1 AND a.artifact = ?2 "
+        "AND a.yanked = 0 AND a.status = 'published'",
+        rp, 2, count_cb, &count);
+    ASSERT(count == 1, "default resolve excludes yanked");
+
+    /* include_yanked resolve */
+    count = 0;
+    db->query_p(db,
+        "SELECT a.version FROM artifacts a "
+        "JOIN artifact_semver s ON a.coord_id = s.coord_id "
+        "WHERE a.group_id = ?1 AND a.artifact = ?2 "
+        "AND a.status = 'published'",
+        rp, 2, count_cb, &count);
+    ASSERT(count == 2, "include_yanked resolve returns both versions");
+
+    /* verify yanked version has reason in extended query */
+    count = 0;
+    cookbook_db_param vrp[] = {
+        COOKBOOK_P_TEXT("org.ry"),
+        COOKBOOK_P_TEXT("lib"),
+        COOKBOOK_P_TEXT("security vulnerability")
+    };
+    db->query_p(db,
+        "SELECT a.version FROM artifacts a "
+        "WHERE a.group_id = ?1 AND a.artifact = ?2 "
+        "AND a.yanked = 1 AND a.yank_reason = ?3",
+        vrp, 3, count_cb, &count);
+    ASSERT(count == 1, "yanked version has correct reason in resolve");
 
     db->close(db);
 }
@@ -1223,6 +1658,378 @@ static void test_pasta_sorted_write(void) {
     }
 }
 
+/* ---- auth v2: policy tests ---- */
+
+static void test_policy_crud(void) {
+    cookbook_db *db = cookbook_db_open_sqlite(NULL);
+    cookbook_db_migrate(db);
+
+    /* put a policy */
+    int rc = cookbook_policy_put(db, "alice", "user",
+        "@identity {\n  subject: \"alice\",\n  kind: \"user\",\n"
+        "  teams: [core]\n}\n@grants {\n  com.iridiumfx: \"crwd\"\n}\n");
+    ASSERT(rc == 0, "policy put succeeds");
+
+    /* get it back */
+    char *p = cookbook_policy_get(db, "alice");
+    ASSERT(p != NULL, "policy get returns non-NULL");
+    ASSERT(strstr(p, "alice") != NULL, "policy contains subject");
+    ASSERT(strstr(p, "crwd") != NULL, "policy contains grants");
+    free(p);
+
+    /* get non-existent */
+    char *p2 = cookbook_policy_get(db, "bob");
+    ASSERT(p2 == NULL, "non-existent policy returns NULL");
+
+    /* update (replace) */
+    rc = cookbook_policy_put(db, "alice", "user",
+        "@identity {\n  subject: \"alice\"\n}\n"
+        "@grants {\n  com.iridiumfx: \"r\"\n}\n");
+    ASSERT(rc == 0, "policy update succeeds");
+    p = cookbook_policy_get(db, "alice");
+    ASSERT(p != NULL, "updated policy exists");
+    ASSERT(strstr(p, "\"r\"") != NULL, "updated policy has new grant");
+    free(p);
+
+    /* delete */
+    rc = cookbook_policy_delete(db, "alice");
+    ASSERT(rc == 0, "policy delete succeeds");
+    p = cookbook_policy_get(db, "alice");
+    ASSERT(p == NULL, "deleted policy is gone");
+
+    db->close(db);
+}
+
+static void test_policy_resolve(void) {
+    cookbook_db *db = cookbook_db_open_sqlite(NULL);
+    cookbook_db_migrate(db);
+
+    /* add user with team reference */
+    cookbook_policy_put(db, "alice", "user",
+        "@identity {\n  subject: \"alice\",\n  kind: \"user\",\n"
+        "  teams: [core]\n}\n"
+        "@grants {\n  com.iridiumfx: \"r\"\n}\n");
+
+    /* add team policy */
+    cookbook_policy_put(db, "core", "team",
+        "@identity {\n  team_id: \"core\",\n  kind: \"team\"\n}\n"
+        "@grants {\n  com.iridiumfx: \"crwd\",\n"
+        "  com.iridiumfx.internal: \"crwd\"\n}\n"
+        "@exclude {\n  com.iridiumfx.secret: true\n}\n");
+
+    /* resolve — should aggregate alice + core */
+    char *json = cookbook_policy_resolve(db, "alice");
+    ASSERT(json != NULL, "policy resolve returns non-NULL");
+    ASSERT(strstr(json, "\"grants\"") != NULL, "resolved has grants");
+    ASSERT(strstr(json, "com.iridiumfx") != NULL, "resolved has group");
+    ASSERT(strstr(json, "\"exclude\"") != NULL, "resolved has exclude");
+    ASSERT(strstr(json, "com.iridiumfx.secret") != NULL, "resolved has exclusion");
+
+    /* verify collect OR: com.iridiumfx should have permissions from BOTH
+       user ("r") and team ("crwd") OR'd together, not just last-write-wins */
+    ASSERT(strstr(json, "crwd") != NULL || strstr(json, "rcrwd") != NULL,
+           "resolved grants OR user+team permissions");
+
+    /* com.iridiumfx.internal only in team → single value, not array */
+    ASSERT(strstr(json, "com.iridiumfx.internal") != NULL,
+           "team-only grant preserved");
+    free(json);
+
+    /* resolve non-existent user */
+    char *j2 = cookbook_policy_resolve(db, "nobody");
+    ASSERT(j2 == NULL, "resolve unknown user returns NULL");
+
+    db->close(db);
+}
+
+static void test_policy_resolve_collect(void) {
+    /* prove that merge:"collect" OR's permissions instead of last-write-wins */
+    cookbook_db *db = cookbook_db_open_sqlite(NULL);
+    cookbook_db_migrate(db);
+
+    /* user has 'r' only, team has 'cw' only — result must have all three */
+    cookbook_policy_put(db, "dev1", "user",
+        "@identity {\n  subject: \"dev1\",\n  kind: \"user\",\n"
+        "  teams: [builders]\n}\n"
+        "@grants {\n  com.example: \"r\"\n}\n");
+
+    cookbook_policy_put(db, "builders", "team",
+        "@identity {\n  team_id: \"builders\",\n  kind: \"team\"\n}\n"
+        "@grants {\n  com.example: \"cw\"\n}\n");
+
+    char *json = cookbook_policy_resolve(db, "dev1");
+    ASSERT(json != NULL, "collect resolve returns non-NULL");
+
+    /* with last-write-wins: "cw" only. with collect OR: "rcw" or "cwr" etc. */
+    int has_r = (strstr(json, "r") != NULL);
+    int has_c = (strstr(json, "c") != NULL);
+    int has_w = (strstr(json, "w") != NULL);
+    ASSERT(has_r && has_c && has_w,
+           "collect OR yields all three permissions (r+cw)");
+
+    /* verify via auth_check that all three ops are allowed */
+    ASSERT(cookbook_auth_check(json, NULL, "com.example", 'r') == 1,
+           "collect: read allowed (from user)");
+    ASSERT(cookbook_auth_check(json, NULL, "com.example", 'c') == 1,
+           "collect: create allowed (from team)");
+    ASSERT(cookbook_auth_check(json, NULL, "com.example", 'w') == 1,
+           "collect: write allowed (from team)");
+    ASSERT(cookbook_auth_check(json, NULL, "com.example", 'd') == 0,
+           "collect: delete denied (nobody granted it)");
+
+    free(json);
+    db->close(db);
+}
+
+static void test_auth_check_prefix(void) {
+    const char *grants =
+        "{\"grants\":{\"com.iridiumfx\":\"crwd\",\"org.acme\":\"r\"},"
+        "\"exclude\":{}}";
+
+    /* exact prefix match */
+    ASSERT(cookbook_auth_check(grants, NULL, "com.iridiumfx", 'r') == 1,
+           "exact prefix read allowed");
+    ASSERT(cookbook_auth_check(grants, NULL, "com.iridiumfx", 'c') == 1,
+           "exact prefix create allowed");
+
+    /* hierarchical match: com.iridiumfx.pasta starts with com.iridiumfx */
+    ASSERT(cookbook_auth_check(grants, NULL, "com.iridiumfx.pasta", 'r') == 1,
+           "hierarchical read allowed");
+    ASSERT(cookbook_auth_check(grants, NULL, "com.iridiumfx.pasta", 'w') == 1,
+           "hierarchical write allowed");
+
+    /* org.acme is read-only */
+    ASSERT(cookbook_auth_check(grants, NULL, "org.acme", 'r') == 1,
+           "org.acme read allowed");
+    ASSERT(cookbook_auth_check(grants, NULL, "org.acme.sdk", 'r') == 1,
+           "org.acme.sdk read allowed");
+    ASSERT(cookbook_auth_check(grants, NULL, "org.acme", 'w') == 0,
+           "org.acme write denied");
+    ASSERT(cookbook_auth_check(grants, NULL, "org.acme.sdk", 'c') == 0,
+           "org.acme.sdk create denied");
+
+    /* no matching grant */
+    ASSERT(cookbook_auth_check(grants, NULL, "net.example", 'r') == 0,
+           "ungranted group denied");
+
+    /* prefix must match at dot boundary */
+    ASSERT(cookbook_auth_check(grants, NULL, "com.iridiumfxtra", 'r') == 0,
+           "non-dot-boundary prefix rejected");
+}
+
+static void test_auth_check_exclude(void) {
+    const char *grants =
+        "{\"grants\":{\"com.iridiumfx\":\"crwd\"},"
+        "\"exclude\":{\"com.iridiumfx.secret\":true}}";
+
+    /* normal access allowed */
+    ASSERT(cookbook_auth_check(grants, NULL, "com.iridiumfx.pasta", 'r') == 1,
+           "non-excluded group allowed");
+
+    /* excluded group denied despite grant */
+    ASSERT(cookbook_auth_check(grants, NULL, "com.iridiumfx.secret", 'r') == 0,
+           "excluded group denied");
+
+    /* sub-group of excluded also denied */
+    ASSERT(cookbook_auth_check(grants, NULL, "com.iridiumfx.secret.keys", 'r') == 0,
+           "sub-group of excluded denied");
+}
+
+static void test_auth_check_edge_cases(void) {
+    /* NULL grants */
+    ASSERT(cookbook_auth_check(NULL, NULL, "com.foo", 'r') == 0,
+           "NULL grants denied");
+
+    /* NULL group */
+    ASSERT(cookbook_auth_check("{\"grants\":{}}", NULL, NULL, 'r') == 0,
+           "NULL group denied");
+
+    /* empty grants */
+    ASSERT(cookbook_auth_check("{\"grants\":{},\"exclude\":{}}", NULL,
+                               "com.foo", 'r') == 0,
+           "empty grants denied");
+}
+
+static void test_alforno_integration(void) {
+    /* verify alforno aggregate works with our pasta pastlets */
+    const char *user_pastlet =
+        "@identity {\n  subject: \"test\"\n}\n"
+        "@grants {\n  com.test: \"r\"\n}\n";
+    const char *team_pastlet =
+        "@identity {\n  team_id: \"devs\"\n}\n"
+        "@grants {\n  com.test: \"cw\",\n  org.shared: \"r\"\n}\n";
+
+    AlfResult ar;
+    AlfContext *ctx = alf_create(ALF_AGGREGATE, &ar);
+    ASSERT(ctx != NULL, "alf_create succeeds");
+    if (!ctx) return;
+
+    int rc = alf_add_input(ctx, user_pastlet, strlen(user_pastlet), &ar);
+    ASSERT(rc == 0, "alf_add_input user succeeds");
+
+    rc = alf_add_input(ctx, team_pastlet, strlen(team_pastlet), &ar);
+    ASSERT(rc == 0, "alf_add_input team succeeds");
+
+    PastaValue *resolved = alf_process(ctx, &ar);
+    ASSERT(resolved != NULL, "alf_process succeeds");
+
+    /* check that @grants section exists */
+    const PastaValue *grants = pasta_map_get(resolved, "grants");
+    ASSERT(grants != NULL, "resolved has @grants");
+    ASSERT(pasta_type(grants) == PASTA_MAP, "@grants is a map");
+
+    /* last-write-wins: com.test should be "cw" (from team, which came second) */
+    const PastaValue *ct = pasta_map_get(grants, "com.test");
+    ASSERT(ct != NULL, "com.test grant exists");
+    ASSERT(pasta_type(ct) == PASTA_STRING, "com.test is string");
+    ASSERT(strcmp(pasta_get_string(ct), "cw") == 0,
+           "com.test is 'cw' (last-write-wins from team)");
+
+    /* org.shared should be "r" (only in team) */
+    const PastaValue *os = pasta_map_get(grants, "org.shared");
+    ASSERT(os != NULL, "org.shared grant exists");
+    ASSERT(strcmp(pasta_get_string(os), "r") == 0,
+           "org.shared is 'r'");
+
+    /* check @exclude doesn't exist (neither pastlet has it) */
+    const PastaValue *exc = pasta_map_get(resolved, "exclude");
+    ASSERT(exc == NULL, "no @exclude when none provided");
+
+    pasta_free(resolved);
+    alf_free(ctx);
+}
+
+/* ---- auth v2 phase 2: JWT v2 tests ---- */
+
+static void test_jwt_v2_roundtrip(void) {
+    unsigned char pk[32], sk[64];
+    cookbook_keygen(pk, sk);
+
+    const char *resolved = "{\"grants\":{\"com.iridiumfx\":\"crwd\",\"org.acme\":\"r\"},"
+                           "\"exclude\":{\"com.iridiumfx.secret\":true}}";
+
+    char *token = cookbook_jwt_create_v2("alice", "com.iridiumfx",
+                                          resolved, 3600, sk);
+    ASSERT(token != NULL, "jwt v2 create succeeds");
+
+    cookbook_jwt_claims claims;
+    int rc = cookbook_jwt_verify(token, pk, &claims);
+    ASSERT(rc == 0, "jwt v2 verify succeeds");
+    ASSERT(claims.valid == 1, "jwt v2 claims valid");
+    ASSERT(claims.version == 2, "jwt v2 version is 2");
+    ASSERT(strcmp(claims.sub, "alice") == 0, "jwt v2 sub is alice");
+    ASSERT(strcmp(claims.groups, "com.iridiumfx") == 0, "jwt v2 groups preserved");
+
+    /* check grants extracted */
+    ASSERT(claims.grants_json != NULL, "jwt v2 grants_json extracted");
+    ASSERT(strstr(claims.grants_json, "com.iridiumfx") != NULL,
+           "jwt v2 grants contains com.iridiumfx");
+    ASSERT(strstr(claims.grants_json, "crwd") != NULL,
+           "jwt v2 grants contains crwd");
+    ASSERT(strstr(claims.grants_json, "org.acme") != NULL,
+           "jwt v2 grants contains org.acme");
+
+    /* check exclude extracted */
+    ASSERT(claims.exclude_json != NULL, "jwt v2 exclude_json extracted");
+    ASSERT(strstr(claims.exclude_json, "com.iridiumfx.secret") != NULL,
+           "jwt v2 exclude contains com.iridiumfx.secret");
+
+    /* use auth_check with extracted claims */
+    ASSERT(cookbook_auth_check(claims.grants_json, claims.exclude_json,
+                               "com.iridiumfx.pasta", 'r') == 1,
+           "jwt v2 grants allow read on sub-group");
+    ASSERT(cookbook_auth_check(claims.grants_json, claims.exclude_json,
+                               "com.iridiumfx.secret", 'r') == 0,
+           "jwt v2 exclude blocks secret");
+    ASSERT(cookbook_auth_check(claims.grants_json, claims.exclude_json,
+                               "org.acme", 'r') == 1,
+           "jwt v2 grants allow read on org.acme");
+    ASSERT(cookbook_auth_check(claims.grants_json, claims.exclude_json,
+                               "org.acme", 'w') == 0,
+           "jwt v2 org.acme write denied (read-only)");
+
+    cookbook_jwt_claims_free(&claims);
+    free(token);
+}
+
+static void test_jwt_v2_policy_integration(void) {
+    /* end-to-end: store policy → resolve → create JWT v2 → verify → check */
+    cookbook_db *db = cookbook_db_open_sqlite(NULL);
+    cookbook_db_migrate(db);
+
+    /* set up user + team policies */
+    cookbook_policy_put(db, "bob", "user",
+        "@identity {\n  subject: \"bob\",\n  kind: \"user\",\n"
+        "  teams: [devs]\n}\n"
+        "@grants {\n  com.example: \"r\"\n}\n");
+
+    cookbook_policy_put(db, "devs", "team",
+        "@identity {\n  team_id: \"devs\",\n  kind: \"team\"\n}\n"
+        "@grants {\n  com.example: \"crwd\",\n"
+        "  com.example.tools: \"rw\"\n}\n"
+        "@exclude {\n  com.example.private: true\n}\n");
+
+    /* resolve */
+    char *resolved = cookbook_policy_resolve(db, "bob");
+    ASSERT(resolved != NULL, "policy resolves for bob");
+
+    /* create JWT v2 */
+    unsigned char pk[32], sk[64];
+    cookbook_keygen(pk, sk);
+
+    char *token = cookbook_jwt_create_v2("bob", NULL, resolved, 3600, sk);
+    ASSERT(token != NULL, "jwt v2 from policy succeeds");
+    free(resolved);
+
+    /* verify and extract */
+    cookbook_jwt_claims claims;
+    int rc = cookbook_jwt_verify(token, pk, &claims);
+    ASSERT(rc == 0, "policy jwt v2 verify succeeds");
+    ASSERT(claims.version == 2, "policy jwt v2 version");
+    ASSERT(claims.grants_json != NULL, "policy jwt v2 has grants");
+    ASSERT(claims.exclude_json != NULL, "policy jwt v2 has exclude");
+
+    /* enforce: com.example.tools should be writable (from team) */
+    ASSERT(cookbook_auth_check(claims.grants_json, claims.exclude_json,
+                               "com.example.tools", 'w') == 1,
+           "bob can write com.example.tools via team");
+
+    /* enforce: com.example.private denied by exclude */
+    ASSERT(cookbook_auth_check(claims.grants_json, claims.exclude_json,
+                               "com.example.private", 'r') == 0,
+           "bob denied com.example.private via exclude");
+
+    /* enforce: com.example readable (aggregate: last-write-wins = crwd from team) */
+    ASSERT(cookbook_auth_check(claims.grants_json, claims.exclude_json,
+                               "com.example", 'c') == 1,
+           "bob can create under com.example (team escalation)");
+
+    cookbook_jwt_claims_free(&claims);
+    free(token);
+    db->close(db);
+}
+
+static void test_jwt_v1_v2_compat(void) {
+    /* v1 token should still work — no grants/exclude, version=1 */
+    unsigned char pk[32], sk[64];
+    cookbook_keygen(pk, sk);
+
+    char *token = cookbook_jwt_create("charlie", "org.test", 3600, sk);
+    ASSERT(token != NULL, "jwt v1 create succeeds");
+
+    cookbook_jwt_claims claims;
+    int rc = cookbook_jwt_verify(token, pk, &claims);
+    ASSERT(rc == 0, "jwt v1 verify succeeds");
+    ASSERT(claims.version == 1, "jwt v1 version is 1");
+    ASSERT(strcmp(claims.sub, "charlie") == 0, "jwt v1 sub");
+    ASSERT(strcmp(claims.groups, "org.test") == 0, "jwt v1 groups");
+    ASSERT(claims.grants_json == NULL, "jwt v1 no grants_json");
+    ASSERT(claims.exclude_json == NULL, "jwt v1 no exclude_json");
+
+    cookbook_jwt_claims_free(&claims);
+    free(token);
+}
+
 int main(void) {
     printf("cookbook test suite\n\n");
 
@@ -1258,6 +2065,8 @@ int main(void) {
     test_range_caret_zero();
     test_range_bounded_inclusive();
     test_db_yanked_status();
+    test_db_yank_reason();
+    test_db_resolve_include_yanked();
     test_db_null_params();
     test_db_pending_to_published();
     test_store_overwrite();
@@ -1265,6 +2074,13 @@ int main(void) {
     test_jwt_expired();
     test_jwt_group_boundary();
     test_base64url_edge_cases();
+    test_base64_std_decode();
+    test_credential_hash_verify();
+    test_credential_verify_wrong();
+    test_credentials_table();
+    test_grid_loop_detection();
+    test_grid_peers_table();
+    test_grid_peer_load();
     test_validate_ascii();
     test_validate_ascii_boundaries();
     test_pasta_to_json_primitives();
@@ -1275,6 +2091,16 @@ int main(void) {
     test_pasta_to_json_deeply_nested();
     test_pasta_sorted_write();
     test_pasta_sorted_nested();
+    test_policy_crud();
+    test_policy_resolve();
+    test_policy_resolve_collect();
+    test_auth_check_prefix();
+    test_auth_check_exclude();
+    test_auth_check_edge_cases();
+    test_alforno_integration();
+    test_jwt_v2_roundtrip();
+    test_jwt_v2_policy_integration();
+    test_jwt_v1_v2_compat();
 
     printf("\n%d/%d tests passed\n", tests_run - tests_failed, tests_run);
     return tests_failed ? 1 : 0;

@@ -72,6 +72,60 @@ size_t cookbook_base64url_decode(const char *src, size_t src_len,
     return out;
 }
 
+/* ==== Standard Base64 decode (for Basic auth) ==== */
+
+static int b64std_val(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+size_t cookbook_base64_decode(const char *src, size_t src_len,
+                              void *dst, size_t dst_len) {
+    unsigned char *d = (unsigned char *)dst;
+    size_t out = 0, i = 0;
+
+    while (src_len > 0 && src[src_len - 1] == '=') src_len--;
+
+    while (i < src_len) {
+        int v0 = (i < src_len) ? b64std_val(src[i++]) : 0;
+        int v1 = (i < src_len) ? b64std_val(src[i++]) : 0;
+        int v2 = (i < src_len) ? b64std_val(src[i++]) : -1;
+        int v3 = (i < src_len) ? b64std_val(src[i++]) : -1;
+
+        if (v0 < 0 || v1 < 0) return 0;
+
+        if (out < dst_len) d[out++] = (unsigned char)((v0 << 2) | (v1 >> 4));
+        if (v2 >= 0 && out < dst_len)
+            d[out++] = (unsigned char)(((v1 & 0xf) << 4) | (v2 >> 2));
+        if (v3 >= 0 && out < dst_len)
+            d[out++] = (unsigned char)(((v2 & 0x3) << 6) | v3);
+    }
+    return out;
+}
+
+/* ==== Credential hashing (Argon2id via libsodium) ==== */
+
+char *cookbook_credential_hash(const char *token) {
+    char *hash = malloc(crypto_pwhash_STRBYTES);
+    if (!hash) return NULL;
+
+    if (crypto_pwhash_str(hash, token, strlen(token),
+                          crypto_pwhash_OPSLIMIT_INTERACTIVE,
+                          crypto_pwhash_MEMLIMIT_INTERACTIVE) != 0) {
+        free(hash);
+        return NULL;
+    }
+    return hash;
+}
+
+int cookbook_credential_verify(const char *token, const char *hash) {
+    return crypto_pwhash_str_verify(hash, token, strlen(token));
+}
+
 /* ==== Minimal JSON helpers (for JWT only) ==== */
 
 /* Write a JSON string value, escaping as needed. Returns chars written. */
@@ -175,6 +229,133 @@ char *cookbook_jwt_create(const char *sub, const char *groups,
     return token;
 }
 
+/* ==== JWT v2 (policy-based grants) ==== */
+
+char *cookbook_jwt_create_v2(const char *sub, const char *groups,
+                              const char *resolved_json,
+                              int64_t ttl_sec,
+                              const unsigned char signing_key[64]) {
+    if (!sub || !signing_key || !resolved_json) return NULL;
+
+    int64_t now = (int64_t)time(NULL);
+    int64_t exp = now + ttl_sec;
+
+    /* build payload — embed resolved grants/exclude as raw JSON objects */
+    size_t rjlen = strlen(resolved_json);
+    size_t cap = 512 + rjlen;
+    char *payload = (char *)malloc(cap);
+    if (!payload) return NULL;
+
+    int off = 0;
+    off += snprintf(payload + off, cap - (size_t)off, "{");
+    off += json_write_string(payload + off, cap - (size_t)off, "sub", sub, 1);
+    if (groups && *groups)
+        off += json_write_string(payload + off, cap - (size_t)off,
+                                  "groups", groups, 0);
+    off += json_write_int(payload + off, cap - (size_t)off, "v", 2, 0);
+
+    /* splice in the grants/exclude from resolved_json directly.
+       resolved_json is like: {"grants":{...},"exclude":{...}}
+       We strip the outer braces and append as comma-separated fields. */
+    if (rjlen >= 2 && resolved_json[0] == '{') {
+        off += snprintf(payload + off, cap - (size_t)off, ",");
+        /* copy inner content (skip outer { and }) */
+        size_t inner_len = rjlen - 2;
+        if ((size_t)off + inner_len + 64 > cap) {
+            cap = (size_t)off + inner_len + 256;
+            char *tmp = (char *)realloc(payload, cap);
+            if (!tmp) { free(payload); return NULL; }
+            payload = tmp;
+        }
+        memcpy(payload + off, resolved_json + 1, inner_len);
+        off += (int)inner_len;
+    }
+
+    off += snprintf(payload + off, cap - (size_t)off, ",\"iat\":%lld",
+                    (long long)now);
+    off += snprintf(payload + off, cap - (size_t)off, ",\"exp\":%lld",
+                    (long long)exp);
+    snprintf(payload + off, cap - (size_t)off, "}");
+
+    /* base64url encode header and payload */
+    char hdr_b64[256];
+    size_t pay_actual = strlen(payload);
+    size_t pay_b64_cap = pay_actual * 2 + 16;
+    char *pay_b64 = (char *)malloc(pay_b64_cap);
+    if (!pay_b64) { free(payload); return NULL; }
+
+    size_t hdr_len = cookbook_base64url_encode(JWT_HEADER, strlen(JWT_HEADER),
+                                               hdr_b64, sizeof(hdr_b64));
+    size_t pay_len = cookbook_base64url_encode(payload, pay_actual,
+                                               pay_b64, pay_b64_cap);
+    free(payload);
+    if (hdr_len == 0 || pay_len == 0) { free(pay_b64); return NULL; }
+
+    /* signing input */
+    size_t si_cap = hdr_len + 1 + pay_len + 1;
+    char *signing_input = (char *)malloc(si_cap);
+    if (!signing_input) { free(pay_b64); return NULL; }
+    int si_len = snprintf(signing_input, si_cap, "%s.%s", hdr_b64, pay_b64);
+    free(pay_b64);
+
+    /* sign */
+    unsigned char sig[64];
+    if (crypto_sign_ed25519_detached(sig, NULL,
+                                      (const unsigned char *)signing_input,
+                                      (unsigned long long)si_len,
+                                      signing_key) != 0) {
+        free(signing_input);
+        return NULL;
+    }
+
+    /* encode signature */
+    char sig_b64[128];
+    size_t sig_len = cookbook_base64url_encode(sig, 64, sig_b64, sizeof(sig_b64));
+    if (sig_len == 0) { free(signing_input); return NULL; }
+
+    /* assemble */
+    size_t token_len = (size_t)si_len + 1 + sig_len + 1;
+    char *token = (char *)malloc(token_len);
+    if (!token) { free(signing_input); return NULL; }
+    snprintf(token, token_len, "%s.%s", signing_input, sig_b64);
+    free(signing_input);
+    return token;
+}
+
+void cookbook_jwt_claims_free(cookbook_jwt_claims *claims) {
+    if (!claims) return;
+    free(claims->grants_json);
+    free(claims->exclude_json);
+    claims->grants_json = NULL;
+    claims->exclude_json = NULL;
+}
+
+/* Extract a JSON sub-object as a malloc'd string. E.g. key="grants" from
+   payload like ...,"grants":{...},...  Returns NULL if not found. */
+static char *json_extract_object(const char *json, const char *key) {
+    char pattern[256];
+    snprintf(pattern, sizeof(pattern), "\"%s\":{", key);
+    const char *start = strstr(json, pattern);
+    if (!start) return NULL;
+    start += strlen(pattern) - 1; /* point at the '{' */
+
+    /* count braces to find matching '}' */
+    int depth = 0;
+    const char *p = start;
+    do {
+        if (*p == '{') depth++;
+        else if (*p == '}') depth--;
+        p++;
+    } while (depth > 0 && *p);
+
+    size_t len = (size_t)(p - start);
+    char *result = (char *)malloc(len + 1);
+    if (!result) return NULL;
+    memcpy(result, start, len);
+    result[len] = '\0';
+    return result;
+}
+
 int cookbook_jwt_verify(const char *token, const unsigned char verify_key[32],
                         cookbook_jwt_claims *claims) {
     if (!token || !verify_key || !claims) return -1;
@@ -218,6 +399,16 @@ int cookbook_jwt_verify(const char *token, const unsigned char verify_key[32],
     json_get_string(payload, "groups", claims->groups, sizeof(claims->groups));
     json_get_int(payload, "exp", &claims->exp);
     json_get_int(payload, "iat", &claims->iat);
+
+    /* v2: extract version, grants, exclude */
+    int64_t ver = 0;
+    if (json_get_int(payload, "v", &ver) == 0 && ver == 2) {
+        claims->version = 2;
+        claims->grants_json = json_extract_object(payload, "grants");
+        claims->exclude_json = json_extract_object(payload, "exclude");
+    } else {
+        claims->version = 1;
+    }
 
     /* check expiration */
     int64_t now = (int64_t)time(NULL);

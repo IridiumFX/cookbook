@@ -18,6 +18,8 @@ typedef struct {
     int             rate_limit_per_min;   /* per-sub rate limit; 0 = unlimited */
     const unsigned char *registry_pk;     /* 32-byte Ed25519 public key */
     const unsigned char *registry_sk;     /* 64-byte Ed25519 secret key */
+    int             grid_enabled;         /* 1 = grid federation on */
+    int             grid_max_hops;        /* 0 = default (3) */
 } cookbook_server_opts;
 
 /* Create and start the server. Returns NULL on failure. */

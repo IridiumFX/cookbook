@@ -16,6 +16,18 @@ set(BUILD_SHARED_LIBS OFF)
 set(PASTA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory(vendor/pasta)
 set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_SAVED})
+target_compile_definitions(pasta PUBLIC PASTA_STATIC)
+
+# ---------- vendor: alforno (static, no tests, uses our pasta) ----------
+
+set(BUILD_SHARED_LIBS_SAVED2 ${BUILD_SHARED_LIBS})
+set(BUILD_SHARED_LIBS OFF)
+set(ALF_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(FETCHCONTENT_FULLY_DISCONNECTED ON CACHE BOOL "" FORCE)
+add_subdirectory(vendor/alforno)
+set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_SAVED2})
+unset(FETCHCONTENT_FULLY_DISCONNECTED CACHE)
+target_compile_definitions(alforno PUBLIC ALF_STATIC)
 
 # ---------- vendor: sqlite ----------
 
@@ -105,7 +117,7 @@ endif()
 
 file(GLOB COOKBOOK_HEADERS src/main/h/*.h)
 
-add_library(cookbook ${COOKBOOK_SOURCES})
+add_library(cookbook STATIC ${COOKBOOK_SOURCES})
 
 target_include_directories(cookbook
     PUBLIC
@@ -113,8 +125,9 @@ target_include_directories(cookbook
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
+target_compile_definitions(cookbook PUBLIC COOKBOOK_STATIC)
 target_compile_definitions(cookbook PRIVATE BUILDING_COOKBOOK)
-target_link_libraries(cookbook PRIVATE sqlite3 civetweb pasta sodium)
+target_link_libraries(cookbook PUBLIC sqlite3 civetweb pasta alforno sodium)
 
 if(COOKBOOK_HAS_POSTGRES)
     target_compile_definitions(cookbook PRIVATE COOKBOOK_HAS_POSTGRES)
@@ -126,14 +139,10 @@ if(WIN32)
     target_link_libraries(cookbook PRIVATE ws2_32)
 endif()
 
-if(NOT BUILD_SHARED_LIBS)
-    target_compile_definitions(cookbook PUBLIC COOKBOOK_STATIC)
-endif()
-
 # ---------- server executable ----------
 
 add_executable(cookbook_server src/main/c/main.c)
-target_link_libraries(cookbook_server PRIVATE cookbook sqlite3 civetweb pasta sodium)
+target_link_libraries(cookbook_server PRIVATE cookbook)
 
 # ---------- import tool (§A.4) ----------
 
@@ -151,7 +160,10 @@ file(GLOB COOKBOOK_TEST_SOURCES src/test/c/*.c)
 list(FILTER COOKBOOK_TEST_SOURCES EXCLUDE REGEX ".*cookbook_stress\\.c$")
 
 add_executable(cookbook_test ${COOKBOOK_TEST_SOURCES})
-target_link_libraries(cookbook_test PRIVATE cookbook sqlite3 civetweb pasta sodium)
+target_link_libraries(cookbook_test PRIVATE cookbook)
+if(WIN32)
+    target_link_options(cookbook_test PRIVATE -Wl,--stack,8388608)
+endif()
 
 target_compile_definitions(cookbook_test PRIVATE
     COOKBOOK_TEST_RESOURCES="${CMAKE_CURRENT_SOURCE_DIR}/src/test/resources"
@@ -160,7 +172,7 @@ target_compile_definitions(cookbook_test PRIVATE
 # ---------- stress test ----------
 
 add_executable(cookbook_stress src/test/c/cookbook_stress.c)
-target_link_libraries(cookbook_stress PRIVATE cookbook sqlite3 civetweb pasta sodium)
+target_link_libraries(cookbook_stress PRIVATE cookbook)
 if(WIN32)
     target_link_libraries(cookbook_stress PRIVATE ws2_32)
 endif()

@@ -2,6 +2,8 @@
 #include "cookbook_semver.h"
 #include "cookbook_sha256.h"
 #include "cookbook_auth.h"
+#include "cookbook_grid.h"
+#include "cookbook_policy.h"
 #include "civetweb.h"
 #include "pasta.h"
 #include <sodium.h>
@@ -59,6 +61,8 @@ struct cookbook_server {
     int                 has_registry_key;
     rate_bucket        *rate_buckets;
     cookbook_metrics     metrics;
+    int                 grid_enabled;
+    int                 grid_max_hops;
     volatile int        reconcile_running;
 #ifdef _WIN32
     HANDLE              reconcile_thread;
@@ -854,11 +858,16 @@ static int handle_registry_key(struct mg_connection *conn, void *cbdata) {
     return 1;
 }
 
+/* grid helper forward declarations (defined later, used in resolve/artifact) */
+static int grid_get_hop_count(const struct mg_request_info *ri);
+static const char *grid_get_via(const struct mg_request_info *ri);
+
 /* ==== route: GET /resolve/{group}/{artifact}/{range} ==== */
 
 typedef struct {
     cookbook_range *range;
     int            include_snapshots;
+    int            include_yanked;  /* F2 */
     char          *buf;
     size_t         len;
     size_t         cap;
@@ -870,6 +879,11 @@ static int resolve_filter_cb(const cookbook_db_row *row, void *user) {
     const char *version  = row->values[0];
     const char *snapshot = row->values[1];
     const char *triple   = row->values[2];
+    /* F2: columns 3 and 4 are yanked and yank_reason when include_yanked */
+    const char *yanked_val  = (ctx->include_yanked && row->ncols > 3)
+                              ? row->values[3] : NULL;
+    const char *yank_reason = (ctx->include_yanked && row->ncols > 4)
+                              ? row->values[4] : NULL;
     if (!version) return 0;
 
     if (!ctx->include_snapshots && snapshot && snapshot[0] == '1')
@@ -884,11 +898,31 @@ static int resolve_filter_cb(const cookbook_db_row *row, void *user) {
         n = snprintf(ctx->buf + ctx->len, ctx->cap - ctx->len, ",");
         if (n > 0) ctx->len += (size_t)n;
     }
-    n = snprintf(ctx->buf + ctx->len, ctx->cap - ctx->len,
-        "{\"version\":\"%s\",\"snapshot\":%s,\"triples\":[\"%s\"]}",
-        version,
-        (snapshot && snapshot[0] == '1') ? "true" : "false",
-        triple ? triple : "noarch");
+
+    int is_yanked = yanked_val && yanked_val[0] == '1';
+
+    if (ctx->include_yanked && is_yanked && yank_reason && yank_reason[0]) {
+        n = snprintf(ctx->buf + ctx->len, ctx->cap - ctx->len,
+            "{\"version\":\"%s\",\"snapshot\":%s,\"triples\":[\"%s\"],"
+            "\"yanked\":true,\"yank_reason\":\"%s\"}",
+            version,
+            (snapshot && snapshot[0] == '1') ? "true" : "false",
+            triple ? triple : "noarch",
+            yank_reason);
+    } else if (ctx->include_yanked && is_yanked) {
+        n = snprintf(ctx->buf + ctx->len, ctx->cap - ctx->len,
+            "{\"version\":\"%s\",\"snapshot\":%s,\"triples\":[\"%s\"],"
+            "\"yanked\":true}",
+            version,
+            (snapshot && snapshot[0] == '1') ? "true" : "false",
+            triple ? triple : "noarch");
+    } else {
+        n = snprintf(ctx->buf + ctx->len, ctx->cap - ctx->len,
+            "{\"version\":\"%s\",\"snapshot\":%s,\"triples\":[\"%s\"]}",
+            version,
+            (snapshot && snapshot[0] == '1') ? "true" : "false",
+            triple ? triple : "noarch");
+    }
     if (n > 0) ctx->len += (size_t)n;
     ctx->count++;
     return 0;
@@ -938,13 +972,24 @@ static int handle_resolve(struct mg_connection *conn, void *cbdata) {
     if (ri->query_string && strstr(ri->query_string, "snapshot=true"))
         include_snapshots = 1;
 
-    const char *sql =
-        "SELECT a.version, a.snapshot, a.triple "
-        "FROM artifacts a "
-        "JOIN artifact_semver s ON a.coord_id = s.coord_id "
-        "WHERE a.group_id = ?1 AND a.artifact = ?2 "
-        "AND a.yanked = 0 AND a.status = 'published' "
-        "ORDER BY s.major DESC, s.minor DESC, s.patch DESC";
+    /* F2: include_yanked=true returns yanked versions with reason */
+    int include_yanked = 0;
+    if (ri->query_string && strstr(ri->query_string, "include_yanked=true"))
+        include_yanked = 1;
+
+    const char *sql = include_yanked
+        ? "SELECT a.version, a.snapshot, a.triple, a.yanked, a.yank_reason "
+          "FROM artifacts a "
+          "JOIN artifact_semver s ON a.coord_id = s.coord_id "
+          "WHERE a.group_id = ?1 AND a.artifact = ?2 "
+          "AND a.status = 'published' "
+          "ORDER BY s.major DESC, s.minor DESC, s.patch DESC"
+        : "SELECT a.version, a.snapshot, a.triple "
+          "FROM artifacts a "
+          "JOIN artifact_semver s ON a.coord_id = s.coord_id "
+          "WHERE a.group_id = ?1 AND a.artifact = ?2 "
+          "AND a.yanked = 0 AND a.status = 'published' "
+          "ORDER BY s.major DESC, s.minor DESC, s.patch DESC";
 
     cookbook_db_param params[] = {
         COOKBOOK_P_TEXT(group),
@@ -953,7 +998,8 @@ static int handle_resolve(struct mg_connection *conn, void *cbdata) {
 
     char result_buf[8192] = {0};
     resolve_filter_ctx ctx = {
-        &range, include_snapshots, result_buf, 0, sizeof(result_buf), 0
+        &range, include_snapshots, include_yanked,
+        result_buf, 0, sizeof(result_buf), 0
     };
 
     cookbook_db_status st = srv->db->query_p(srv->db, sql, params, 2,
@@ -963,6 +1009,51 @@ static int handle_resolve(struct mg_connection *conn, void *cbdata) {
         METRIC_INC(srv->metrics.responses_5xx);
         send_json(conn, 500, "{\"error\":\"Database error\"}\n");
     } else {
+        /* G3: grid fan-out on empty local results */
+        if (ctx.count == 0 && srv->grid_enabled &&
+            !grid_get_via(ri)) {
+            /* this is a client request with no local results — fan out */
+            cookbook_peer *peers = NULL;
+            int npeers = cookbook_grid_load_peers(srv->db, &peers);
+            for (int pi = 0; pi < npeers && ctx.count == 0; pi++) {
+                char grid_path[2048];
+                snprintf(grid_path, sizeof(grid_path),
+                    "/grid/resolve/%s", path);
+                if (ri->query_string && ri->query_string[0]) {
+                    size_t gp_len = strlen(grid_path);
+                    snprintf(grid_path + gp_len,
+                             sizeof(grid_path) - gp_len,
+                             "?%s", ri->query_string);
+                }
+                cookbook_grid_response gresp;
+                if (cookbook_grid_get(&peers[pi], grid_path,
+                        srv->registry_id, NULL, 0, &gresp) == 0
+                    && gresp.status == 200 && gresp.body) {
+                    /* copy peer response into result_buf */
+                    /* find "versions":[ ... ] and extract the array content */
+                    const char *vs = strstr(gresp.body, "\"versions\":[");
+                    if (vs) {
+                        vs += 12; /* skip "versions":[ */
+                        const char *ve = strrchr(vs, ']');
+                        if (ve && ve > vs) {
+                            size_t vlen = (size_t)(ve - vs);
+                            if (vlen < sizeof(result_buf) - ctx.len - 1) {
+                                if (ctx.count > 0 && ctx.len > 0) {
+                                    result_buf[ctx.len++] = ',';
+                                }
+                                memcpy(result_buf + ctx.len, vs, vlen);
+                                ctx.len += vlen;
+                                result_buf[ctx.len] = '\0';
+                                ctx.count++;
+                            }
+                        }
+                    }
+                    free(gresp.body);
+                }
+            }
+            cookbook_grid_free_peers(peers, npeers);
+        }
+
         METRIC_INC(srv->metrics.responses_2xx);
         METRIC_INC(srv->metrics.artifacts_resolved);
 
@@ -1023,6 +1114,7 @@ static int handle_resolve(struct mg_connection *conn, void *cbdata) {
 typedef struct {
     int found;
     int yanked;
+    char yank_reason[256];
 } yanked_check_ctx;
 
 static int yanked_check_cb(const cookbook_db_row *row, void *user) {
@@ -1030,6 +1122,13 @@ static int yanked_check_cb(const cookbook_db_row *row, void *user) {
     ctx->found = 1;
     if (row->values[0] && row->values[0][0] == '1')
         ctx->yanked = 1;
+    if (row->ncols > 1 && row->values[1] && row->values[1][0]) {
+        size_t rlen = strlen(row->values[1]);
+        if (rlen >= sizeof(ctx->yank_reason))
+            rlen = sizeof(ctx->yank_reason) - 1;
+        memcpy(ctx->yank_reason, row->values[1], rlen);
+        ctx->yank_reason[rlen] = '\0';
+    }
     return 0;
 }
 
@@ -1076,22 +1175,53 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
             free(path); free(ygroup); free(yartifact); free(yversion);
             return 1;
         }
+        /* F1: read optional reason from POST body */
+        char reason[256] = {0};
+        size_t ybody_len = 0;
+        char *ybody = read_body(conn, ri, &ybody_len, 4096);
+        if (ybody && ybody_len > 0) {
+            const char *rp = strstr(ybody, "\"reason\":");
+            if (rp) {
+                rp += 9;
+                while (*rp == ' ' || *rp == '\t') rp++;
+                if (*rp == '"') {
+                    rp++;
+                    const char *end = strchr(rp, '"');
+                    if (end) {
+                        size_t rlen = (size_t)(end - rp);
+                        if (rlen >= sizeof(reason)) rlen = sizeof(reason) - 1;
+                        memcpy(reason, rp, rlen);
+                        reason[rlen] = '\0';
+                    }
+                }
+            }
+        }
+        free(ybody);
+
         const char *ysql =
-            "UPDATE artifacts SET yanked = 1 "
+            "UPDATE artifacts SET yanked = 1, yank_reason = ?4 "
             "WHERE group_id = ?1 AND artifact = ?2 AND version = ?3";
         cookbook_db_param yp[] = {
             COOKBOOK_P_TEXT(ygroup),
             COOKBOOK_P_TEXT(yartifact),
-            COOKBOOK_P_TEXT(yversion)
+            COOKBOOK_P_TEXT(yversion),
+            reason[0] ? COOKBOOK_P_TEXT(reason) : COOKBOOK_P_NULL()
         };
-        cookbook_db_status yst = srv->db->exec_p(srv->db, ysql, yp, 3);
+        cookbook_db_status yst = srv->db->exec_p(srv->db, ysql, yp, 4);
         if (yst != COOKBOOK_DB_OK) {
             METRIC_INC(srv->metrics.responses_5xx);
             send_json(conn, 500, "{\"error\":\"Database error\"}\n");
         } else {
             METRIC_INC(srv->metrics.responses_2xx);
             METRIC_INC(srv->metrics.artifacts_yanked);
-            send_json(conn, 200, "{\"status\":\"yanked\"}\n");
+            if (reason[0]) {
+                char resp[384];
+                snprintf(resp, sizeof(resp),
+                    "{\"status\":\"yanked\",\"reason\":\"%s\"}\n", reason);
+                send_json(conn, 200, resp);
+            } else {
+                send_json(conn, 200, "{\"status\":\"yanked\"}\n");
+            }
         }
         free(path); free(ygroup); free(yartifact); free(yversion);
         return 1;
@@ -1163,7 +1293,62 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
         cookbook_store_status sst = srv->store->get(srv->store, key, &data, &len);
 
         if (sst == COOKBOOK_STORE_NOT_FOUND) {
-            send_json(conn, 404, "{\"error\":\"Not found\"}\n");
+            /* G4: grid fan-out on local 404 */
+            int grid_handled = 0;
+            if (srv->grid_enabled && !grid_get_via(ri)) {
+                cookbook_peer *peers = NULL;
+                int npeers = cookbook_grid_load_peers(srv->db, &peers);
+                for (int pi = 0; pi < npeers; pi++) {
+                    char grid_path[2048];
+                    snprintf(grid_path, sizeof(grid_path),
+                        "/grid/artifact/%s", path);
+
+                    if (peers[pi].mode == 'r') {
+                        /* redirect mode: HEAD check then 307 */
+                        cookbook_grid_response gresp;
+                        if (cookbook_grid_head(&peers[pi], grid_path,
+                                srv->registry_id, NULL, 0, &gresp) == 0
+                            && gresp.status == 200) {
+                            char location[2048];
+                            snprintf(location, sizeof(location),
+                                "%s/artifact/%s", peers[pi].url, path);
+                            mg_printf(conn,
+                                "HTTP/1.1 307 Temporary Redirect\r\n"
+                                "Location: %s\r\n"
+                                "X-Cookbook-Source: %s\r\n"
+                                "Content-Length: 0\r\n"
+                                "\r\n",
+                                location, peers[pi].peer_id);
+                            grid_handled = 1;
+                            free(gresp.body);
+                            break;
+                        }
+                        free(gresp.body);
+                    } else {
+                        /* proxy mode: GET and relay */
+                        cookbook_grid_response gresp;
+                        if (cookbook_grid_get(&peers[pi], grid_path,
+                                srv->registry_id, NULL, 0, &gresp) == 0
+                            && gresp.status == 200 && gresp.body) {
+                            mg_printf(conn,
+                                "HTTP/1.1 200 OK\r\n"
+                                "Content-Type: application/octet-stream\r\n"
+                                "Content-Length: %zu\r\n"
+                                "X-Cookbook-Source: %s\r\n"
+                                "\r\n",
+                                gresp.body_len, peers[pi].peer_id);
+                            mg_write(conn, gresp.body, gresp.body_len);
+                            grid_handled = 1;
+                            free(gresp.body);
+                            break;
+                        }
+                        free(gresp.body);
+                    }
+                }
+                cookbook_grid_free_peers(peers, npeers);
+            }
+            if (!grid_handled)
+                send_json(conn, 404, "{\"error\":\"Not found\"}\n");
         } else if (sst != COOKBOOK_STORE_OK) {
             send_json(conn, 500, "{\"error\":\"Storage error\"}\n");
         } else {
@@ -1178,10 +1363,10 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
             else if (strstr(path, ".tar.gz")) ct = "application/gzip";
             else if (strstr(path, ".tar.zst")) ct = "application/zstd";
 
-            /* #5: check yanked status */
-            yanked_check_ctx yctx = { 0, 0 };
+            /* #5: check yanked status (F1: also fetch reason) */
+            yanked_check_ctx yctx = { 0, 0, {0} };
             const char *yanked_sql =
-                "SELECT yanked FROM artifacts "
+                "SELECT yanked, yank_reason FROM artifacts "
                 "WHERE group_id = ?1 AND artifact = ?2 AND version = ?3 "
                 "LIMIT 1";
             cookbook_db_param yparams[] = {
@@ -1191,6 +1376,18 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
             };
             srv->db->query_p(srv->db, yanked_sql, yparams, 3,
                               yanked_check_cb, &yctx);
+
+            /* F1: build yanked headers string */
+            char yanked_hdrs[384] = "";
+            if (yctx.yanked) {
+                if (yctx.yank_reason[0])
+                    snprintf(yanked_hdrs, sizeof(yanked_hdrs),
+                        "X-Now-Yanked: true\r\n"
+                        "X-Now-Yank-Reason: %s\r\n", yctx.yank_reason);
+                else
+                    snprintf(yanked_hdrs, sizeof(yanked_hdrs),
+                        "X-Now-Yanked: true\r\n");
+            }
 
             /* #23: strip build-only fields from now.pasta for installed view */
             void *serve_data = data;
@@ -1240,8 +1437,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
                                 "%s"
                                 "\r\n",
                                 jlen,
-                                yctx.yanked
-                                    ? "X-Now-Yanked: true\r\n" : "");
+                                yanked_hdrs);
                             mg_write(conn, json, jlen);
                             free(json);
                             if (stripped) free(stripped);
@@ -1275,8 +1471,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
                                 "%s"
                                 "\r\n",
                                 plen,
-                                yctx.yanked
-                                    ? "X-Now-Yanked: true\r\n" : "");
+                                yanked_hdrs);
                             mg_write(conn, pretty, plen);
                             free(pretty);
                             if (stripped) free(stripped);
@@ -1299,7 +1494,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
                 "%s"
                 "\r\n",
                 ct, serve_len,
-                yctx.yanked ? "X-Now-Yanked: true\r\n" : "");
+                yanked_hdrs);
             mg_write(conn, serve_data, serve_len);
 
             if (stripped) free(stripped);
@@ -1584,6 +1779,32 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
     return 1;
 }
 
+/* ==== F3: credential lookup helper ==== */
+
+typedef struct {
+    char hash[256];
+    char groups[1024];
+    int found;
+} cred_lookup_ctx;
+
+static int cred_lookup_cb(const cookbook_db_row *row, void *user) {
+    cred_lookup_ctx *c = (cred_lookup_ctx *)user;
+    c->found = 1;
+    if (row->values[0]) {
+        size_t l = strlen(row->values[0]);
+        if (l >= sizeof(c->hash)) l = sizeof(c->hash) - 1;
+        memcpy(c->hash, row->values[0], l);
+        c->hash[l] = '\0';
+    }
+    if (row->values[1]) {
+        size_t l = strlen(row->values[1]);
+        if (l >= sizeof(c->groups)) l = sizeof(c->groups) - 1;
+        memcpy(c->groups, row->values[1], l);
+        c->groups[l] = '\0';
+    }
+    return 0;
+}
+
 /* ==== #9: route: POST /auth/token ==== */
 
 static int handle_auth_token(struct mg_connection *conn, void *cbdata) {
@@ -1605,76 +1826,155 @@ static int handle_auth_token(struct mg_connection *conn, void *cbdata) {
         return 1;
     }
 
-    /* read body — expect JSON like {"sub":"alice","groups":"org.acme,org.beta"} */
-    size_t body_len = 0;
-    char *body = read_body(conn, ri, &body_len, 4096);
-    if (!body || body_len == 0) {
-        send_json(conn, 400, "{\"error\":\"Request body required\"}\n");
-        free(body);
-        return 1;
-    }
+    /* F3: credential verification via Authorization: Basic header.
+       Format: "Basic base64(subject:token)"
+       Falls back to JSON body for backwards compatibility when no
+       credentials table is populated. */
 
-    /* minimal JSON parse for sub and groups */
     char sub[128] = {0}, groups[1024] = {0};
-    /* find "sub":"..." */
-    const char *sub_start = strstr(body, "\"sub\"");
-    if (sub_start) {
-        sub_start = strchr(sub_start + 4, '"');
-        if (sub_start) {
-            sub_start++; /* skip opening quote after colon */
-            /* skip the colon quote: "sub":"value" — we need to find :"
-               Let's just find :" pattern */
-        }
-    }
-    /* simpler: just scan for "sub":"value" and "groups":"value" */
-    {
-        const char *p = strstr(body, "\"sub\":");
-        if (p) {
-            p += 6;
-            while (*p == ' ' || *p == '\t') p++;
-            if (*p == '"') {
-                p++;
-                const char *end = strchr(p, '"');
-                if (end) {
-                    size_t len = (size_t)(end - p);
-                    if (len >= sizeof(sub)) len = sizeof(sub) - 1;
-                    memcpy(sub, p, len);
-                    sub[len] = '\0';
-                }
-            }
-        }
-    }
-    {
-        const char *p = strstr(body, "\"groups\":");
-        if (p) {
-            p += 9;
-            while (*p == ' ' || *p == '\t') p++;
-            if (*p == '"') {
-                p++;
-                const char *end = strchr(p, '"');
-                if (end) {
-                    size_t len = (size_t)(end - p);
-                    if (len >= sizeof(groups)) len = sizeof(groups) - 1;
-                    memcpy(groups, p, len);
-                    groups[len] = '\0';
-                }
-            }
+    int cred_verified = 0;
+
+    const char *auth_hdr = NULL;
+    for (int i = 0; i < ri->num_headers; i++) {
+        if (strcasecmp(ri->http_headers[i].name, "Authorization") == 0) {
+            auth_hdr = ri->http_headers[i].value;
+            break;
         }
     }
 
-    free(body);
+    if (auth_hdr && strncmp(auth_hdr, "Basic ", 6) == 0) {
+        /* decode base64(subject:token) */
+        const char *b64 = auth_hdr + 6;
+        size_t b64_len = strlen(b64);
+        char decoded[512] = {0};
+        size_t dec_len = cookbook_base64_decode(b64, b64_len,
+                                                decoded, sizeof(decoded) - 1);
+        if (dec_len == 0) {
+            METRIC_INC(srv->metrics.responses_4xx);
+            METRIC_INC(srv->metrics.auth_failures);
+            send_json(conn, 401,
+                "{\"error\":\"Invalid Basic auth encoding\"}\n");
+            return 1;
+        }
+        decoded[dec_len] = '\0';
+
+        /* split at first ':' */
+        char *colon = strchr(decoded, ':');
+        if (!colon || colon == decoded) {
+            METRIC_INC(srv->metrics.responses_4xx);
+            METRIC_INC(srv->metrics.auth_failures);
+            send_json(conn, 401,
+                "{\"error\":\"Invalid Basic auth format\"}\n");
+            return 1;
+        }
+        *colon = '\0';
+        const char *cred_sub = decoded;
+        const char *cred_tok = colon + 1;
+
+        /* copy subject */
+        size_t slen = strlen(cred_sub);
+        if (slen >= sizeof(sub)) slen = sizeof(sub) - 1;
+        memcpy(sub, cred_sub, slen);
+        sub[slen] = '\0';
+
+        /* look up stored hash and groups */
+        cred_lookup_ctx clctx = { {0}, {0}, 0 };
+
+        cookbook_db_param cp[] = { COOKBOOK_P_TEXT(sub) };
+        srv->db->query_p(srv->db,
+            "SELECT token_hash, groups FROM credentials "
+            "WHERE subject = ?1 AND revoked_at IS NULL",
+            cp, 1, cred_lookup_cb, &clctx);
+
+        if (clctx.found) {
+            /* verify token against stored hash */
+            if (cookbook_credential_verify(cred_tok, clctx.hash) != 0) {
+                METRIC_INC(srv->metrics.responses_4xx);
+                METRIC_INC(srv->metrics.auth_failures);
+                send_json(conn, 401,
+                    "{\"error\":\"Invalid credentials\"}\n");
+                return 1;
+            }
+            /* use groups from credential store */
+            memcpy(groups, clctx.groups, sizeof(groups));
+            cred_verified = 1;
+        }
+        /* if no credential record found, fall through — open issuance */
+    }
 
     if (!sub[0]) {
-        send_json(conn, 400, "{\"error\":\"Missing 'sub' field\"}\n");
-        return 1;
+        /* no Basic auth header — fall back to JSON body */
+        size_t body_len = 0;
+        char *body = read_body(conn, ri, &body_len, 4096);
+        if (!body || body_len == 0) {
+            send_json(conn, 400,
+                "{\"error\":\"Authorization header or body required\"}\n");
+            free(body);
+            return 1;
+        }
+
+        /* minimal JSON parse for sub and groups */
+        {
+            const char *p = strstr(body, "\"sub\":");
+            if (p) {
+                p += 6;
+                while (*p == ' ' || *p == '\t') p++;
+                if (*p == '"') {
+                    p++;
+                    const char *end = strchr(p, '"');
+                    if (end) {
+                        size_t len = (size_t)(end - p);
+                        if (len >= sizeof(sub)) len = sizeof(sub) - 1;
+                        memcpy(sub, p, len);
+                        sub[len] = '\0';
+                    }
+                }
+            }
+        }
+        {
+            const char *p = strstr(body, "\"groups\":");
+            if (p) {
+                p += 9;
+                while (*p == ' ' || *p == '\t') p++;
+                if (*p == '"') {
+                    p++;
+                    const char *end = strchr(p, '"');
+                    if (end) {
+                        size_t len = (size_t)(end - p);
+                        if (len >= sizeof(groups)) len = sizeof(groups) - 1;
+                        memcpy(groups, p, len);
+                        groups[len] = '\0';
+                    }
+                }
+            }
+        }
+        free(body);
+
+        if (!sub[0]) {
+            send_json(conn, 400,
+                "{\"error\":\"Missing 'sub' field\"}\n");
+            return 1;
+        }
     }
 
-    /* TODO: authenticate the caller (e.g., check password/API key).
-       For now, token issuance is open — auth will be enforced by
-       whatever identity provider is fronting cookbook in production. */
+    /* Phase 2: try policy-based JWT v2 — resolve via alforno */
+    char *resolved = cookbook_policy_resolve(srv->db, sub);
+    char *token = NULL;
+    int token_version = 1;
 
-    char *token = cookbook_jwt_create(sub, groups, srv->jwt_ttl_sec,
-                                       srv->registry_sk);
+    if (resolved) {
+        /* v2: embed resolved grants/exclude in JWT */
+        token = cookbook_jwt_create_v2(sub, groups[0] ? groups : NULL,
+                                        resolved, srv->jwt_ttl_sec,
+                                        srv->registry_sk);
+        token_version = 2;
+        free(resolved);
+    } else {
+        /* v1 fallback: legacy comma-separated groups */
+        token = cookbook_jwt_create(sub, groups, srv->jwt_ttl_sec,
+                                     srv->registry_sk);
+    }
+
     if (!token) {
         send_json(conn, 500, "{\"error\":\"Failed to create token\"}\n");
         return 1;
@@ -1684,8 +1984,8 @@ static int handle_auth_token(struct mg_connection *conn, void *cbdata) {
     METRIC_INC(srv->metrics.auth_tokens_issued);
     char resp[8192];
     snprintf(resp, sizeof(resp),
-        "{\"token\":\"%s\",\"expires_in\":%d}\n",
-        token, srv->jwt_ttl_sec);
+        "{\"token\":\"%s\",\"expires_in\":%d,\"version\":%d}\n",
+        token, srv->jwt_ttl_sec, token_version);
     free(token);
 
     send_json(conn, 200, resp);
@@ -1955,6 +2255,43 @@ static int handle_mirror_manifest(struct mg_connection *conn, void *cbdata) {
             return 1;
         }
 
+        /* G5: grid-aware manifest — merge peer manifests */
+        int grid_mode = 0;
+        if (srv->grid_enabled && ri->query_string &&
+            strstr(ri->query_string, "grid=true"))
+            grid_mode = 1;
+
+        if (grid_mode) {
+            cookbook_peer *peers = NULL;
+            int npeers = cookbook_grid_load_peers(srv->db, &peers);
+            for (int pi = 0; pi < npeers; pi++) {
+                cookbook_grid_response gresp;
+                if (cookbook_grid_get(&peers[pi], "/grid/manifest",
+                        srv->registry_id, NULL, 0, &gresp) == 0
+                    && gresp.status == 200 && gresp.body) {
+                    /* extract "artifacts":[ ... ] from peer response */
+                    const char *as = strstr(gresp.body, "\"artifacts\":[");
+                    if (as) {
+                        as += 13; /* skip "artifacts":[ */
+                        const char *ae = strrchr(as, ']');
+                        if (ae && ae > as) {
+                            size_t alen = (size_t)(ae - as);
+                            if (alen < ctx.cap - ctx.len - 2) {
+                                if (ctx.count > 0 && ctx.len > 0)
+                                    result_buf[ctx.len++] = ',';
+                                memcpy(result_buf + ctx.len, as, alen);
+                                ctx.len += alen;
+                                result_buf[ctx.len] = '\0';
+                                ctx.count++;
+                            }
+                        }
+                    }
+                    free(gresp.body);
+                }
+            }
+            cookbook_grid_free_peers(peers, npeers);
+        }
+
         char *response = malloc(ctx.len + 128);
         if (!response) {
             METRIC_INC(srv->metrics.responses_5xx);
@@ -2063,6 +2400,498 @@ static int handle_mirror_manifest(struct mg_connection *conn, void *cbdata) {
     return 1;
 }
 
+/* ==== grid helpers ==== */
+
+/* Extract grid hop headers from request. */
+static int grid_get_hop_count(const struct mg_request_info *ri) {
+    for (int i = 0; i < ri->num_headers; i++) {
+        if (strcasecmp(ri->http_headers[i].name,
+                       "X-Cookbook-Hop-Count") == 0)
+            return atoi(ri->http_headers[i].value);
+    }
+    return 0;
+}
+
+static const char *grid_get_via(const struct mg_request_info *ri) {
+    for (int i = 0; i < ri->num_headers; i++) {
+        if (strcasecmp(ri->http_headers[i].name,
+                       "X-Cookbook-Via") == 0)
+            return ri->http_headers[i].value;
+    }
+    return NULL;
+}
+
+/* ==== route: /grid/resolve/ (internal, local-only) ==== */
+
+static int handle_grid_resolve(struct mg_connection *conn, void *cbdata) {
+    cookbook_server *srv = (cookbook_server *)cbdata;
+    const struct mg_request_info *ri = mg_get_request_info(conn);
+
+    if (strcmp(ri->request_method, "GET") != 0) {
+        send_json(conn, 405, "{\"error\":\"Method not allowed\"}\n");
+        return 1;
+    }
+
+    /* loop detection */
+    const char *via = grid_get_via(ri);
+    int hop = grid_get_hop_count(ri);
+    if (hop > srv->grid_max_hops) {
+        send_json(conn, 508, "{\"error\":\"Grid hop limit exceeded\"}\n");
+        return 1;
+    }
+    if (via && cookbook_grid_is_loop(srv->registry_id, via)) {
+        send_json(conn, 508, "{\"error\":\"Grid loop detected\"}\n");
+        return 1;
+    }
+
+    /* reuse resolve logic but path is /grid/resolve/... */
+    char *path = path_after(ri->local_uri, "/grid/resolve/");
+    if (!path) {
+        send_json(conn, 400, "{\"error\":\"Bad request\"}\n");
+        return 1;
+    }
+
+    char *group = NULL, *artifact = NULL, *range_str = NULL;
+    if (split_coord(path, &group, &artifact, &range_str) != 0 || !range_str) {
+        send_json(conn, 400, "{\"error\":\"Malformed path\"}\n");
+        free(path); free(group); free(artifact); free(range_str);
+        return 1;
+    }
+
+    cookbook_range range;
+    if (cookbook_range_parse(range_str, &range) != 0) {
+        send_json(conn, 400, "{\"error\":\"Malformed range\"}\n");
+        free(path); free(group); free(artifact); free(range_str);
+        return 1;
+    }
+
+    int include_snapshots = 0;
+    if (ri->query_string && strstr(ri->query_string, "snapshot=true"))
+        include_snapshots = 1;
+    int include_yanked = 0;
+    if (ri->query_string && strstr(ri->query_string, "include_yanked=true"))
+        include_yanked = 1;
+
+    const char *sql = include_yanked
+        ? "SELECT a.version, a.snapshot, a.triple, a.yanked, a.yank_reason "
+          "FROM artifacts a "
+          "JOIN artifact_semver s ON a.coord_id = s.coord_id "
+          "WHERE a.group_id = ?1 AND a.artifact = ?2 "
+          "AND a.status = 'published' "
+          "ORDER BY s.major DESC, s.minor DESC, s.patch DESC"
+        : "SELECT a.version, a.snapshot, a.triple "
+          "FROM artifacts a "
+          "JOIN artifact_semver s ON a.coord_id = s.coord_id "
+          "WHERE a.group_id = ?1 AND a.artifact = ?2 "
+          "AND a.yanked = 0 AND a.status = 'published' "
+          "ORDER BY s.major DESC, s.minor DESC, s.patch DESC";
+
+    cookbook_db_param params[] = {
+        COOKBOOK_P_TEXT(group), COOKBOOK_P_TEXT(artifact)
+    };
+
+    char result_buf[8192] = {0};
+    resolve_filter_ctx ctx = {
+        &range, include_snapshots, include_yanked,
+        result_buf, 0, sizeof(result_buf), 0
+    };
+
+    srv->db->query_p(srv->db, sql, params, 2,
+                      resolve_filter_cb, &ctx);
+
+    /* always respond JSON for grid internal calls */
+    char response[8320];
+    snprintf(response, sizeof(response),
+             "{\"versions\":[%s],\"source\":\"%s\"}\n",
+             result_buf, srv->registry_id);
+    send_json(conn, 200, response);
+
+    free(path); free(group); free(artifact); free(range_str);
+    return 1;
+}
+
+/* ==== route: /grid/artifact/ (internal, local-only) ==== */
+
+static int handle_grid_artifact(struct mg_connection *conn, void *cbdata) {
+    cookbook_server *srv = (cookbook_server *)cbdata;
+    const struct mg_request_info *ri = mg_get_request_info(conn);
+
+    /* loop detection */
+    const char *via = grid_get_via(ri);
+    int hop = grid_get_hop_count(ri);
+    if (hop > srv->grid_max_hops) {
+        send_json(conn, 508, "{\"error\":\"Grid hop limit exceeded\"}\n");
+        return 1;
+    }
+    if (via && cookbook_grid_is_loop(srv->registry_id, via)) {
+        send_json(conn, 508, "{\"error\":\"Grid loop detected\"}\n");
+        return 1;
+    }
+
+    char *path = path_after(ri->local_uri, "/grid/artifact/");
+    if (!path) {
+        send_json(conn, 400, "{\"error\":\"Bad request\"}\n");
+        return 1;
+    }
+
+    if (strcmp(ri->request_method, "HEAD") == 0) {
+        /* existence check: just probe the object store */
+        size_t key_len = strlen(srv->registry_id) + 1 + strlen(path);
+        char *key = malloc(key_len + 1);
+        snprintf(key, key_len + 1, "%s/%s", srv->registry_id, path);
+
+        int exists = srv->store->exists(srv->store, key);
+        free(key);
+        free(path);
+
+        if (exists) {
+            mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        } else {
+            mg_printf(conn, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+        }
+        return 1;
+    }
+
+    if (strcmp(ri->request_method, "GET") == 0) {
+        /* serve artifact from local store */
+        size_t key_len = strlen(srv->registry_id) + 1 + strlen(path);
+        char *key = malloc(key_len + 1);
+        snprintf(key, key_len + 1, "%s/%s", srv->registry_id, path);
+
+        void *data = NULL;
+        size_t len = 0;
+        cookbook_store_status sst = srv->store->get(srv->store, key, &data, &len);
+        free(key);
+
+        if (sst == COOKBOOK_STORE_NOT_FOUND) {
+            send_json(conn, 404, "{\"error\":\"Not found\"}\n");
+        } else if (sst != COOKBOOK_STORE_OK) {
+            send_json(conn, 500, "{\"error\":\"Storage error\"}\n");
+        } else {
+            mg_printf(conn,
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/octet-stream\r\n"
+                "Content-Length: %zu\r\n"
+                "X-Cookbook-Source: %s\r\n"
+                "\r\n",
+                len, srv->registry_id);
+            mg_write(conn, data, len);
+            srv->store->free_buf(data);
+        }
+        free(path);
+        return 1;
+    }
+
+    send_json(conn, 405, "{\"error\":\"Method not allowed\"}\n");
+    free(path);
+    return 1;
+}
+
+/* ==== route: /grid/manifest (internal, local-only) ==== */
+
+static int handle_grid_manifest(struct mg_connection *conn, void *cbdata) {
+    /* delegates to existing mirror manifest logic (local-only) */
+    return handle_mirror_manifest(conn, cbdata);
+}
+
+/* ==== route: /admin/peers ==== */
+
+static int handle_admin_peers(struct mg_connection *conn, void *cbdata) {
+    cookbook_server *srv = (cookbook_server *)cbdata;
+    const struct mg_request_info *ri = mg_get_request_info(conn);
+
+    if (strcmp(ri->request_method, "GET") == 0) {
+        /* list peers */
+        cookbook_peer *peers = NULL;
+        int n = cookbook_grid_load_peers(srv->db, &peers);
+
+        char buf[8192] = {0};
+        size_t pos = 0;
+        pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, "{\"peers\":[");
+        for (int i = 0; i < n; i++) {
+            if (i > 0)
+                pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, ",");
+            pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
+                "{\"peer_id\":\"%s\",\"name\":\"%s\",\"url\":\"%s\","
+                "\"mode\":\"%s\",\"priority\":%d}",
+                peers[i].peer_id, peers[i].name, peers[i].url,
+                peers[i].mode == 'p' ? "proxy" : "redirect",
+                peers[i].priority);
+        }
+        pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, "]}\n");
+
+        cookbook_grid_free_peers(peers, n);
+        send_json(conn, 200, buf);
+        return 1;
+    }
+
+    if (strcmp(ri->request_method, "PUT") == 0) {
+        /* add/update peer */
+        size_t body_len = 0;
+        char *body = read_body(conn, ri, &body_len, 4096);
+        if (!body) {
+            send_json(conn, 400, "{\"error\":\"Body required\"}\n");
+            return 1;
+        }
+
+        /* minimal JSON parse for peer fields */
+        char peer_id[128] = {0}, name[128] = {0}, url[512] = {0}, mode[16] = {0};
+        int priority = 100;
+
+        #define GRID_PARSE_STR(field, key, sz) do { \
+            const char *_p = strstr(body, "\"" key "\":"); \
+            if (_p) { \
+                _p += strlen("\"" key "\":"); \
+                while (*_p == ' ' || *_p == '\t') _p++; \
+                if (*_p == '"') { \
+                    _p++; \
+                    const char *_e = strchr(_p, '"'); \
+                    if (_e) { \
+                        size_t _l = (size_t)(_e - _p); \
+                        if (_l >= (sz)) _l = (sz) - 1; \
+                        memcpy(field, _p, _l); \
+                        field[_l] = '\0'; \
+                    } \
+                } \
+            } \
+        } while(0)
+
+        GRID_PARSE_STR(peer_id, "peer_id", sizeof(peer_id));
+        GRID_PARSE_STR(name, "name", sizeof(name));
+        GRID_PARSE_STR(url, "url", sizeof(url));
+        GRID_PARSE_STR(mode, "mode", sizeof(mode));
+        #undef GRID_PARSE_STR
+
+        /* parse priority */
+        const char *pp = strstr(body, "\"priority\":");
+        if (pp) priority = atoi(pp + 11);
+
+        free(body);
+
+        if (!peer_id[0] || !name[0] || !url[0]) {
+            send_json(conn, 400,
+                "{\"error\":\"peer_id, name, and url required\"}\n");
+            return 1;
+        }
+
+        char mode_char = (strcmp(mode, "proxy") == 0) ? 'p' : 'r';
+        const char *mode_str = mode_char == 'p' ? "proxy" : "redirect";
+
+        cookbook_db_param pp2[] = {
+            COOKBOOK_P_TEXT(peer_id),
+            COOKBOOK_P_TEXT(name),
+            COOKBOOK_P_TEXT(url),
+            COOKBOOK_P_TEXT(mode_str),
+            COOKBOOK_P_INT(priority)
+        };
+        /* upsert: try insert, on conflict update */
+        cookbook_db_status st = srv->db->exec_p(srv->db,
+            "INSERT OR REPLACE INTO peers "
+            "(peer_id, name, url, mode, priority, enabled, added_at) "
+            "VALUES (?1, ?2, ?3, ?4, ?5, 1, datetime('now'))",
+            pp2, 5);
+
+        if (st != COOKBOOK_DB_OK) {
+            send_json(conn, 500, "{\"error\":\"Database error\"}\n");
+        } else {
+            send_json(conn, 200, "{\"status\":\"ok\"}\n");
+        }
+        return 1;
+    }
+
+    if (strcmp(ri->request_method, "DELETE") == 0) {
+        char *path = path_after(ri->local_uri, "/admin/peers/");
+        if (!path || !path[0]) {
+            send_json(conn, 400, "{\"error\":\"Peer ID required\"}\n");
+            free(path);
+            return 1;
+        }
+        cookbook_db_param dp[] = { COOKBOOK_P_TEXT(path) };
+        srv->db->exec_p(srv->db,
+            "DELETE FROM peers WHERE peer_id = ?1", dp, 1);
+        send_json(conn, 200, "{\"status\":\"deleted\"}\n");
+        free(path);
+        return 1;
+    }
+
+    send_json(conn, 405, "{\"error\":\"Method not allowed\"}\n");
+    return 1;
+}
+
+/* ==== route: /admin/policies ==== */
+
+typedef struct {
+    char  *buf;
+    size_t pos;
+    size_t cap;
+    int    count;
+} policy_list_ctx;
+
+static int policy_list_cb(const cookbook_db_row *row, void *user) {
+    policy_list_ctx *ctx = (policy_list_ctx *)user;
+    if (row->ncols < 3 || !row->values[0]) return 0;
+    const char *sub  = row->values[0];
+    const char *kind = row->values[1] ? row->values[1] : "user";
+    const char *upd  = row->values[2] ? row->values[2] : "";
+
+    int n;
+    if (ctx->count > 0) {
+        n = snprintf(ctx->buf + ctx->pos, ctx->cap - ctx->pos, ",");
+        if (n > 0) ctx->pos += (size_t)n;
+    }
+    n = snprintf(ctx->buf + ctx->pos, ctx->cap - ctx->pos,
+        "{\"subject\":\"%s\",\"kind\":\"%s\",\"updated_at\":\"%s\"}",
+        sub, kind, upd);
+    if (n > 0) ctx->pos += (size_t)n;
+    ctx->count++;
+    return 0;
+}
+
+static int handle_admin_policies(struct mg_connection *conn, void *cbdata) {
+    cookbook_server *srv = (cookbook_server *)cbdata;
+    const struct mg_request_info *ri = mg_get_request_info(conn);
+
+    if (strcmp(ri->request_method, "GET") == 0) {
+        /* check for specific subject: /admin/policies/{subject} */
+        char *path = path_after(ri->local_uri, "/admin/policies/");
+        if (path && path[0]) {
+            /* check for /effective suffix */
+            char *eff = strstr(path, "/effective");
+            if (eff) {
+                *eff = '\0'; /* truncate to get subject */
+                char *json = cookbook_policy_resolve(srv->db, path);
+                free(path);
+                if (!json) {
+                    send_json(conn, 404,
+                        "{\"error\":\"Policy not found or resolution failed\"}\n");
+                    return 1;
+                }
+                size_t jlen = strlen(json);
+                mg_printf(conn,
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: %zu\r\n"
+                    "\r\n"
+                    "%s", jlen, json);
+                free(json);
+                return 1;
+            }
+
+            /* get specific policy */
+            char *pastlet = cookbook_policy_get(srv->db, path);
+            free(path);
+            if (!pastlet) {
+                send_json(conn, 404, "{\"error\":\"Policy not found\"}\n");
+                return 1;
+            }
+            /* return as application/x-pasta */
+            size_t plen = strlen(pastlet);
+            mg_printf(conn,
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/x-pasta\r\n"
+                "Content-Length: %zu\r\n"
+                "\r\n"
+                "%s", plen, pastlet);
+            free(pastlet);
+            return 1;
+        }
+        free(path);
+
+        /* list all policies */
+        char lbuf[8192] = {0};
+        policy_list_ctx plctx = { lbuf, 0, sizeof(lbuf), 0 };
+        srv->db->query(srv->db,
+            "SELECT subject, kind, updated_at FROM policies ORDER BY subject",
+            policy_list_cb, &plctx);
+
+        char resp[8320];
+        int rlen = snprintf(resp, sizeof(resp),
+            "{\"policies\":[%s]}\n", lbuf);
+        mg_printf(conn,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "\r\n"
+            "%s", rlen, resp);
+        return 1;
+    }
+
+    if (strcmp(ri->request_method, "PUT") == 0) {
+        char *path = path_after(ri->local_uri, "/admin/policies/");
+        if (!path || !path[0]) {
+            free(path);
+            send_json(conn, 400, "{\"error\":\"Subject required in path\"}\n");
+            return 1;
+        }
+        char subject[128];
+        snprintf(subject, sizeof(subject), "%s", path);
+        free(path);
+
+        /* read body — the pastlet */
+        size_t body_len = 0;
+        char *body = read_body(conn, ri, &body_len, 65536);
+        if (!body || body_len == 0) {
+            free(body);
+            send_json(conn, 400, "{\"error\":\"Pastlet body required\"}\n");
+            return 1;
+        }
+
+        /* validate it's parseable pasta */
+        PastaResult pr;
+        PastaValue *test = pasta_parse(body, body_len, &pr);
+        if (!test) {
+            free(body);
+            char err[512];
+            snprintf(err, sizeof(err),
+                "{\"error\":\"Invalid pasta at %d:%d: %s\"}\n",
+                pr.line, pr.col, pr.message);
+            send_json(conn, 400, err);
+            return 1;
+        }
+        pasta_free(test);
+
+        /* extract kind from pastlet if present */
+        const char *kind = "user";
+        PastaValue *v2 = pasta_parse(body, body_len, NULL);
+        if (v2) {
+            const PastaValue *id = pasta_map_get(v2, "identity");
+            if (id && pasta_type(id) == PASTA_MAP) {
+                const PastaValue *kv = pasta_map_get(id, "kind");
+                if (kv && pasta_type(kv) == PASTA_STRING) {
+                    const char *ks = pasta_get_string(kv);
+                    if (strcmp(ks, "team") == 0) kind = "team";
+                }
+            }
+            pasta_free(v2);
+        }
+
+        if (cookbook_policy_put(srv->db, subject, kind, body) != 0) {
+            free(body);
+            send_json(conn, 500, "{\"error\":\"Database error\"}\n");
+            return 1;
+        }
+        free(body);
+        send_json(conn, 200, "{\"status\":\"ok\"}\n");
+        return 1;
+    }
+
+    if (strcmp(ri->request_method, "DELETE") == 0) {
+        char *path = path_after(ri->local_uri, "/admin/policies/");
+        if (!path || !path[0]) {
+            free(path);
+            send_json(conn, 400, "{\"error\":\"Subject required in path\"}\n");
+            return 1;
+        }
+        cookbook_policy_delete(srv->db, path);
+        free(path);
+        send_json(conn, 200, "{\"status\":\"deleted\"}\n");
+        return 1;
+    }
+
+    send_json(conn, 405, "{\"error\":\"Method not allowed\"}\n");
+    return 1;
+}
+
 /* ==== public API ==== */
 
 cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
@@ -2082,6 +2911,10 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
         : 3600;  /* default 1 hour */
     srv->jwt_ttl_sec = opts->jwt_ttl_sec > 0 ? opts->jwt_ttl_sec : 3600;
     srv->rate_limit_per_min = opts->rate_limit_per_min;
+    srv->grid_enabled = opts->grid_enabled;
+    srv->grid_max_hops = opts->grid_max_hops > 0
+        ? opts->grid_max_hops
+        : COOKBOOK_GRID_MAX_HOPS_DEFAULT;
 
     /* initialize rate limiter lock */
 #ifdef _WIN32
@@ -2130,6 +2963,22 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
     mg_set_request_handler(srv->ctx, "/resolve/", handle_resolve, srv);
     mg_set_request_handler(srv->ctx, "/artifact/", handle_artifact, srv);
 
+    /* grid federation endpoints */
+    if (srv->grid_enabled) {
+        mg_set_request_handler(srv->ctx, "/grid/resolve/",
+                               handle_grid_resolve, srv);
+        mg_set_request_handler(srv->ctx, "/grid/artifact/",
+                               handle_grid_artifact, srv);
+        mg_set_request_handler(srv->ctx, "/grid/manifest",
+                               handle_grid_manifest, srv);
+        mg_set_request_handler(srv->ctx, "/admin/peers",
+                               handle_admin_peers, srv);
+    }
+
+    /* auth v2: policy admin endpoints */
+    mg_set_request_handler(srv->ctx, "/admin/policies",
+                           handle_admin_policies, srv);
+
     /* #20: start reconciliation thread */
     srv->reconcile_running = 1;
 #ifdef _WIN32
@@ -2151,6 +3000,9 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
     if (srv->rate_limit_per_min > 0)
         fprintf(stdout, "cookbook: rate limit: %d req/min per subject\n",
                 srv->rate_limit_per_min);
+    if (srv->grid_enabled)
+        fprintf(stdout, "cookbook: grid federation: enabled (max hops: %d)\n",
+                srv->grid_max_hops);
     return srv;
 }
 

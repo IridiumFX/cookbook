@@ -517,6 +517,11 @@ static int extract_bearer_jwt(cookbook_server *srv,
    Extracts JWT, checks v2 grants or v1 group, handles rate limiting.
    Returns 1 if allowed (claims populated), 0 if denied (error sent).
    If auth is disabled (no registry key), returns 1 with zeroed claims. */
+/* forward declaration — defined after utc_now */
+static void audit_log(cookbook_server *srv, const char *event,
+                       const char *subject, const char *target,
+                       const char *result);
+
 static int require_auth_v2(cookbook_server *srv, struct mg_connection *conn,
                             const struct mg_request_info *ri,
                             const char *group_id, char op,
@@ -527,6 +532,7 @@ static int require_auth_v2(cookbook_server *srv, struct mg_connection *conn,
     if (extract_bearer_jwt(srv, ri, claims) != 0) {
         METRIC_INC(srv->metrics.responses_4xx);
         METRIC_INC(srv->metrics.auth_failures);
+        audit_log(srv, "auth", "unknown", group_id, "jwt-invalid");
         send_json(conn, 401,
             "{\"error\":\"Valid Bearer JWT required\"}\n");
         return 0;
@@ -535,6 +541,7 @@ static int require_auth_v2(cookbook_server *srv, struct mg_connection *conn,
     /* rate limiting */
     if (check_rate_limit(srv, claims->sub)) {
         METRIC_INC(srv->metrics.responses_4xx);
+        audit_log(srv, "auth", claims->sub, group_id, "rate-limited");
         cookbook_jwt_claims_free(claims);
         send_json(conn, 429, "{\"error\":\"Rate limit exceeded\"}\n");
         return 0;
@@ -546,6 +553,7 @@ static int require_auth_v2(cookbook_server *srv, struct mg_connection *conn,
                                 group_id, op)) {
             METRIC_INC(srv->metrics.responses_4xx);
             METRIC_INC(srv->metrics.auth_failures);
+            audit_log(srv, "auth", claims->sub, group_id, "denied");
             cookbook_jwt_claims_free(claims);
             send_json(conn, 403,
                 "{\"error\":\"Insufficient permissions\"}\n");
@@ -556,6 +564,7 @@ static int require_auth_v2(cookbook_server *srv, struct mg_connection *conn,
         if (op != 'r' && !cookbook_jwt_has_group(claims, group_id)) {
             METRIC_INC(srv->metrics.responses_4xx);
             METRIC_INC(srv->metrics.auth_failures);
+            audit_log(srv, "auth", claims->sub, group_id, "denied");
             send_json(conn, 403,
                 "{\"error\":\"JWT does not authorize this group\"}\n");
             return 0;
@@ -2364,6 +2373,7 @@ static int handle_auth_token(struct mg_connection *conn, void *cbdata) {
             if (cookbook_credential_verify(cred_tok, clctx.hash) != 0) {
                 METRIC_INC(srv->metrics.responses_4xx);
                 METRIC_INC(srv->metrics.auth_failures);
+                audit_log(srv, "auth", sub, "token-issue", "bad-credentials");
                 send_json(conn, 401,
                     "{\"error\":\"Invalid credentials\"}\n");
                 return 1;
@@ -2463,6 +2473,8 @@ static int handle_auth_token(struct mg_connection *conn, void *cbdata) {
                                     free(body);
                                     METRIC_INC(srv->metrics.responses_4xx);
                                     METRIC_INC(srv->metrics.auth_failures);
+                                    audit_log(srv, "auth", sub,
+                                              "token-issue", "bad-credentials");
                                     send_json(conn, 401,
                                         "{\"error\":\"Invalid credentials\"}\n");
                                     return 1;

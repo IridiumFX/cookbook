@@ -11,76 +11,11 @@
  */
 
 #include "cookbook_ldap.h"
+#include "cookbook_socket.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-
-/* ---- Platform socket abstraction ---- */
-
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-typedef SOCKET sock_t;
-#define SOCK_INVALID INVALID_SOCKET
-#define sock_close(s) closesocket(s)
-#define sock_errno WSAGetLastError()
-#else
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netdb.h>
-#include <errno.h>
-typedef int sock_t;
-#define SOCK_INVALID (-1)
-#define sock_close(s) close(s)
-#define sock_errno errno
-#endif
-
-static sock_t tcp_connect(const char *host, int port) {
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", port);
-
-    struct addrinfo hints = {0}, *res = NULL;
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res)
-        return SOCK_INVALID;
-
-    sock_t s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (s == SOCK_INVALID) { freeaddrinfo(res); return SOCK_INVALID; }
-
-    if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) {
-        sock_close(s);
-        freeaddrinfo(res);
-        return SOCK_INVALID;
-    }
-
-    freeaddrinfo(res);
-    return s;
-}
-
-static int sock_send_all(sock_t s, const unsigned char *buf, size_t len) {
-    while (len > 0) {
-        int n = send(s, (const char *)buf, (int)len, 0);
-        if (n <= 0) return -1;
-        buf += n;
-        len -= (size_t)n;
-    }
-    return 0;
-}
-
-static int sock_recv_all(sock_t s, unsigned char *buf, size_t len) {
-    size_t got = 0;
-    while (got < len) {
-        int n = recv(s, (char *)buf + got, (int)(len - got), 0);
-        if (n <= 0) return -1;
-        got += (size_t)n;
-    }
-    return 0;
-}
 
 /* ---- BER encoding helpers (X.690, DER subset) ---- */
 
@@ -350,28 +285,28 @@ int cookbook_ldap_bind(const cookbook_ldap_config *cfg,
              attr, subject, cfg->base_dn ? cfg->base_dn : "");
 
     /* connect */
-    sock_t s = tcp_connect(host_buf, port);
-    if (s == SOCK_INVALID) return -1;
+    cookbook_sock_t s = cookbook_sock_connect(host_buf, port, 5);
+    if (s == COOKBOOK_SOCK_INVALID) return -1;
 
     /* build and send BindRequest */
     unsigned char req[2048];
     size_t req_len = 0;
     if (build_bind_request(req, sizeof(req), &req_len, 1,
                             user_dn, password) != 0) {
-        sock_close(s);
+        cookbook_sock_close(s);
         return -1;
     }
 
-    if (sock_send_all(s, req, req_len) != 0) {
-        sock_close(s);
+    if (cookbook_sock_send(s, req, req_len) != 0) {
+        cookbook_sock_close(s);
         return -1;
     }
 
     /* receive BindResponse — read header first to get length */
     unsigned char resp[4096];
     /* read first 2 bytes: tag + first length byte */
-    if (sock_recv_all(s, resp, 2) != 0) {
-        sock_close(s);
+    if (cookbook_sock_recv(s, resp, 2) != 0) {
+        cookbook_sock_close(s);
         return -1;
     }
 
@@ -381,9 +316,9 @@ int cookbook_ldap_bind(const cookbook_ldap_config *cfg,
         total_len = (size_t)resp[1];
     } else {
         hdr_extra = (size_t)(resp[1] & 0x7F);
-        if (hdr_extra > 3 || hdr_extra == 0) { sock_close(s); return -1; }
-        if (sock_recv_all(s, resp + 2, hdr_extra) != 0) {
-            sock_close(s);
+        if (hdr_extra > 3 || hdr_extra == 0) { cookbook_sock_close(s); return -1; }
+        if (cookbook_sock_recv(s, resp + 2, hdr_extra) != 0) {
+            cookbook_sock_close(s);
             return -1;
         }
         total_len = 0;
@@ -393,18 +328,18 @@ int cookbook_ldap_bind(const cookbook_ldap_config *cfg,
 
     size_t hdr_size = 2 + hdr_extra;
     if (total_len + hdr_size > sizeof(resp)) {
-        sock_close(s);
+        cookbook_sock_close(s);
         return -1;
     }
 
     /* read the rest of the message */
     if (total_len > 0 &&
-        sock_recv_all(s, resp + hdr_size, total_len) != 0) {
-        sock_close(s);
+        cookbook_sock_recv(s, resp + hdr_size, total_len) != 0) {
+        cookbook_sock_close(s);
         return -1;
     }
 
-    sock_close(s);
+    cookbook_sock_close(s);
 
     /* parse response */
     int rc = parse_bind_response(resp, hdr_size + total_len);

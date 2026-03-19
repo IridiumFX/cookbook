@@ -3,6 +3,7 @@
    artifacts from any peer via redirect (307) or proxy. */
 
 #include "cookbook_grid.h"
+#include "cookbook_socket.h"
 #include "cookbook_ed25519.h"
 #include "cookbook_auth.h"  /* for cookbook_base64url_encode */
 #include <stdio.h>
@@ -10,22 +11,9 @@
 #include <string.h>
 #include <time.h>
 
-#ifdef _WIN32
-  #include <winsock2.h>
-  #include <ws2tcpip.h>
-  #include <windows.h>
-  typedef SOCKET sock_t;
-  #define SOCK_INVALID INVALID_SOCKET
-  #define sock_close closesocket
-#else
-  #include <sys/socket.h>
-  #include <netdb.h>
-  #include <netinet/in.h>
-  #include <unistd.h>
-  typedef int sock_t;
-  #define SOCK_INVALID (-1)
-  #define sock_close close
-#endif
+typedef cookbook_sock_t sock_t;
+#define SOCK_INVALID COOKBOOK_SOCK_INVALID
+#define sock_close cookbook_sock_close
 
 /* ---- Peer loading ---- */
 
@@ -144,49 +132,12 @@ static int parse_peer_url(const char *url,
 /* ---- Socket helpers ---- */
 
 static sock_t grid_connect(const char *host, const char *port) {
-    struct addrinfo hints = {0}, *res = NULL;
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host, port, &hints, &res) != 0 || !res)
-        return SOCK_INVALID;
-
-    sock_t fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd == SOCK_INVALID) {
-        freeaddrinfo(res);
-        return SOCK_INVALID;
-    }
-
-    if (connect(fd, res->ai_addr, (int)res->ai_addrlen) != 0) {
-        sock_close(fd);
-        freeaddrinfo(res);
-        return SOCK_INVALID;
-    }
-    freeaddrinfo(res);
-
-    /* set 5 second timeout */
-#ifdef _WIN32
-    DWORD timeout = 5000;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout,
-               sizeof(timeout));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout,
-               sizeof(timeout));
-#else
-    struct timeval tv = { 5, 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-#endif
-
-    return fd;
+    int p = atoi(port);
+    return cookbook_sock_connect(host, p, 5);
 }
 
 static int grid_send_all(sock_t fd, const char *data, size_t len) {
-    size_t sent = 0;
-    while (sent < len) {
-        int chunk = (len - sent > 65536) ? 65536 : (int)(len - sent);
-        int n = send(fd, data + sent, chunk, 0);
-        if (n <= 0) return -1;
-        sent += (size_t)n;
-    }
+    return cookbook_sock_send(fd, data, len);
     return 0;
 }
 
@@ -203,7 +154,7 @@ static char *grid_recv_response(sock_t fd, size_t *out_len, int *status) {
             if (!tmp) break;
             buf = tmp;
         }
-        int n = recv(fd, buf + total, (int)(cap - 1 - total), 0);
+        int n = cookbook_sock_recv_partial(fd, buf + total, cap - 1 - total);
         if (n <= 0) break;
         total += (size_t)n;
 

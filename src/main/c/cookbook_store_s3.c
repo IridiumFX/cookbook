@@ -3,6 +3,7 @@
    No libcurl dependency — uses HMAC-SHA256 from libsodium and our SHA-256. */
 
 #include "cookbook_store.h"
+#include "cookbook_socket.h"
 #include "cookbook_sha256.h"
 #include <sodium.h>
 
@@ -11,23 +12,9 @@
 #include <string.h>
 #include <time.h>
 
-#ifdef _WIN32
-  #include <winsock2.h>
-  #include <ws2tcpip.h>
-  #include <windows.h>
-  typedef SOCKET sock_t;
-  #define SOCK_INVALID INVALID_SOCKET
-  #define sock_close closesocket
-#else
-  #include <sys/socket.h>
-  #include <netdb.h>
-  #include <netinet/in.h>
-  #include <arpa/inet.h>
-  #include <unistd.h>
-  typedef int sock_t;
-  #define SOCK_INVALID (-1)
-  #define sock_close close
-#endif
+typedef cookbook_sock_t sock_t;
+#define SOCK_INVALID COOKBOOK_SOCK_INVALID
+#define sock_close cookbook_sock_close
 
 typedef struct {
     cookbook_store  base;
@@ -225,41 +212,13 @@ static char *s3_sign_request(cookbook_store_s3 *self,
 /* ---- socket helpers ---- */
 
 static sock_t s3_connect(cookbook_store_s3 *self) {
-    const char *host = self->endpoint_host;
-    const char *port = self->endpoint_port;
-
-    /* for virtual-hosted style, connect to the same endpoint */
-    struct addrinfo hints = {0}, *res = NULL;
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host, port, &hints, &res) != 0 || !res)
-        return SOCK_INVALID;
-
-    sock_t fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd == SOCK_INVALID) {
-        freeaddrinfo(res);
-        return SOCK_INVALID;
-    }
-
-    if (connect(fd, res->ai_addr, (int)res->ai_addrlen) != 0) {
-        sock_close(fd);
-        freeaddrinfo(res);
-        return SOCK_INVALID;
-    }
-    freeaddrinfo(res);
-    return fd;
+    int p = atoi(self->endpoint_port);
+    return cookbook_sock_connect(self->endpoint_host, p, 10);
 }
 
 /* Send data over socket, handling partial sends. */
 static int sock_send_all(sock_t fd, const void *data, size_t len) {
-    size_t sent = 0;
-    while (sent < len) {
-        int chunk = (len - sent > 65536) ? 65536 : (int)(len - sent);
-        int n = send(fd, (const char *)data + sent, chunk, 0);
-        if (n <= 0) return -1;
-        sent += (size_t)n;
-    }
-    return 0;
+    return cookbook_sock_send(fd, data, len);
 }
 
 /* Receive full HTTP response. Returns malloc'd buffer, sets *out_len.
@@ -276,7 +235,7 @@ static char *sock_recv_response(sock_t fd, size_t *out_len, int *status) {
             if (!tmp) { free(buf); *out_len = 0; *status = -1; return NULL; }
             buf = tmp;
         }
-        int n = recv(fd, buf + total, (int)(cap - 1 - total), 0);
+        int n = cookbook_sock_recv_partial(fd, buf + total, cap - 1 - total);
         if (n <= 0) break;
         total += (size_t)n;
 

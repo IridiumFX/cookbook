@@ -14,7 +14,7 @@ set COOKBOOK_STORAGE_DIR=.\data\objects
 set COOKBOOK_JWT_TTL_SEC=3600
 set COOKBOOK_RATE_LIMIT_PER_MIN=0
 set COOKBOOK_PENDING_TIMEOUT_SEC=3600
-set COOKBOOK_AUDIT_LOG=.\data\audit.pasta
+set COOKBOOK_AUDIT_DIR=.\data\audit
 set COOKBOOK_OBJECT_CACHE_TTL_SEC=86400
 
 :: Runtime libraries
@@ -23,6 +23,7 @@ set PATH=C:\Program Files\PostgreSQL\16\bin;C:\Program Files\JetBrains\CLion 202
 :: Create directories if needed
 if not exist keys mkdir keys
 if not exist data\objects mkdir data\objects
+if not exist data\audit mkdir data\audit
 
 :: Run the server
 echo Starting on http://localhost:%COOKBOOK_PORT% (auth: enabled)

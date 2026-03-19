@@ -66,7 +66,9 @@ struct cookbook_server {
     int                 grid_max_hops;
     int                 grid_peer_auth;
     cookbook_revocation_list revocations;
-    FILE               *audit_log;
+    FILE               *audit_auth;
+    FILE               *audit_access;
+    FILE               *audit_admin;
     int                 object_cache_ttl_sec;
     volatile int        reconcile_running;
 #ifdef _WIN32
@@ -895,7 +897,12 @@ static void utc_now(char *buf, size_t sz) {
 static void audit_log(cookbook_server *srv, const char *event,
                        const char *subject, const char *target,
                        const char *result) {
-    if (!srv->audit_log) return;
+    /* select the right file based on event category */
+    FILE *f = NULL;
+    if (strcmp(event, "auth") == 0)        f = srv->audit_auth;
+    else if (strcmp(event, "admin") == 0)   f = srv->audit_admin;
+    else                                    f = srv->audit_access;
+    if (!f) return;
 
     char ts[64];
     utc_now(ts, sizeof(ts));
@@ -934,8 +941,8 @@ static void audit_log(cookbook_server *srv, const char *event,
 #else
         pthread_mutex_lock(&srv->audit_lock);
 #endif
-        fwrite(line, 1, (size_t)n, srv->audit_log);
-        fflush(srv->audit_log);
+        fwrite(line, 1, (size_t)n, f);
+        fflush(f);
 #ifdef _WIN32
         LeaveCriticalSection(&srv->audit_lock);
 #else
@@ -2026,6 +2033,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
 
         /* immutability check */
         if (srv->store->exists(srv->store, key) == COOKBOOK_STORE_OK) {
+            audit_log(srv, "publish", art_claims.sub, key, "duplicate");
             send_json(conn, 409,
                 "{\"error\":\"Release coordinate already published\"}\n");
             free(key); free(path); free(group); free(artifact); free(ver_file); free(filename);
@@ -2141,6 +2149,8 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
                     if (!valid) {
                         pasta_free(root);
                         srv->store->del(srv->store, key);
+                        audit_log(srv, "publish", art_claims.sub, key,
+                                  "validation-failed");
                         send_json(conn, 400,
                             "{\"error\":\"Descriptor validation failed: "
                             "artifact must be lowercase, version must be "
@@ -4053,6 +4063,7 @@ static int handle_admin_groups(struct mg_connection *conn, void *cbdata) {
 
         if (ok) {
             METRIC_INC(srv->metrics.responses_2xx);
+            audit_log(srv, "admin", claims.sub, group_id, "group-updated");
             send_json(conn, 200, "{\"status\":\"updated\"}\n");
         } else {
             send_json(conn, 404, "{\"error\":\"Group not found\"}\n");
@@ -4200,6 +4211,7 @@ static int handle_admin_credentials(struct mg_connection *conn, void *cbdata) {
             rp, 1);
         if (rc == COOKBOOK_DB_OK) {
             METRIC_INC(srv->metrics.responses_2xx);
+            audit_log(srv, "admin", subject, "credential-revoke", "ok");
             send_json(conn, 200, "{\"status\":\"revoked\"}\n");
         } else {
             send_json(conn, 500,
@@ -4312,6 +4324,7 @@ static int handle_admin_credentials(struct mg_connection *conn, void *cbdata) {
             dp, 1);
         if (rc == COOKBOOK_DB_OK) {
             METRIC_INC(srv->metrics.responses_2xx);
+            audit_log(srv, "admin", subject, "credential-delete", "ok");
             send_json(conn, 200, "{\"status\":\"deleted\"}\n");
         } else {
             send_json(conn, 500,
@@ -4449,6 +4462,7 @@ static int handle_admin_policies(struct mg_connection *conn, void *cbdata) {
             return 1;
         }
         free(body);
+        audit_log(srv, "admin", subject, "policy-put", "ok");
         send_json(conn, 200, "{\"status\":\"ok\"}\n");
         return 1;
     }
@@ -4460,6 +4474,7 @@ static int handle_admin_policies(struct mg_connection *conn, void *cbdata) {
             send_json(conn, 400, "{\"error\":\"Subject required in path\"}\n");
             return 1;
         }
+        audit_log(srv, "admin", path, "policy-delete", "ok");
         cookbook_policy_delete(srv->db, path);
         free(path);
         send_json(conn, 200, "{\"status\":\"deleted\"}\n");
@@ -4541,14 +4556,21 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
     pthread_mutex_init(&srv->audit_lock, NULL);
 #endif
 
-    /* audit log */
-    if (opts->audit_log_path) {
-        srv->audit_log = fopen(opts->audit_log_path, "a");
-        if (srv->audit_log)
-            fprintf(stdout, "cookbook: audit log: %s\n", opts->audit_log_path);
+    /* audit logs — three separate files by category */
+    if (opts->audit_log_dir) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/audit-auth.pasta", opts->audit_log_dir);
+        srv->audit_auth = fopen(path, "a");
+        snprintf(path, sizeof(path), "%s/audit-access.pasta", opts->audit_log_dir);
+        srv->audit_access = fopen(path, "a");
+        snprintf(path, sizeof(path), "%s/audit-admin.pasta", opts->audit_log_dir);
+        srv->audit_admin = fopen(path, "a");
+        if (srv->audit_auth && srv->audit_access && srv->audit_admin)
+            fprintf(stdout, "cookbook: audit logs: %s/audit-{auth,access,admin}.pasta\n",
+                    opts->audit_log_dir);
         else
-            fprintf(stderr, "cookbook: warning: cannot open audit log: %s\n",
-                    opts->audit_log_path);
+            fprintf(stderr, "cookbook: warning: some audit logs failed to open in %s\n",
+                    opts->audit_log_dir);
     }
 
     if (srv->object_cache_ttl_sec > 0)
@@ -4699,7 +4721,9 @@ void cookbook_server_stop(cookbook_server *srv) {
     pthread_mutex_destroy(&srv->audit_lock);
 #endif
 
-    if (srv->audit_log) fclose(srv->audit_log);
+    if (srv->audit_auth)   fclose(srv->audit_auth);
+    if (srv->audit_access) fclose(srv->audit_access);
+    if (srv->audit_admin)  fclose(srv->audit_admin);
 
     sodium_memzero(srv->registry_sk, 64);
     free(srv->registry_id);

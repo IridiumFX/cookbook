@@ -2815,6 +2815,51 @@ static void test_object_cache_ttl(void) {
     db->close(db);
 }
 
+static void test_repro_validation(void) {
+    /* valid .repro file */
+    const char *valid =
+        "{ format: \"now-repro-v1\", artifact_hash: \"sha256:abc123\","
+        " build: { tool: \"now 0.1.0\" } }";
+    BastaValue *v = basta_parse_cstr(valid, NULL);
+    ASSERT(v != NULL, "repro: valid parses");
+    ASSERT(basta_type(v) == BASTA_MAP, "repro: is map");
+    ASSERT(basta_map_get(v, "format") != NULL, "repro: has format");
+    ASSERT(basta_map_get(v, "artifact_hash") != NULL, "repro: has artifact_hash");
+    const BastaValue *fmt = basta_map_get(v, "format");
+    ASSERT(basta_type(fmt) == BASTA_STRING, "repro: format is string");
+    ASSERT(strcmp(basta_get_string(fmt), "now-repro-v1") == 0,
+           "repro: format value");
+    basta_free(v);
+
+    /* missing format field */
+    const char *no_fmt = "{ artifact_hash: \"sha256:abc\" }";
+    v = basta_parse_cstr(no_fmt, NULL);
+    ASSERT(v != NULL, "repro: no-fmt parses");
+    ASSERT(basta_map_get(v, "format") == NULL, "repro: format absent");
+    ASSERT(basta_map_get(v, "artifact_hash") != NULL, "repro: hash present");
+    basta_free(v);
+
+    /* missing artifact_hash field */
+    const char *no_hash = "{ format: \"now-repro-v1\" }";
+    v = basta_parse_cstr(no_hash, NULL);
+    ASSERT(v != NULL, "repro: no-hash parses");
+    ASSERT(basta_map_get(v, "format") != NULL, "repro: fmt present");
+    ASSERT(basta_map_get(v, "artifact_hash") == NULL, "repro: hash absent");
+    basta_free(v);
+
+    /* with attestations array */
+    const char *with_attest =
+        "{ format: \"now-repro-v1\", artifact_hash: \"sha256:def\","
+        " attestations: [{ signer: \"ed25519:abc\", timestamp: \"2026-03-19\" }] }";
+    v = basta_parse_cstr(with_attest, NULL);
+    ASSERT(v != NULL, "repro: attestations parse");
+    ASSERT(basta_map_get(v, "attestations") != NULL, "repro: has attestations");
+    const BastaValue *att = basta_map_get(v, "attestations");
+    ASSERT(basta_type(att) == BASTA_ARRAY, "repro: attestations is array");
+    ASSERT(basta_count(att) == 1, "repro: one attestation");
+    basta_free(v);
+}
+
 static void test_object_cache_store(void) {
     /* test that the object cache storage pattern works at the store level */
     cookbook_store *store = cookbook_store_open_fs(NULL);
@@ -3411,6 +3456,7 @@ int main(void) {
     test_credential_admin_lifecycle();
     test_group_admin_lifecycle();
     test_full_auth_flow();
+    test_repro_validation();
     test_object_cache_store();
     test_object_cache_ttl();
     test_revocation_persistence();

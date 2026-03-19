@@ -2075,6 +2075,57 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
             }
         }
 
+        /* validate .repro sidecar files (reproducibility attestation) */
+        if (filename) {
+            size_t fnlen = strlen(filename);
+            if (fnlen > 6 && strcmp(filename + fnlen - 6, ".repro") == 0) {
+                /* must be valid ASCII */
+                size_t bad = validate_ascii(body, body_len);
+                if (bad) {
+                    char err[256];
+                    snprintf(err, sizeof(err),
+                        "{\"error\":\"Non-ASCII byte at offset %zu"
+                        " in .repro file\"}\n", bad);
+                    METRIC_INC(srv->metrics.responses_4xx);
+                    send_json(conn, 400, err);
+                    free(body); free(key); free(path);
+                    free(group); free(artifact);
+                    free(ver_file); free(filename);
+                    return 1;
+                }
+                /* must be valid pasta */
+                PastaResult rpr;
+                PastaValue *repro = pasta_parse(body, body_len, &rpr);
+                if (!repro) {
+                    METRIC_INC(srv->metrics.responses_4xx);
+                    send_json(conn, 400,
+                        "{\"error\":\"Invalid .repro file: "
+                        "must be valid pasta\"}\n");
+                    free(body); free(key); free(path);
+                    free(group); free(artifact);
+                    free(ver_file); free(filename);
+                    return 1;
+                }
+                /* check required fields: format, artifact_hash */
+                int has_format = 0, has_hash = 0;
+                if (pasta_type(repro) == PASTA_MAP) {
+                    if (basta_map_get(repro, "format")) has_format = 1;
+                    if (basta_map_get(repro, "artifact_hash")) has_hash = 1;
+                }
+                pasta_free(repro);
+                if (!has_format || !has_hash) {
+                    METRIC_INC(srv->metrics.responses_4xx);
+                    send_json(conn, 400,
+                        "{\"error\":\"Invalid .repro file: "
+                        "requires 'format' and 'artifact_hash' fields\"}\n");
+                    free(body); free(key); free(path);
+                    free(group); free(artifact);
+                    free(ver_file); free(filename);
+                    return 1;
+                }
+            }
+        }
+
         /* compute SHA-256 */
         char sha256_hex[65];
         cookbook_sha256_hex(body, body_len, sha256_hex);

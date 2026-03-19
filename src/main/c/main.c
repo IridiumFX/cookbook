@@ -94,6 +94,9 @@ int main(int argc, char **argv) {
     int         grid_max_hops = atoi(grid_hops_str);
     const char *grid_auth_str = env_or("COOKBOOK_GRID_PEER_AUTH", "0");
     int         grid_peer_auth = atoi(grid_auth_str);
+    const char *audit_log    = env_or("COOKBOOK_AUDIT_LOG", NULL);
+    const char *obj_ttl_str = env_or("COOKBOOK_OBJECT_CACHE_TTL_SEC", "0");
+    int         obj_cache_ttl = atoi(obj_ttl_str);
 
     /* registry Ed25519 key pair */
     unsigned char registry_pk[32], registry_sk[64];
@@ -194,7 +197,9 @@ int main(int argc, char **argv) {
         .registry_sk         = has_key ? registry_sk : NULL,
         .grid_enabled        = grid_enabled,
         .grid_max_hops       = grid_max_hops,
-        .grid_peer_auth      = grid_peer_auth
+        .grid_peer_auth      = grid_peer_auth,
+        .audit_log_path      = audit_log,
+        .object_cache_ttl_sec = obj_cache_ttl
     };
 
     cookbook_server *srv = cookbook_server_start(&opts);

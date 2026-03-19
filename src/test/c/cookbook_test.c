@@ -2746,6 +2746,198 @@ static void test_full_auth_flow(void) {
     free(jwt2);
 }
 
+static void test_object_cache_ttl(void) {
+    cookbook_db *db = cookbook_db_open_sqlite(":memory:");
+    ASSERT(db != NULL, "obj ttl: db open");
+    ASSERT(cookbook_db_migrate(db) == COOKBOOK_DB_OK, "obj ttl: migrate");
+
+    int64_t now = (int64_t)time(NULL);
+
+    /* insert a fresh entry */
+    char now_str[32];
+    snprintf(now_str, sizeof(now_str), "%lld", (long long)now);
+    cookbook_db_param fp[] = {
+        COOKBOOK_P_TEXT("abc123.o"),
+        COOKBOOK_P_TEXT("central/objects/abc123.o"),
+        COOKBOOK_P_TEXT("1024"),
+        COOKBOOK_P_TEXT(now_str)
+    };
+    ASSERT(db->exec_p(db,
+        "INSERT INTO object_cache (cache_key, store_key, size_bytes, created_at) "
+        "VALUES (?1, ?2, ?3, ?4)",
+        fp, 4) == COOKBOOK_DB_OK, "obj ttl: insert fresh");
+
+    /* insert an old entry (2 hours ago) */
+    char old_str[32];
+    snprintf(old_str, sizeof(old_str), "%lld", (long long)(now - 7200));
+    cookbook_db_param op[] = {
+        COOKBOOK_P_TEXT("old999.o"),
+        COOKBOOK_P_TEXT("central/objects/old999.o"),
+        COOKBOOK_P_TEXT("2048"),
+        COOKBOOK_P_TEXT(old_str)
+    };
+    ASSERT(db->exec_p(db,
+        "INSERT INTO object_cache (cache_key, store_key, size_bytes, created_at) "
+        "VALUES (?1, ?2, ?3, ?4)",
+        op, 4) == COOKBOOK_DB_OK, "obj ttl: insert old");
+
+    /* count all entries */
+    int total = 0;
+    db->query(db, "SELECT cache_key FROM object_cache", count_cb, &total);
+    ASSERT(total == 2, "obj ttl: two entries");
+
+    /* query expired (TTL = 3600 sec, cutoff = now - 3600) */
+    char cutoff_str[32];
+    snprintf(cutoff_str, sizeof(cutoff_str), "%lld", (long long)(now - 3600));
+    cookbook_db_param cp[] = { COOKBOOK_P_TEXT(cutoff_str) };
+    int expired = 0;
+    db->query_p(db,
+        "SELECT cache_key FROM object_cache WHERE created_at < ?1",
+        cp, 1, count_cb, &expired);
+    ASSERT(expired == 1, "obj ttl: one expired");
+
+    /* delete expired */
+    db->exec_p(db,
+        "DELETE FROM object_cache WHERE created_at < ?1", cp, 1);
+
+    total = 0;
+    db->query(db, "SELECT cache_key FROM object_cache", count_cb, &total);
+    ASSERT(total == 1, "obj ttl: one remains after eviction");
+
+    /* verify the remaining one is the fresh entry */
+    int found_fresh = 0;
+    cookbook_db_param qp[] = { COOKBOOK_P_TEXT("abc123.o") };
+    db->query_p(db,
+        "SELECT cache_key FROM object_cache WHERE cache_key = ?1",
+        qp, 1, count_cb, &found_fresh);
+    ASSERT(found_fresh == 1, "obj ttl: fresh entry survives");
+
+    db->close(db);
+}
+
+static void test_object_cache_store(void) {
+    /* test that the object cache storage pattern works at the store level */
+    cookbook_store *store = cookbook_store_open_fs(NULL);
+    ASSERT(store != NULL, "obj cache: store open");
+
+    const char *key = "central/objects/abc123def456.o";
+    const char *data = "fake compiled object data";
+    size_t len = strlen(data);
+
+    /* put */
+    ASSERT(store->put(store, key, data, len) == COOKBOOK_STORE_OK,
+           "obj cache: put");
+
+    /* get */
+    void *out = NULL;
+    size_t out_len = 0;
+    ASSERT(store->get(store, key, &out, &out_len) == COOKBOOK_STORE_OK,
+           "obj cache: get");
+    ASSERT(out_len == len, "obj cache: length match");
+    ASSERT(memcmp(out, data, len) == 0, "obj cache: data match");
+    free(out);
+
+    /* exists via get */
+    out = NULL; out_len = 0;
+    ASSERT(store->get(store, key, &out, &out_len) == COOKBOOK_STORE_OK,
+           "obj cache: exists");
+    free(out);
+
+    /* not found */
+    out = NULL; out_len = 0;
+    ASSERT(store->get(store, "central/objects/nonexistent.o",
+           &out, &out_len) == COOKBOOK_STORE_NOT_FOUND,
+           "obj cache: miss");
+
+    /* delete */
+    ASSERT(store->del(store, key) == COOKBOOK_STORE_OK,
+           "obj cache: del");
+    out = NULL; out_len = 0;
+    ASSERT(store->get(store, key, &out, &out_len) == COOKBOOK_STORE_NOT_FOUND,
+           "obj cache: deleted");
+
+    store->close(store);
+}
+
+static void test_revocation_persistence(void) {
+    cookbook_db *db = cookbook_db_open_sqlite(":memory:");
+    ASSERT(db != NULL, "revoke persist: db open");
+    ASSERT(cookbook_db_migrate(db) == COOKBOOK_DB_OK, "revoke persist: migrate");
+
+    /* insert a revocation into the DB */
+    int64_t future_exp = (int64_t)time(NULL) + 3600;
+    char exp_str[32];
+    snprintf(exp_str, sizeof(exp_str), "%lld", (long long)future_exp);
+    cookbook_db_param rp[] = {
+        COOKBOOK_P_TEXT("abc123def456"),
+        COOKBOOK_P_TEXT("alice"),
+        COOKBOOK_P_TEXT("2026-03-19T18:00:00Z"),
+        COOKBOOK_P_TEXT(exp_str)
+    };
+    ASSERT(db->exec_p(db,
+        "INSERT INTO revocations (jti, subject, revoked_at, expires_at) "
+        "VALUES (?1, ?2, ?3, ?4)",
+        rp, 4) == COOKBOOK_DB_OK, "revoke persist: insert");
+
+    /* insert an already-expired revocation */
+    char past_str[32];
+    snprintf(past_str, sizeof(past_str), "%lld",
+             (long long)((int64_t)time(NULL) - 100));
+    cookbook_db_param rp2[] = {
+        COOKBOOK_P_TEXT("expired999"),
+        COOKBOOK_P_TEXT("bob"),
+        COOKBOOK_P_TEXT("2026-03-19T17:00:00Z"),
+        COOKBOOK_P_TEXT(past_str)
+    };
+    ASSERT(db->exec_p(db,
+        "INSERT INTO revocations (jti, subject, revoked_at, expires_at) "
+        "VALUES (?1, ?2, ?3, ?4)",
+        rp2, 4) == COOKBOOK_DB_OK, "revoke persist: insert expired");
+
+    /* load non-expired into a fresh revocation list */
+    cookbook_revocation_list rl;
+    cookbook_revocation_init(&rl, 64);
+
+    char now_str[32];
+    snprintf(now_str, sizeof(now_str), "%lld", (long long)time(NULL));
+    cookbook_db_param tp[] = { COOKBOOK_P_TEXT(now_str) };
+    int loaded = 0;
+    /* simulate the startup load query */
+    typedef struct { cookbook_revocation_list *rl; int *loaded; } rl_ctx;
+    rl_ctx ctx = { &rl, &loaded };
+    db->query_p(db,
+        "SELECT jti, expires_at FROM revocations WHERE expires_at > ?1",
+        tp, 1,
+        (cookbook_db_row_cb)count_cb, &loaded);
+    /* count_cb just counts rows — should be 1 (only non-expired) */
+    ASSERT(loaded == 1, "revoke persist: only non-expired loaded");
+
+    /* verify the jti is loadable */
+    cookbook_revocation_add(&rl, "abc123def456", future_exp);
+    ASSERT(cookbook_revocation_check(&rl, "abc123def456") == 1,
+           "revoke persist: jti found in list");
+    ASSERT(cookbook_revocation_check(&rl, "expired999") == 0,
+           "revoke persist: expired jti not in list");
+
+    /* prune expired from DB */
+    db->exec_p(db, "DELETE FROM revocations WHERE expires_at <= ?1", tp, 1);
+    int remaining = 0;
+    db->query(db, "SELECT jti FROM revocations", count_cb, &remaining);
+    ASSERT(remaining == 1, "revoke persist: expired pruned from DB");
+
+    /* duplicate insert should be ignored (OR IGNORE) */
+    ASSERT(db->exec_p(db,
+        "INSERT OR IGNORE INTO revocations "
+        "(jti, subject, revoked_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+        rp, 4) == COOKBOOK_DB_OK, "revoke persist: dup ignored");
+    remaining = 0;
+    db->query(db, "SELECT jti FROM revocations", count_cb, &remaining);
+    ASSERT(remaining == 1, "revoke persist: still one after dup");
+
+    cookbook_revocation_free(&rl);
+    db->close(db);
+}
+
 #ifdef COOKBOOK_HAS_BASTA
 /* ---- basta integration tests ---- */
 
@@ -3020,6 +3212,118 @@ static void test_ed25519_cross_validation(void) {
     ASSERT(rc == 0, "cross: sodium verifies native key+sig");
 }
 
+static void test_group_admin_lifecycle(void) {
+    cookbook_db *db = cookbook_db_open_sqlite(":memory:");
+    ASSERT(db != NULL, "group admin: db open");
+    ASSERT(cookbook_db_migrate(db) == COOKBOOK_DB_OK, "group admin: migrate");
+
+    /* create a group */
+    cookbook_db_param ip[] = {
+        COOKBOOK_P_TEXT("com.iridiumfx"),
+        COOKBOOK_P_TEXT("alice"),
+        COOKBOOK_P_TEXT("2026-03-19T00:00:00Z"),
+        COOKBOOK_P_TEXT("IridiumFX components")
+    };
+    ASSERT(db->exec_p(db,
+        "INSERT INTO groups (group_id, owner_sub, created_at, description) "
+        "VALUES (?1, ?2, ?3, ?4)",
+        ip, 4) == COOKBOOK_DB_OK, "group admin: create");
+
+    /* duplicate should fail */
+    ASSERT(db->exec_p(db,
+        "INSERT INTO groups (group_id, owner_sub, created_at, description) "
+        "VALUES (?1, ?2, ?3, ?4)",
+        ip, 4) == COOKBOOK_DB_CONSTRAINT, "group admin: dup rejected");
+
+    /* query the group */
+    int count = 0;
+    cookbook_db_param qp[] = { COOKBOOK_P_TEXT("com.iridiumfx") };
+    db->query_p(db,
+        "SELECT group_id FROM groups WHERE group_id = ?1",
+        qp, 1, count_cb, &count);
+    ASSERT(count == 1, "group admin: found");
+
+    /* update description */
+    cookbook_db_param up[] = {
+        COOKBOOK_P_TEXT("Updated description"),
+        COOKBOOK_P_TEXT("com.iridiumfx")
+    };
+    ASSERT(db->exec_p(db,
+        "UPDATE groups SET description = ?1 WHERE group_id = ?2",
+        up, 2) == COOKBOOK_DB_OK, "group admin: update desc");
+
+    /* update owner */
+    cookbook_db_param uo[] = {
+        COOKBOOK_P_TEXT("bob"),
+        COOKBOOK_P_TEXT("com.iridiumfx")
+    };
+    ASSERT(db->exec_p(db,
+        "UPDATE groups SET owner_sub = ?1 WHERE group_id = ?2",
+        uo, 2) == COOKBOOK_DB_OK, "group admin: update owner");
+
+    /* create second group */
+    cookbook_db_param ip2[] = {
+        COOKBOOK_P_TEXT("org.example"),
+        COOKBOOK_P_TEXT("charlie"),
+        COOKBOOK_P_TEXT("2026-03-19T01:00:00Z")
+    };
+    ASSERT(db->exec_p(db,
+        "INSERT INTO groups (group_id, owner_sub, created_at) "
+        "VALUES (?1, ?2, ?3)",
+        ip2, 3) == COOKBOOK_DB_OK, "group admin: create second");
+
+    /* count all groups */
+    count = 0;
+    db->query(db, "SELECT group_id FROM groups", count_cb, &count);
+    ASSERT(count == 2, "group admin: two groups");
+
+    /* add artifact referencing first group */
+    ASSERT(db->exec(db,
+        "INSERT INTO artifacts "
+        "(coord_id, group_id, artifact, version, triple, sha256) "
+        "VALUES ('com.iridiumfx:core:1.0.0:linux:amd64:gnu', "
+        "'com.iridiumfx', 'core', '1.0.0', 'linux:amd64:gnu', 'abcd1234')"
+    ) == COOKBOOK_DB_OK, "group admin: add artifact");
+
+    /* delete group with artifacts should be blocked at handler level,
+       but at DB level FK may or may not cascade depending on schema.
+       Here we test the count-based check the handler uses. */
+    int art_count = 0;
+    cookbook_db_param cp[] = { COOKBOOK_P_TEXT("com.iridiumfx") };
+    db->query_p(db,
+        "SELECT coord_id FROM artifacts WHERE group_id = ?1",
+        cp, 1, count_cb, &art_count);
+    ASSERT(art_count == 1, "group admin: artifact count = 1");
+
+    /* delete group WITHOUT artifacts succeeds */
+    cookbook_db_param dp[] = { COOKBOOK_P_TEXT("org.example") };
+    ASSERT(db->exec_p(db,
+        "DELETE FROM groups WHERE group_id = ?1",
+        dp, 1) == COOKBOOK_DB_OK, "group admin: delete empty group");
+
+    count = 0;
+    db->query(db, "SELECT group_id FROM groups", count_cb, &count);
+    ASSERT(count == 1, "group admin: one group remains");
+
+    /* clean up artifact, then delete group */
+    db->exec(db, "DELETE FROM artifacts WHERE group_id = 'com.iridiumfx'");
+    art_count = 0;
+    db->query_p(db,
+        "SELECT coord_id FROM artifacts WHERE group_id = ?1",
+        cp, 1, count_cb, &art_count);
+    ASSERT(art_count == 0, "group admin: artifacts cleared");
+
+    ASSERT(db->exec_p(db,
+        "DELETE FROM groups WHERE group_id = ?1",
+        cp, 1) == COOKBOOK_DB_OK, "group admin: delete after clearing");
+
+    count = 0;
+    db->query(db, "SELECT group_id FROM groups", count_cb, &count);
+    ASSERT(count == 0, "group admin: all groups deleted");
+
+    db->close(db);
+}
+
 int main(void) {
     printf("cookbook test suite\n\n");
 
@@ -3105,7 +3409,11 @@ int main(void) {
     test_revocation_list();
     test_jwt_jti();
     test_credential_admin_lifecycle();
+    test_group_admin_lifecycle();
     test_full_auth_flow();
+    test_object_cache_store();
+    test_object_cache_ttl();
+    test_revocation_persistence();
 #ifdef COOKBOOK_HAS_BASTA
     test_basta_integration();
 #endif

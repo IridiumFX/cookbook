@@ -66,13 +66,17 @@ struct cookbook_server {
     int                 grid_max_hops;
     int                 grid_peer_auth;
     cookbook_revocation_list revocations;
+    FILE               *audit_log;
+    int                 object_cache_ttl_sec;
     volatile int        reconcile_running;
 #ifdef _WIN32
     HANDLE              reconcile_thread;
     CRITICAL_SECTION    rate_lock;
+    CRITICAL_SECTION    audit_lock;
 #else
     pthread_t           reconcile_thread;
     pthread_mutex_t     rate_lock;
+    pthread_mutex_t     audit_lock;
 #endif
 };
 
@@ -877,6 +881,60 @@ static void utc_now(char *buf, size_t sz) {
 #endif
 }
 
+/* ==== audit log (pasta format) ==== */
+
+static void audit_log(cookbook_server *srv, const char *event,
+                       const char *subject, const char *target,
+                       const char *result) {
+    if (!srv->audit_log) return;
+
+    char ts[64];
+    utc_now(ts, sizeof(ts));
+
+    /* escape quotes in target */
+    char safe_target[512] = {0};
+    if (target) {
+        size_t j = 0;
+        for (size_t i = 0; target[i] && j < sizeof(safe_target) - 1; i++) {
+            safe_target[j++] = (target[i] == '"') ? '\'' : target[i];
+        }
+    }
+
+    char line[1024];
+    int n;
+    if (target && target[0]) {
+        n = snprintf(line, sizeof(line),
+            "{ timestamp: \"%s\", event: \"%s\", subject: \"%s\", "
+            "target: \"%s\", result: \"%s\" }\n",
+            ts, event,
+            subject ? subject : "anonymous",
+            safe_target,
+            result ? result : "ok");
+    } else {
+        n = snprintf(line, sizeof(line),
+            "{ timestamp: \"%s\", event: \"%s\", subject: \"%s\", "
+            "result: \"%s\" }\n",
+            ts, event,
+            subject ? subject : "anonymous",
+            result ? result : "ok");
+    }
+
+    if (n > 0) {
+#ifdef _WIN32
+        EnterCriticalSection(&srv->audit_lock);
+#else
+        pthread_mutex_lock(&srv->audit_lock);
+#endif
+        fwrite(line, 1, (size_t)n, srv->audit_log);
+        fflush(srv->audit_log);
+#ifdef _WIN32
+        LeaveCriticalSection(&srv->audit_lock);
+#else
+        pthread_mutex_unlock(&srv->audit_lock);
+#endif
+    }
+}
+
 /* Check if a pending artifact has all required files and transition to
    published if so. Required: now.pasta must exist in the store. */
 static void try_publish(cookbook_server *srv, const char *grp,
@@ -995,13 +1053,96 @@ static void reconcile_stale_pending(cookbook_server *srv) {
     free(ctx.coord_ids);
 }
 
+/* ==== Object cache TTL eviction ==== */
+
+static int srv_count_cb(const cookbook_db_row *row, void *user) {
+    (void)row;
+    int *count = (int *)user;
+    (*count)++;
+    return 0;
+}
+
+typedef struct {
+    char **keys;        /* store_key values to delete */
+    char **cache_keys;  /* cache_key values for DB delete */
+    int count;
+    int cap;
+} evict_ctx;
+
+static int evict_cb(const cookbook_db_row *row, void *user) {
+    evict_ctx *ctx = (evict_ctx *)user;
+    if (row->ncols < 2 || !row->values[0] || !row->values[1]) return 0;
+    if (ctx->count >= ctx->cap) return 0;
+
+    ctx->keys[ctx->count] = strdup(row->values[0]);       /* store_key */
+    ctx->cache_keys[ctx->count] = strdup(row->values[1]);  /* cache_key */
+    ctx->count++;
+    return 0;
+}
+
+static void evict_expired_objects(cookbook_server *srv) {
+    if (srv->object_cache_ttl_sec <= 0) return;
+
+    int64_t cutoff = (int64_t)time(NULL) - srv->object_cache_ttl_sec;
+    char cutoff_str[32];
+    snprintf(cutoff_str, sizeof(cutoff_str), "%lld", (long long)cutoff);
+
+    evict_ctx ctx = { NULL, NULL, 0, 0 };
+
+    /* count expired entries first */
+    int expired_count = 0;
+    cookbook_db_param cp[] = { COOKBOOK_P_TEXT(cutoff_str) };
+    srv->db->query_p(srv->db,
+        "SELECT store_key FROM object_cache WHERE created_at < ?1",
+        cp, 1, srv_count_cb, &expired_count);
+
+    if (expired_count == 0) return;
+
+    /* allocate and collect */
+    ctx.cap = expired_count;
+    ctx.keys = calloc((size_t)expired_count, sizeof(char *));
+    ctx.cache_keys = calloc((size_t)expired_count, sizeof(char *));
+    if (!ctx.keys || !ctx.cache_keys) {
+        free(ctx.keys);
+        free(ctx.cache_keys);
+        return;
+    }
+
+    srv->db->query_p(srv->db,
+        "SELECT store_key, cache_key FROM object_cache WHERE created_at < ?1",
+        cp, 1, evict_cb, &ctx);
+
+    /* delete from store and DB */
+    for (int i = 0; i < ctx.count; i++) {
+        if (ctx.keys[i]) {
+            srv->store->del(srv->store, ctx.keys[i]);
+            free(ctx.keys[i]);
+        }
+        if (ctx.cache_keys[i]) {
+            cookbook_db_param dp[] = { COOKBOOK_P_TEXT(ctx.cache_keys[i]) };
+            srv->db->exec_p(srv->db,
+                "DELETE FROM object_cache WHERE cache_key = ?1", dp, 1);
+            free(ctx.cache_keys[i]);
+        }
+    }
+
+    if (ctx.count > 0)
+        fprintf(stdout, "cookbook: evicted %d expired cached objects\n",
+                ctx.count);
+
+    free(ctx.keys);
+    free(ctx.cache_keys);
+}
+
 #ifdef _WIN32
 static DWORD WINAPI reconcile_thread_fn(LPVOID arg) {
     cookbook_server *srv = (cookbook_server *)arg;
     while (srv->reconcile_running) {
         Sleep(60000);  /* check every 60 seconds */
-        if (srv->reconcile_running)
+        if (srv->reconcile_running) {
             reconcile_stale_pending(srv);
+            evict_expired_objects(srv);
+        }
     }
     return 0;
 }
@@ -1010,8 +1151,10 @@ static void *reconcile_thread_fn(void *arg) {
     cookbook_server *srv = (cookbook_server *)arg;
     while (srv->reconcile_running) {
         sleep(60);  /* check every 60 seconds */
-        if (srv->reconcile_running)
+        if (srv->reconcile_running) {
             reconcile_stale_pending(srv);
+            evict_expired_objects(srv);
+        }
     }
     return NULL;
 }
@@ -1100,6 +1243,70 @@ static int handle_registry_key(struct mg_connection *conn, void *cbdata) {
         "\"public_key\":\"%s\","
         "\"status\":\"active\"}\n", pk_hex);
     send_json(conn, 200, resp);
+    return 1;
+}
+
+/* ==== route: GET /.well-known/now-registry ==== */
+
+static int handle_registry_discovery(struct mg_connection *conn, void *cbdata) {
+    cookbook_server *srv = (cookbook_server *)cbdata;
+    const struct mg_request_info *ri = mg_get_request_info(conn);
+
+    if (strcmp(ri->request_method, "GET") != 0) {
+        send_json(conn, 405, "{\"error\":\"Method not allowed\"}\n");
+        return 1;
+    }
+
+    /* build pasta discovery document */
+    char resp[2048];
+    int n = 0;
+    n += snprintf(resp + n, sizeof(resp) - (size_t)n,
+        "{ registry_id: \"%s\"", srv->registry_id);
+
+    /* auth capabilities */
+    if (srv->has_registry_key) {
+        n += snprintf(resp + n, sizeof(resp) - (size_t)n,
+            ", auth: { enabled: true"
+            ", methods: [\"token\"]"
+            ", algorithm: \"ed25519\"");
+        char pk_hex[65];
+        for (int i = 0; i < 32; i++)
+            snprintf(pk_hex + i * 2, 3, "%02x", srv->registry_pk[i]);
+        n += snprintf(resp + n, sizeof(resp) - (size_t)n,
+            ", public_key: \"%s\" }", pk_hex);
+    } else {
+        n += snprintf(resp + n, sizeof(resp) - (size_t)n,
+            ", auth: { enabled: false }");
+    }
+
+    /* grid capabilities */
+    n += snprintf(resp + n, sizeof(resp) - (size_t)n,
+        ", grid: { enabled: %s, max_hops: %d }",
+        srv->grid_enabled ? "true" : "false",
+        srv->grid_max_hops);
+
+    /* endpoints */
+    n += snprintf(resp + n, sizeof(resp) - (size_t)n,
+        ", endpoints: ["
+        "\"resolve\", \"artifact\", \"auth/token\", \"auth/revoke\""
+        ", \"keys\", \"mirror/manifest\", \"metrics\""
+        ", \"admin/credentials\", \"admin/groups\", \"admin/policies\""
+        ", \"admin/peers\", \"objects\""
+        "]");
+
+    /* content types */
+    n += snprintf(resp + n, sizeof(resp) - (size_t)n,
+        ", content_types: ["
+        "\"application/x-pasta\", \"application/json\""
+        "]");
+
+    n += snprintf(resp + n, sizeof(resp) - (size_t)n, " }\n");
+
+    mg_printf(conn,
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/x-pasta; charset=US-ASCII\r\n"
+        "Content-Length: %d\r\n\r\n", n);
+    mg_write(conn, resp, (size_t)n);
     return 1;
 }
 
@@ -1316,6 +1523,7 @@ static int handle_resolve(struct mg_connection *conn, void *cbdata) {
 
         METRIC_INC(srv->metrics.responses_2xx);
         METRIC_INC(srv->metrics.artifacts_resolved);
+        audit_log(srv, "resolve", claims.sub, path, "ok");
 
         /* #8: content negotiation on /resolve/ */
         content_pref pref = parse_accept(ri);
@@ -1439,12 +1647,14 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
             return 1;
         }
         /* Phase 3: auth enforcement on yank */
+        char yank_sub[128] = {0};
         {
             cookbook_jwt_claims yclaims;
             if (!require_auth_v2(srv, conn, ri, ygroup, 'w', &yclaims)) {
                 free(path); free(ygroup); free(yartifact); free(yversion);
                 return 1;
             }
+            snprintf(yank_sub, sizeof(yank_sub), "%s", yclaims.sub);
             cookbook_jwt_claims_free(&yclaims);
         }
         /* F1: read optional reason from POST body */
@@ -1486,6 +1696,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
         } else {
             METRIC_INC(srv->metrics.responses_2xx);
             METRIC_INC(srv->metrics.artifacts_yanked);
+            audit_log(srv, "yank", yank_sub, path, "ok");
             if (reason[0]) {
                 char resp[384];
                 snprintf(resp, sizeof(resp),
@@ -1942,12 +2153,14 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
 
                     /* ensure group exists */
                     {
+                        const char *owner_sub =
+                            art_claims.sub[0] ? art_claims.sub : "anonymous";
                         const char *grp_sql =
                             "INSERT OR IGNORE INTO groups "
                             "(group_id, owner_sub) VALUES (?1, ?2)";
                         cookbook_db_param gp[] = {
                             COOKBOOK_P_TEXT(grp),
-                            COOKBOOK_P_TEXT("anonymous")
+                            COOKBOOK_P_TEXT(owner_sub)
                         };
                         srv->db->exec_p(srv->db, grp_sql, gp, 2);
                     }
@@ -2018,6 +2231,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
         METRIC_INC(srv->metrics.responses_2xx);
         METRIC_INC(srv->metrics.artifacts_published);
         METRIC_ADD(srv->metrics.bytes_uploaded, (long)body_len);
+        audit_log(srv, "publish", art_claims.sub, key, "ok");
         char resp[256];
         snprintf(resp, sizeof(resp),
             "{\"status\":\"created\",\"sha256\":\"%s\",\"triple\":\"%s\"}\n",
@@ -2172,20 +2386,25 @@ static int handle_auth_token(struct mg_connection *conn, void *cbdata) {
             return 1;
         }
 
-        /* minimal JSON parse for sub and groups */
+        /* minimal JSON parse for sub/subject, token, and groups */
         {
             const char *p = strstr(body, "\"sub\":");
+            if (!p) p = strstr(body, "\"subject\":");
             if (p) {
-                p += 6;
-                while (*p == ' ' || *p == '\t') p++;
-                if (*p == '"') {
+                /* advance past key + colon */
+                p = strchr(p, ':');
+                if (p) {
                     p++;
-                    const char *end = strchr(p, '"');
-                    if (end) {
-                        size_t len = (size_t)(end - p);
-                        if (len >= sizeof(sub)) len = sizeof(sub) - 1;
-                        memcpy(sub, p, len);
-                        sub[len] = '\0';
+                    while (*p == ' ' || *p == '\t') p++;
+                    if (*p == '"') {
+                        p++;
+                        const char *end = strchr(p, '"');
+                        if (end) {
+                            size_t len = (size_t)(end - p);
+                            if (len >= sizeof(sub)) len = sizeof(sub) - 1;
+                            memcpy(sub, p, len);
+                            sub[len] = '\0';
+                        }
                     }
                 }
             }
@@ -2207,11 +2426,60 @@ static int handle_auth_token(struct mg_connection *conn, void *cbdata) {
                 }
             }
         }
+
+        /* if body includes "token", verify against credential store */
+        if (sub[0]) {
+            const char *tp = strstr(body, "\"token\":");
+            if (tp) {
+                tp = strchr(tp, ':');
+                if (tp) {
+                    tp++;
+                    while (*tp == ' ' || *tp == '\t') tp++;
+                    if (*tp == '"') {
+                        tp++;
+                        const char *te = strchr(tp, '"');
+                        if (te) {
+                            char body_token[512] = {0};
+                            size_t tl = (size_t)(te - tp);
+                            if (tl >= sizeof(body_token))
+                                tl = sizeof(body_token) - 1;
+                            memcpy(body_token, tp, tl);
+
+                            /* look up stored hash */
+                            cred_lookup_ctx clctx = { {0}, {0}, 0 };
+                            cookbook_db_param cp[] = {
+                                COOKBOOK_P_TEXT(sub)
+                            };
+                            srv->db->query_p(srv->db,
+                                "SELECT token_hash, groups "
+                                "FROM credentials "
+                                "WHERE subject = ?1 "
+                                "AND revoked_at IS NULL",
+                                cp, 1, cred_lookup_cb, &clctx);
+
+                            if (clctx.found) {
+                                if (cookbook_credential_verify(
+                                        body_token, clctx.hash) != 0) {
+                                    free(body);
+                                    METRIC_INC(srv->metrics.responses_4xx);
+                                    METRIC_INC(srv->metrics.auth_failures);
+                                    send_json(conn, 401,
+                                        "{\"error\":\"Invalid credentials\"}\n");
+                                    return 1;
+                                }
+                                memcpy(groups, clctx.groups, sizeof(groups));
+                                cred_verified = 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         free(body);
 
         if (!sub[0]) {
             send_json(conn, 400,
-                "{\"error\":\"Missing 'sub' field\"}\n");
+                "{\"error\":\"Missing 'sub' or 'subject' field\"}\n");
             return 1;
         }
     }
@@ -2241,6 +2509,7 @@ static int handle_auth_token(struct mg_connection *conn, void *cbdata) {
 
     METRIC_INC(srv->metrics.responses_2xx);
     METRIC_INC(srv->metrics.auth_tokens_issued);
+    audit_log(srv, "auth", sub, "token-issue", "ok");
     char resp[8192];
     snprintf(resp, sizeof(resp),
         "{\"token\":\"%s\",\"expires_in\":%d,\"version\":%d}\n",
@@ -2325,16 +2594,37 @@ static int handle_auth_revoke(struct mg_connection *conn, void *cbdata) {
         return 1;
     }
 
-    /* add to revocation list */
+    /* add to in-memory revocation list */
     int rc = cookbook_revocation_add(&srv->revocations,
                                       claims.jti, claims.exp);
-    cookbook_jwt_claims_free(&claims);
-
     if (rc != 0) {
+        cookbook_jwt_claims_free(&claims);
         send_json(conn, 507,
             "{\"error\":\"Revocation list full\"}\n");
         return 1;
     }
+
+    /* persist to database */
+    {
+        char now_ts[64];
+        utc_now(now_ts, sizeof(now_ts));
+        char exp_str[32];
+        snprintf(exp_str, sizeof(exp_str), "%lld", (long long)claims.exp);
+        cookbook_db_param rp[] = {
+            COOKBOOK_P_TEXT(claims.jti),
+            COOKBOOK_P_TEXT(claims.sub),
+            COOKBOOK_P_TEXT(now_ts),
+            COOKBOOK_P_TEXT(exp_str)
+        };
+        srv->db->exec_p(srv->db,
+            "INSERT OR IGNORE INTO revocations "
+            "(jti, subject, revoked_at, expires_at) "
+            "VALUES (?1, ?2, ?3, ?4)",
+            rp, 4);
+    }
+
+    audit_log(srv, "auth", claims.sub, "token-revoke", "ok");
+    cookbook_jwt_claims_free(&claims);
 
     METRIC_INC(srv->metrics.responses_2xx);
     send_json(conn, 200,
@@ -3292,6 +3582,520 @@ static int policy_list_cb(const cookbook_db_row *row, void *user) {
     return 0;
 }
 
+/* ==== Object cache: /objects/{key} ==== */
+
+static int handle_objects(struct mg_connection *conn, void *cbdata) {
+    cookbook_server *srv = (cookbook_server *)cbdata;
+    const struct mg_request_info *ri = mg_get_request_info(conn);
+
+    METRIC_INC(srv->metrics.requests_total);
+
+    /* extract cache key from /objects/{key} */
+    char *cache_key = path_after(ri->local_uri, "/objects/");
+    if (!cache_key || !cache_key[0]) {
+        free(cache_key);
+        METRIC_INC(srv->metrics.responses_4xx);
+        send_json(conn, 400, "{\"error\":\"Missing cache key\"}\n");
+        return 1;
+    }
+
+    /* validate: key must be hex chars + optional extension (.o, .obj, etc.)
+       reject path traversal */
+    if (validate_path_segment(cache_key) != 0) {
+        free(cache_key);
+        METRIC_INC(srv->metrics.responses_4xx);
+        send_json(conn, 400, "{\"error\":\"Invalid cache key\"}\n");
+        return 1;
+    }
+
+    /* build store key: {registry_id}/objects/{cache_key} */
+    size_t store_key_len = strlen(srv->registry_id) + 9 + strlen(cache_key);
+    char *store_key = malloc(store_key_len + 1);
+    if (!store_key) { free(cache_key); return 1; }
+    snprintf(store_key, store_key_len + 1,
+             "%s/objects/%s", srv->registry_id, cache_key);
+
+    if (strcmp(ri->request_method, "GET") == 0) {
+        METRIC_INC(srv->metrics.requests_get);
+
+        void *data = NULL;
+        size_t len = 0;
+        cookbook_store_status sst = srv->store->get(srv->store,
+                                                     store_key, &data, &len);
+        if (sst == COOKBOOK_STORE_NOT_FOUND) {
+            METRIC_INC(srv->metrics.responses_4xx);
+            send_json(conn, 404, "{\"error\":\"Object not found\"}\n");
+        } else {
+            METRIC_INC(srv->metrics.responses_2xx);
+            METRIC_ADD(srv->metrics.bytes_downloaded, (long)len);
+            mg_send_http_ok(conn, "application/octet-stream", (long long)len);
+            mg_write(conn, data, len);
+        }
+        free(data);
+        free(store_key);
+        free(cache_key);
+        return 1;
+    }
+
+    if (strcmp(ri->request_method, "HEAD") == 0) {
+        METRIC_INC(srv->metrics.requests_get);
+
+        void *data = NULL;
+        size_t len = 0;
+        cookbook_store_status sst = srv->store->get(srv->store,
+                                                     store_key, &data, &len);
+        free(data);
+        if (sst == COOKBOOK_STORE_NOT_FOUND) {
+            mg_printf(conn,
+                "HTTP/1.1 404 Not Found\r\n"
+                "Content-Length: 0\r\n\r\n");
+        } else {
+            mg_printf(conn,
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/octet-stream\r\n"
+                "Content-Length: %zu\r\n\r\n", len);
+        }
+        free(store_key);
+        free(cache_key);
+        return 1;
+    }
+
+    if (strcmp(ri->request_method, "PUT") == 0) {
+        METRIC_INC(srv->metrics.requests_put);
+
+        /* auth: require 'c' on _objects prefix */
+        cookbook_jwt_claims claims;
+        if (!require_auth_v2(srv, conn, ri, "_objects", 'c', &claims)) {
+            free(store_key);
+            free(cache_key);
+            return 1;
+        }
+        cookbook_jwt_claims_free(&claims);
+
+        /* read body */
+        size_t max = srv->max_upload_bytes > 0
+            ? srv->max_upload_bytes : 256 * 1024 * 1024;
+        size_t body_len = 0;
+        char *body = read_body(conn, ri, &body_len, max);
+        if (!body || body_len == 0) {
+            free(body);
+            free(store_key);
+            free(cache_key);
+            METRIC_INC(srv->metrics.responses_4xx);
+            send_json(conn, 400, "{\"error\":\"Empty body\"}\n");
+            return 1;
+        }
+
+        cookbook_store_status sst = srv->store->put(srv->store,
+                                                     store_key, body, body_len);
+        free(body);
+
+        if (sst == COOKBOOK_STORE_OK) {
+            METRIC_INC(srv->metrics.responses_2xx);
+            METRIC_ADD(srv->metrics.bytes_uploaded, (long)body_len);
+
+            /* track in object_cache table for TTL eviction */
+            {
+                char now_epoch[32];
+                snprintf(now_epoch, sizeof(now_epoch), "%lld",
+                         (long long)time(NULL));
+                char sz_str[32];
+                snprintf(sz_str, sizeof(sz_str), "%zu", body_len);
+                cookbook_db_param op[] = {
+                    COOKBOOK_P_TEXT(cache_key),
+                    COOKBOOK_P_TEXT(store_key),
+                    COOKBOOK_P_TEXT(sz_str),
+                    COOKBOOK_P_TEXT(now_epoch)
+                };
+                srv->db->exec_p(srv->db,
+                    "INSERT OR REPLACE INTO object_cache "
+                    "(cache_key, store_key, size_bytes, created_at) "
+                    "VALUES (?1, ?2, ?3, ?4)",
+                    op, 4);
+            }
+
+            audit_log(srv, "objects", claims.sub, cache_key, "stored");
+            send_json(conn, 201, "{\"status\":\"stored\"}\n");
+        } else {
+            send_json(conn, 500, "{\"error\":\"Store write failed\"}\n");
+        }
+        free(store_key);
+        free(cache_key);
+        return 1;
+    }
+
+    METRIC_INC(srv->metrics.responses_4xx);
+    send_json(conn, 405, "{\"error\":\"Method not allowed\"}\n");
+    free(store_key);
+    free(cache_key);
+    return 1;
+}
+
+/* ==== Group management: /admin/groups ==== */
+
+/* callback for listing groups */
+typedef struct {
+    char *buf;
+    size_t pos;
+    size_t cap;
+    int count;
+} group_list_ctx;
+
+static int group_list_cb(const cookbook_db_row *row, void *user) {
+    group_list_ctx *ctx = (group_list_ctx *)user;
+    if (row->ncols < 4 || !row->values[0]) return 0;
+
+    const char *gid   = row->values[0] ? row->values[0] : "";
+    const char *owner = row->values[1] ? row->values[1] : "";
+    const char *cdate = row->values[2] ? row->values[2] : "";
+    const char *desc  = row->values[3];
+
+    if (ctx->count > 0 && ctx->pos < ctx->cap)
+        ctx->buf[ctx->pos++] = ',';
+
+    int n;
+    if (desc) {
+        n = snprintf(ctx->buf + ctx->pos, ctx->cap - ctx->pos,
+            "{\"group_id\":\"%s\",\"owner\":\"%s\",\"created_at\":\"%s\","
+            "\"description\":\"%s\"}", gid, owner, cdate, desc);
+    } else {
+        n = snprintf(ctx->buf + ctx->pos, ctx->cap - ctx->pos,
+            "{\"group_id\":\"%s\",\"owner\":\"%s\",\"created_at\":\"%s\"}",
+            gid, owner, cdate);
+    }
+    if (n > 0) ctx->pos += (size_t)n;
+    ctx->count++;
+    return 0;
+}
+
+/* callback for counting rows (DELETE artifact check) */
+typedef struct { int count; } group_count_ctx;
+
+static int group_count_cb(const cookbook_db_row *row, void *user) {
+    group_count_ctx *c = (group_count_ctx *)user;
+    if (row->ncols > 0 && row->values[0])
+        c->count = atoi(row->values[0]);
+    return 0;
+}
+
+static int handle_admin_groups(struct mg_connection *conn, void *cbdata) {
+    cookbook_server *srv = (cookbook_server *)cbdata;
+    const struct mg_request_info *ri = mg_get_request_info(conn);
+
+    METRIC_INC(srv->metrics.requests_total);
+
+    /* extract sub-path: /admin/groups or /admin/groups/{group_id} */
+    const char *uri = ri->local_uri;
+    const char *path = uri + strlen("/admin/groups");
+    char group_id[256] = {0};
+
+    if (path[0] == '/' && path[1]) {
+        const char *start = path + 1;
+        size_t slen = strlen(start);
+        /* strip trailing slash */
+        while (slen > 0 && start[slen - 1] == '/') slen--;
+        if (slen >= sizeof(group_id)) slen = sizeof(group_id) - 1;
+        memcpy(group_id, start, slen);
+        group_id[slen] = '\0';
+
+        /* convert path slashes back to dots for group_id
+           (e.g., /admin/groups/com/iridiumfx → com.iridiumfx) */
+        for (size_t i = 0; i < slen; i++) {
+            if (group_id[i] == '/') group_id[i] = '.';
+        }
+    }
+
+    if (strcmp(ri->request_method, "GET") == 0) {
+        if (group_id[0]) {
+            /* GET /admin/groups/{group_id} — get single group */
+            cookbook_db_param gp[] = { COOKBOOK_P_TEXT(group_id) };
+            char buf[2048] = {0};
+            size_t pos = 0;
+            group_list_ctx ctx = { buf, pos, sizeof(buf), 0 };
+            srv->db->query_p(srv->db,
+                "SELECT group_id, owner_sub, created_at, description "
+                "FROM groups WHERE group_id = ?1",
+                gp, 1, group_list_cb, &ctx);
+            if (ctx.count == 0) {
+                METRIC_INC(srv->metrics.responses_4xx);
+                send_json(conn, 404, "{\"error\":\"Group not found\"}\n");
+            } else {
+                METRIC_INC(srv->metrics.responses_2xx);
+                /* wrap single result in newline */
+                size_t end = ctx.pos;
+                buf[end++] = '\n';
+                buf[end] = '\0';
+                send_json(conn, 200, buf);
+            }
+        } else {
+            /* GET /admin/groups — list all groups */
+            char buf[16384] = {0};
+            size_t pos = 0;
+            pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
+                "{\"groups\":[");
+
+            group_list_ctx ctx = { buf, pos, sizeof(buf), 0 };
+            srv->db->query(srv->db,
+                "SELECT group_id, owner_sub, created_at, description "
+                "FROM groups ORDER BY group_id",
+                group_list_cb, &ctx);
+            pos = ctx.pos;
+            pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, "]}\n");
+            METRIC_INC(srv->metrics.responses_2xx);
+            send_json(conn, 200, buf);
+        }
+        return 1;
+    }
+
+    if (strcmp(ri->request_method, "PUT") == 0) {
+        /* PUT /admin/groups — create/register a group
+           Body: {"group_id":"com.iridiumfx","description":"..."} */
+        size_t body_len = 0;
+        char *body = read_body(conn, ri, &body_len, 4096);
+        if (!body || body_len == 0) {
+            free(body);
+            METRIC_INC(srv->metrics.responses_4xx);
+            send_json(conn, 400, "{\"error\":\"Body required\"}\n");
+            return 1;
+        }
+
+        /* extract group_id and optional description from JSON body */
+        char gid[256] = {0}, desc[512] = {0};
+        const char *p;
+
+        p = strstr(body, "\"group_id\":\"");
+        if (p) {
+            p += strlen("\"group_id\":\"");
+            const char *e = strchr(p, '"');
+            if (e) {
+                size_t l = (size_t)(e - p);
+                if (l >= sizeof(gid)) l = sizeof(gid) - 1;
+                memcpy(gid, p, l);
+                gid[l] = '\0';
+            }
+        }
+
+        p = strstr(body, "\"description\":\"");
+        if (p) {
+            p += strlen("\"description\":\"");
+            const char *e = strchr(p, '"');
+            if (e) {
+                size_t l = (size_t)(e - p);
+                if (l >= sizeof(desc)) l = sizeof(desc) - 1;
+                memcpy(desc, p, l);
+                desc[l] = '\0';
+            }
+        }
+
+        if (!gid[0]) {
+            free(body);
+            METRIC_INC(srv->metrics.responses_4xx);
+            send_json(conn, 400,
+                "{\"error\":\"Missing group_id\"}\n");
+            return 1;
+        }
+
+        /* auth: require 'c' permission on the group prefix */
+        cookbook_jwt_claims claims;
+        if (!require_auth_v2(srv, conn, ri, gid, 'c', &claims)) {
+            free(body);
+            return 1;
+        }
+
+        const char *owner = claims.sub[0] ? claims.sub : "anonymous";
+
+        char now_ts[64];
+        utc_now(now_ts, sizeof(now_ts));
+
+        if (desc[0]) {
+            cookbook_db_param gp[] = {
+                COOKBOOK_P_TEXT(gid),
+                COOKBOOK_P_TEXT(owner),
+                COOKBOOK_P_TEXT(now_ts),
+                COOKBOOK_P_TEXT(desc)
+            };
+            int rc = srv->db->exec_p(srv->db,
+                "INSERT INTO groups (group_id, owner_sub, created_at, description) "
+                "VALUES (?1, ?2, ?3, ?4)",
+                gp, 4);
+            if (rc != COOKBOOK_DB_OK) {
+                /* likely duplicate */
+                METRIC_INC(srv->metrics.responses_4xx);
+                send_json(conn, 409,
+                    "{\"error\":\"Group already exists\"}\n");
+                cookbook_jwt_claims_free(&claims);
+                free(body);
+                return 1;
+            }
+        } else {
+            cookbook_db_param gp[] = {
+                COOKBOOK_P_TEXT(gid),
+                COOKBOOK_P_TEXT(owner),
+                COOKBOOK_P_TEXT(now_ts)
+            };
+            int rc = srv->db->exec_p(srv->db,
+                "INSERT INTO groups (group_id, owner_sub, created_at) "
+                "VALUES (?1, ?2, ?3)",
+                gp, 3);
+            if (rc != COOKBOOK_DB_OK) {
+                METRIC_INC(srv->metrics.responses_4xx);
+                send_json(conn, 409,
+                    "{\"error\":\"Group already exists\"}\n");
+                cookbook_jwt_claims_free(&claims);
+                free(body);
+                return 1;
+            }
+        }
+
+        METRIC_INC(srv->metrics.responses_2xx);
+        audit_log(srv, "admin", owner, gid, "group-created");
+        char resp[512];
+        snprintf(resp, sizeof(resp),
+            "{\"status\":\"created\",\"group_id\":\"%s\",\"owner\":\"%s\"}\n",
+            gid, owner);
+        send_json(conn, 201, resp);
+        cookbook_jwt_claims_free(&claims);
+        free(body);
+        return 1;
+    }
+
+    if (strcmp(ri->request_method, "PATCH") == 0 && group_id[0]) {
+        /* PATCH /admin/groups/{group_id} — update owner or description
+           Body: {"owner":"bob"} or {"description":"new desc"} or both */
+        size_t body_len = 0;
+        char *body = read_body(conn, ri, &body_len, 4096);
+        if (!body || body_len == 0) {
+            free(body);
+            METRIC_INC(srv->metrics.responses_4xx);
+            send_json(conn, 400, "{\"error\":\"Body required\"}\n");
+            return 1;
+        }
+
+        /* auth: require 'w' on the group to modify it */
+        cookbook_jwt_claims claims;
+        if (!require_auth_v2(srv, conn, ri, group_id, 'w', &claims)) {
+            free(body);
+            return 1;
+        }
+
+        char new_owner[128] = {0}, new_desc[512] = {0};
+        int has_owner = 0, has_desc = 0;
+        const char *p;
+
+        p = strstr(body, "\"owner\":\"");
+        if (p) {
+            p += strlen("\"owner\":\"");
+            const char *e = strchr(p, '"');
+            if (e) {
+                size_t l = (size_t)(e - p);
+                if (l >= sizeof(new_owner)) l = sizeof(new_owner) - 1;
+                memcpy(new_owner, p, l);
+                new_owner[l] = '\0';
+                has_owner = 1;
+            }
+        }
+
+        p = strstr(body, "\"description\":\"");
+        if (p) {
+            p += strlen("\"description\":\"");
+            const char *e = strchr(p, '"');
+            if (e) {
+                size_t l = (size_t)(e - p);
+                if (l >= sizeof(new_desc)) l = sizeof(new_desc) - 1;
+                memcpy(new_desc, p, l);
+                new_desc[l] = '\0';
+                has_desc = 1;
+            }
+        }
+
+        if (!has_owner && !has_desc) {
+            free(body);
+            cookbook_jwt_claims_free(&claims);
+            METRIC_INC(srv->metrics.responses_4xx);
+            send_json(conn, 400,
+                "{\"error\":\"Nothing to update (provide owner or description)\"}\n");
+            return 1;
+        }
+
+        int ok = 1;
+        if (has_owner) {
+            cookbook_db_param up[] = {
+                COOKBOOK_P_TEXT(new_owner),
+                COOKBOOK_P_TEXT(group_id)
+            };
+            if (srv->db->exec_p(srv->db,
+                    "UPDATE groups SET owner_sub = ?1 WHERE group_id = ?2",
+                    up, 2) != COOKBOOK_DB_OK)
+                ok = 0;
+        }
+        if (has_desc) {
+            cookbook_db_param up[] = {
+                COOKBOOK_P_TEXT(new_desc),
+                COOKBOOK_P_TEXT(group_id)
+            };
+            if (srv->db->exec_p(srv->db,
+                    "UPDATE groups SET description = ?1 WHERE group_id = ?2",
+                    up, 2) != COOKBOOK_DB_OK)
+                ok = 0;
+        }
+
+        if (ok) {
+            METRIC_INC(srv->metrics.responses_2xx);
+            send_json(conn, 200, "{\"status\":\"updated\"}\n");
+        } else {
+            send_json(conn, 404, "{\"error\":\"Group not found\"}\n");
+        }
+        cookbook_jwt_claims_free(&claims);
+        free(body);
+        return 1;
+    }
+
+    if (strcmp(ri->request_method, "DELETE") == 0 && group_id[0]) {
+        /* DELETE /admin/groups/{group_id} — remove a group
+           Refuses if artifacts still reference it. */
+        cookbook_jwt_claims claims;
+        if (!require_auth_v2(srv, conn, ri, group_id, 'd', &claims)) {
+            return 1;
+        }
+
+        /* check for existing artifacts in this group */
+        cookbook_db_param cp[] = { COOKBOOK_P_TEXT(group_id) };
+        group_count_ctx cctx = { 0 };
+        srv->db->query_p(srv->db,
+            "SELECT COUNT(*) FROM artifacts WHERE group_id = ?1",
+            cp, 1, group_count_cb, &cctx);
+
+        if (cctx.count > 0) {
+            char err[256];
+            snprintf(err, sizeof(err),
+                "{\"error\":\"Cannot delete group '%s': "
+                "%d artifact(s) still reference it\"}\n",
+                group_id, cctx.count);
+            METRIC_INC(srv->metrics.responses_4xx);
+            send_json(conn, 409, err);
+            cookbook_jwt_claims_free(&claims);
+            return 1;
+        }
+
+        cookbook_db_param dp[] = { COOKBOOK_P_TEXT(group_id) };
+        int rc = srv->db->exec_p(srv->db,
+            "DELETE FROM groups WHERE group_id = ?1", dp, 1);
+        if (rc == COOKBOOK_DB_OK) {
+            METRIC_INC(srv->metrics.responses_2xx);
+            audit_log(srv, "admin", claims.sub, group_id, "group-deleted");
+            send_json(conn, 200, "{\"status\":\"deleted\"}\n");
+        } else {
+            send_json(conn, 404, "{\"error\":\"Group not found\"}\n");
+        }
+        cookbook_jwt_claims_free(&claims);
+        return 1;
+    }
+
+    METRIC_INC(srv->metrics.responses_4xx);
+    send_json(conn, 405, "{\"error\":\"Method not allowed\"}\n");
+    return 1;
+}
+
 /* ==== Credential management: /admin/credentials ==== */
 
 /* callback for listing credentials */
@@ -3475,6 +4279,7 @@ static int handle_admin_credentials(struct mg_connection *conn, void *cbdata) {
 
         if (rc == COOKBOOK_DB_OK) {
             METRIC_INC(srv->metrics.responses_2xx);
+            audit_log(srv, "admin", cred_sub, "credential-create", "ok");
             char resp[256];
             snprintf(resp, sizeof(resp),
                 "{\"status\":\"created\",\"subject\":\"%s\"}\n",
@@ -3655,6 +4460,19 @@ static int handle_admin_policies(struct mg_connection *conn, void *cbdata) {
 
 /* ==== public API ==== */
 
+/* callback for loading persisted revocations at startup */
+typedef struct { cookbook_revocation_list *rl; int loaded; } revoke_load_ctx;
+
+static int revoke_load_cb(const cookbook_db_row *row, void *user) {
+    revoke_load_ctx *ctx = (revoke_load_ctx *)user;
+    if (row->ncols < 2 || !row->values[0] || !row->values[1]) return 0;
+    const char *jti = row->values[0];
+    int64_t exp = (int64_t)strtoll(row->values[1], NULL, 10);
+    if (cookbook_revocation_add(ctx->rl, jti, exp) == 0)
+        ctx->loaded++;
+    return 0;
+}
+
 cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
     if (!opts || !opts->db || !opts->store) return NULL;
 
@@ -3677,16 +4495,53 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
         ? opts->grid_max_hops
         : COOKBOOK_GRID_MAX_HOPS_DEFAULT;
     srv->grid_peer_auth = opts->grid_peer_auth;
+    srv->object_cache_ttl_sec = opts->object_cache_ttl_sec;
 
     /* initialize token revocation list (max 4096 entries) */
     cookbook_revocation_init(&srv->revocations, 4096);
 
+    /* load persisted revocations from database */
+    {
+        revoke_load_ctx rctx = { &srv->revocations, 0 };
+        char exp_str[32];
+        snprintf(exp_str, sizeof(exp_str), "%lld", (long long)time(NULL));
+        cookbook_db_param tp[] = { COOKBOOK_P_TEXT(exp_str) };
+        srv->db->query_p(srv->db,
+            "SELECT jti, expires_at FROM revocations "
+            "WHERE expires_at > ?1",
+            tp, 1, revoke_load_cb, &rctx);
+        if (rctx.loaded > 0)
+            fprintf(stdout, "cookbook: loaded %d persisted revocations\n",
+                    rctx.loaded);
+
+        /* prune expired entries from DB */
+        srv->db->exec_p(srv->db,
+            "DELETE FROM revocations WHERE expires_at <= ?1",
+            tp, 1);
+    }
+
     /* initialize rate limiter lock */
 #ifdef _WIN32
     InitializeCriticalSection(&srv->rate_lock);
+    InitializeCriticalSection(&srv->audit_lock);
 #else
     pthread_mutex_init(&srv->rate_lock, NULL);
+    pthread_mutex_init(&srv->audit_lock, NULL);
 #endif
+
+    /* audit log */
+    if (opts->audit_log_path) {
+        srv->audit_log = fopen(opts->audit_log_path, "a");
+        if (srv->audit_log)
+            fprintf(stdout, "cookbook: audit log: %s\n", opts->audit_log_path);
+        else
+            fprintf(stderr, "cookbook: warning: cannot open audit log: %s\n",
+                    opts->audit_log_path);
+    }
+
+    if (srv->object_cache_ttl_sec > 0)
+        fprintf(stdout, "cookbook: object cache TTL: %d sec\n",
+                srv->object_cache_ttl_sec);
 
     /* registry Ed25519 key pair */
     if (opts->registry_pk && opts->registry_sk) {
@@ -3721,6 +4576,8 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
     mg_set_request_handler(srv->ctx, "/readyz", handle_readyz, srv);
     mg_set_request_handler(srv->ctx, "/.well-known/now-registry-key",
                            handle_registry_key, srv);
+    mg_set_request_handler(srv->ctx, "/.well-known/now-registry",
+                           handle_registry_discovery, srv);
     mg_set_request_handler(srv->ctx, "/auth/token", handle_auth_token, srv);
     mg_set_request_handler(srv->ctx, "/auth/revoke", handle_auth_revoke, srv);
     mg_set_request_handler(srv->ctx, "/keys", handle_keys, srv);
@@ -3740,6 +4597,14 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
         mg_set_request_handler(srv->ctx, "/admin/peers",
                                handle_admin_peers, srv);
     }
+
+    /* object cache endpoints */
+    mg_set_request_handler(srv->ctx, "/objects/",
+                           handle_objects, srv);
+
+    /* group management endpoints */
+    mg_set_request_handler(srv->ctx, "/admin/groups",
+                           handle_admin_groups, srv);
 
     /* credential management endpoints */
     mg_set_request_handler(srv->ctx, "/admin/credentials",
@@ -3816,9 +4681,13 @@ void cookbook_server_stop(cookbook_server *srv) {
 
 #ifdef _WIN32
     DeleteCriticalSection(&srv->rate_lock);
+    DeleteCriticalSection(&srv->audit_lock);
 #else
     pthread_mutex_destroy(&srv->rate_lock);
+    pthread_mutex_destroy(&srv->audit_lock);
 #endif
+
+    if (srv->audit_log) fclose(srv->audit_log);
 
     sodium_memzero(srv->registry_sk, 64);
     free(srv->registry_id);

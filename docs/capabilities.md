@@ -2,7 +2,7 @@
 
 **Version**: 0.1.0
 **Last updated**: 2026-03-19
-**Phases complete**: A–E (M1 spec), F1–F3 (feature gaps), G1–G5 (grid federation), Auth v2 (Phases 1–4), Auth v2.5 (wildcard/revocation/credentials), Native Ed25519, Basta migration
+**Phases complete**: A–E (M1 spec), F1–F3 (feature gaps), G1–G5 (grid federation), Auth v2 (Phases 1–4), Auth v2.5 (wildcard/revocation/credentials), Native Ed25519, Basta migration, Group management, Persistent revocation, Object cache
 
 ---
 
@@ -128,7 +128,7 @@ All request handlers enforce `cookbook_auth_check()` when JWT v2 grants are pres
 POST /auth/revoke         — revoke a JWT by its jti claim
 ```
 
-Accepts `{"token":"eyJ..."}` body. Verifies the JWT, extracts the `jti` claim, and adds it to an in-memory bounded revocation list (4096 entries). Expired entries are auto-pruned on insert. All subsequent requests using the revoked token are rejected at JWT verification time.
+Accepts `{"token":"eyJ..."}` body. Verifies the JWT, extracts the `jti` claim, and adds it to both an in-memory bounded revocation list (4096 entries) and the `revocations` database table. Expired entries are auto-pruned on insert and on server startup. On restart, non-expired revocations are loaded from the DB, so revoked tokens stay revoked across server restarts.
 
 ### Credential management
 
@@ -140,6 +140,18 @@ DELETE /admin/credentials — remove credential
 ```
 
 Credentials table: `subject TEXT PK`, `token_hash TEXT`, `groups TEXT`, `created_at`, `revoked_at`.
+
+### Group management
+
+```
+GET    /admin/groups              — list all groups
+GET    /admin/groups/{group_id}   — get single group
+PUT    /admin/groups              — create group (body: group_id, description)
+PATCH  /admin/groups/{group_id}   — update owner or description
+DELETE /admin/groups/{group_id}   — remove group (blocked if artifacts exist)
+```
+
+Groups are auto-created on first artifact publish (owner from JWT `sub`). Admin endpoints allow explicit creation, description, ownership transfer, and removal. URL paths use `/` for `.` separators (e.g., `/admin/groups/com/iridiumfx` → `com.iridiumfx`). Auth enforcement: `c` (create), `w` (update), `d` (delete).
 
 ### Mirror manifest
 
@@ -173,6 +185,26 @@ DELETE /admin/peers/{id}     — remove peer
 
 **Grant propagation:** `X-Cookbook-Grid-Grants` and `X-Cookbook-Grid-Exclude` headers carry scoped claims (derived from user's JWT, not the full token).
 
+### Object cache (compilation artifacts)
+
+```
+GET  /objects/{cache_key}    — retrieve cached object
+HEAD /objects/{cache_key}    — existence check
+PUT  /objects/{cache_key}    — store object (auth: 'c' on _objects)
+```
+
+Content-addressable blob cache for compiled artifacts. Cache key is typically a SHA-256 hex string with extension (`.o`, `.obj`). Uses the same object store backend as artifacts. GET/HEAD are open; PUT requires JWT authorization on the `_objects` group prefix. Respects `COOKBOOK_MAX_ARTIFACT_MB` upload limit. Cached objects are tracked in the `object_cache` table with creation timestamps for TTL-based eviction.
+
+### Audit log
+
+When `COOKBOOK_AUDIT_LOG` is set to a file path, cookbook appends structured audit events in pasta format:
+
+```
+{ timestamp: "2026-03-19T22:00:00Z", event: "publish", subject: "alice", target: "central/com/example/mylib/1.0.0/mylib.tar", result: "ok" }
+```
+
+Events: `publish`, `yank`, `resolve`, `auth` (token-issue, token-revoke), `objects` (stored), `admin` (credential-create, group-created, group-deleted). Thread-safe (mutex-protected writes with flush). One entry per line — parseable with `basta_parse_cstr()`.
+
 ### Prometheus metrics
 
 ```
@@ -180,6 +212,14 @@ GET /metrics
 ```
 
 Prometheus exposition format with counters: `cookbook_requests_total`, `cookbook_requests_by_method`, `cookbook_responses_by_status`, `cookbook_artifacts_published_total`, `cookbook_artifacts_yanked_total`, `cookbook_artifacts_resolved_total`, `cookbook_auth_tokens_issued_total`, `cookbook_auth_failures_total`, `cookbook_bytes_uploaded_total`, `cookbook_bytes_downloaded_total`.
+
+### Registry discovery
+
+```
+GET /.well-known/now-registry         — registry capabilities (pasta format)
+```
+
+Returns a pasta document with registry metadata: `registry_id`, `auth` (enabled, methods, algorithm, public_key), `grid` (enabled, max_hops), `endpoints` (list of available endpoints), `content_types`. Used by now's enterprise auth for registry capability discovery.
 
 ### Health and diagnostics
 
@@ -280,6 +320,8 @@ All configuration is via environment variables:
 | `COOKBOOK_GRID_ENABLED` | `0` | Enable grid federation (1 = on) |
 | `COOKBOOK_GRID_MAX_HOPS` | `3` | Maximum grid fan-out hop count |
 | `COOKBOOK_GRID_PEER_AUTH` | `0` | Require Ed25519 peer signatures (1 = required) |
+| `COOKBOOK_AUDIT_LOG` | *(none)* | Path to pasta-format audit log file |
+| `COOKBOOK_OBJECT_CACHE_TTL_SEC` | `0` (no eviction) | TTL for cached objects; expired entries pruned every 60s |
 
 ---
 
@@ -312,7 +354,7 @@ All configuration is via environment variables:
 
 ## Test suite
 
-512 unit tests covering:
+555 unit tests covering:
 
 - Semver parsing, range evaluation, edge cases, comparison details
 - Database operations (parameterized queries, yank/status transitions, pending lifecycle)
@@ -396,4 +438,4 @@ Reports throughput (req/s), status code distribution, and latency percentiles (p
 
 - **IANA registration**: Using `application/x-pasta` as interim media type. Will switch to `application/pasta` after IANA registration.
 - **No token refresh**: Policy changes take effect only on next token issuance. Revocation endpoint (`POST /auth/revoke`) exists for immediate invalidation.
-- **Revocation list is in-memory**: Bounded to 4096 entries, not persisted across server restarts. Suitable for operational revocation, not long-term audit.
+- **Revocation list bounded**: In-memory list capped at 4096 entries (backed by DB for persistence across restarts). Expired entries auto-pruned.

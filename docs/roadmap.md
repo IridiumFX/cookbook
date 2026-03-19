@@ -102,6 +102,43 @@ All 29 original gaps from the M1 spec are implemented and tested.
 - `FetchContent_SetPopulated` prevents alforno from re-fetching basta
 - Root cause of previous basta segfault: 50+ internal symbol collisions between pasta/basta (`lexer_init`, `parse_array`, `write_value`, etc.) — eliminated by using basta exclusively
 
+### Group management ✓
+
+- `GET /admin/groups` — list all groups, get single group (path slash→dot conversion)
+- `PUT /admin/groups` — create group with auth enforcement (`c` permission)
+- `PATCH /admin/groups/{group_id}` — update owner or description (`w` permission)
+- `DELETE /admin/groups/{group_id}` — remove group, blocked if artifacts still reference it (`d` permission)
+- Publish path updated: `owner_sub` uses JWT `claims.sub` instead of hardcoded `"anonymous"`
+
+### Persistent token revocation ✓
+
+- `revocations` table: `jti TEXT PK`, `subject TEXT`, `revoked_at TEXT`, `expires_at INTEGER`
+- `POST /auth/revoke` now writes to both in-memory list and database
+- On startup: non-expired revocations loaded from DB into memory, expired entries pruned from DB
+- Revoked tokens survive server restarts
+
+### Registry discovery ✓
+
+- `GET /.well-known/now-registry` — pasta-format capability document
+- Returns: registry_id, auth (enabled/methods/algorithm/public_key), grid, endpoints, content_types
+- Enables now's enterprise auth discovery (`now auth:login --registry URL`)
+
+### Audit log ✓
+
+- Pasta-format structured event log: `{ timestamp, event, subject, target, result }`
+- Events: publish, yank, resolve, auth (issue/revoke), objects (store), admin (credential/group)
+- Thread-safe (mutex + fflush), one entry per line
+- Enabled via `COOKBOOK_AUDIT_LOG` env var (file path)
+
+### Object cache ✓
+
+- `GET /objects/{key}` — retrieve cached compiled object
+- `HEAD /objects/{key}` — existence check
+- `PUT /objects/{key}` — store object (auth: `c` on `_objects` prefix)
+- `object_cache` DB table tracks cache_key, store_key, size_bytes, created_at
+- TTL eviction via `COOKBOOK_OBJECT_CACHE_TTL_SEC` — background thread prunes expired entries every 60s
+- Designed for now's remote compilation cache (`GET/PUT /objects/{sha256_hex}{.o|.obj}`)
+
 ### Test suite
 
-512 unit tests + stress test driver (4 concurrent phases). All passing.
+555 unit tests + stress test driver (4 concurrent phases). All passing.

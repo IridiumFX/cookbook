@@ -21,6 +21,8 @@ typedef struct {
     int             grid_enabled;         /* 1 = grid federation on */
     int             grid_max_hops;        /* 0 = default (3) */
     int             grid_peer_auth;       /* 1 = require Ed25519 peer signatures */
+    const char     *audit_log_path;       /* NULL = disabled; path to pasta audit log */
+    int             object_cache_ttl_sec; /* 0 = no eviction; seconds until cached objects expire */
 } cookbook_server_opts;
 
 /* Create and start the server. Returns NULL on failure. */

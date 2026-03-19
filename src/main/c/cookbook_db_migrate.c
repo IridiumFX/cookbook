@@ -64,6 +64,26 @@ static const char *SCHEMA_SQL =
     "  updated_at  TEXT NOT NULL DEFAULT (datetime('now'))"
     ");"
 
+    "CREATE TABLE IF NOT EXISTS revocations ("
+    "  jti         TEXT PRIMARY KEY,"
+    "  subject     TEXT,"
+    "  revoked_at  TEXT NOT NULL,"
+    "  expires_at  INTEGER NOT NULL"
+    ");"
+
+    "CREATE INDEX IF NOT EXISTS idx_revocations_expires "
+    "  ON revocations(expires_at);"
+
+    "CREATE TABLE IF NOT EXISTS object_cache ("
+    "  cache_key   TEXT PRIMARY KEY,"
+    "  store_key   TEXT NOT NULL,"
+    "  size_bytes  INTEGER,"
+    "  created_at  INTEGER NOT NULL"
+    ");"
+
+    "CREATE INDEX IF NOT EXISTS idx_object_cache_created "
+    "  ON object_cache(created_at);"
+
     "CREATE TABLE IF NOT EXISTS peers ("
     "  peer_id     TEXT PRIMARY KEY,"
     "  name        TEXT NOT NULL,"

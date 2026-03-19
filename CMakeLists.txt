@@ -9,24 +9,44 @@ set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
 include(GNUInstallDirs)
 
-# ---------- vendor: pasta (static, no tests) ----------
+# ---------- vendor: basta (static, no tests) ----------
+# Basta is a strict superset of Pasta (adds BASTA_BLOB for binary data).
+# We use basta as the single text/binary format library — cookbook code
+# includes a compat pasta.h header (src/main/h/pasta.h) that maps the
+# pasta_* API to basta_*.  Basta's CMakeLists.txt hardcodes SHARED, so
+# we build it manually as STATIC.
+
+set(BASTA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+add_library(basta STATIC
+    vendor/basta/src/main/c/basta_lexer.c
+    vendor/basta/src/main/c/basta_parser.c
+    vendor/basta/src/main/c/basta_value.c
+    vendor/basta/src/main/c/basta_writer.c
+)
+target_include_directories(basta
+    PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/vendor/basta/src/main/h>
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vendor/basta/src/main/c
+)
+target_compile_definitions(basta PUBLIC BASTA_STATIC)
+target_compile_definitions(basta PRIVATE BASTA_BUILDING)
+
+# ---------- vendor: alforno (static, no tests, uses basta via ALF_USE_BASTA) ----------
+# ALF_USE_BASTA tells alforno to use basta instead of pasta.  The basta
+# target already exists (defined above as STATIC), so mark it as populated
+# for FetchContent so alforno doesn't try to add_subdirectory it again.
+
+include(FetchContent)
+FetchContent_SetPopulated(basta
+    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/basta"
+    BINARY_DIR "${CMAKE_BINARY_DIR}/_deps/basta-build"
+)
 
 set(BUILD_SHARED_LIBS_SAVED ${BUILD_SHARED_LIBS})
 set(BUILD_SHARED_LIBS OFF)
-set(PASTA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-add_subdirectory(vendor/pasta)
-set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_SAVED})
-target_compile_definitions(pasta PUBLIC PASTA_STATIC)
-
-# ---------- vendor: alforno (static, no tests, uses our pasta) ----------
-
-set(BUILD_SHARED_LIBS_SAVED2 ${BUILD_SHARED_LIBS})
-set(BUILD_SHARED_LIBS OFF)
+set(ALF_USE_BASTA ON CACHE BOOL "" FORCE)
 set(ALF_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(FETCHCONTENT_FULLY_DISCONNECTED ON CACHE BOOL "" FORCE)
 add_subdirectory(vendor/alforno)
-set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_SAVED2})
-unset(FETCHCONTENT_FULLY_DISCONNECTED CACHE)
+set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_SAVED})
 target_compile_definitions(alforno PUBLIC ALF_STATIC)
 
 # ---------- vendor: sqlite ----------
@@ -127,16 +147,17 @@ target_include_directories(cookbook
 
 target_compile_definitions(cookbook PUBLIC COOKBOOK_STATIC)
 target_compile_definitions(cookbook PRIVATE BUILDING_COOKBOOK)
-target_link_libraries(cookbook PUBLIC sqlite3 civetweb pasta alforno sodium)
+target_link_libraries(cookbook PUBLIC sqlite3 civetweb basta alforno sodium)
+
 
 if(COOKBOOK_HAS_POSTGRES)
     target_compile_definitions(cookbook PRIVATE COOKBOOK_HAS_POSTGRES)
     target_link_libraries(cookbook PRIVATE PostgreSQL::PostgreSQL)
 endif()
 
-# S3 store needs ws2_32 on Windows for sockets
+# S3 store needs ws2_32 on Windows for sockets; Ed25519 CSPRNG needs bcrypt
 if(WIN32)
-    target_link_libraries(cookbook PRIVATE ws2_32)
+    target_link_libraries(cookbook PRIVATE ws2_32 bcrypt)
 endif()
 
 # ---------- server executable ----------
@@ -161,6 +182,7 @@ list(FILTER COOKBOOK_TEST_SOURCES EXCLUDE REGEX ".*cookbook_stress\\.c$")
 
 add_executable(cookbook_test ${COOKBOOK_TEST_SOURCES})
 target_link_libraries(cookbook_test PRIVATE cookbook)
+target_compile_definitions(cookbook_test PRIVATE COOKBOOK_HAS_BASTA)
 if(WIN32)
     target_link_options(cookbook_test PRIVATE -Wl,--stack,8388608)
 endif()

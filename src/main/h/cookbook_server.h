@@ -20,6 +20,7 @@ typedef struct {
     const unsigned char *registry_sk;     /* 64-byte Ed25519 secret key */
     int             grid_enabled;         /* 1 = grid federation on */
     int             grid_max_hops;        /* 0 = default (3) */
+    int             grid_peer_auth;       /* 1 = require Ed25519 peer signatures */
 } cookbook_server_opts;
 
 /* Create and start the server. Returns NULL on failure. */
@@ -38,8 +39,9 @@ COOKBOOK_API void cookbook_server_stop(cookbook_server *srv);
    Returns 0 if valid, or the 1-based offset of the first bad byte. */
 COOKBOOK_API size_t cookbook_validate_ascii(const char *data, size_t len);
 
-/* Serialize a PastaValue tree to JSON. Returns malloc'd string, NULL on error. */
-struct PastaValue;
-COOKBOOK_API char *cookbook_pasta_to_json(const struct PastaValue *v);
+/* Serialize a PastaValue tree to JSON. Returns malloc'd string, NULL on error.
+   PastaValue is a typedef for BastaValue (basta is a superset of pasta). */
+struct BastaValue;
+COOKBOOK_API char *cookbook_pasta_to_json(const struct BastaValue *v);
 
 #endif /* COOKBOOK_SERVER_H */

@@ -15,6 +15,7 @@ COOKBOOK_API size_t cookbook_base64url_decode(const char *src, size_t src_len,
 typedef struct {
     char sub[128];          /* subject (user/service ID) */
     char groups[1024];      /* comma-separated group list (v1 compat) */
+    char jti[64];           /* JWT ID (unique token identifier for revocation) */
     char *grants_json;      /* malloc'd: resolved grants JSON (v2), NULL if v1 */
     char *exclude_json;     /* malloc'd: resolved exclude JSON (v2), NULL if v1 */
     int64_t exp;            /* expiration (unix timestamp) */
@@ -22,6 +23,34 @@ typedef struct {
     int version;            /* JWT version: 1 (legacy) or 2 (policy-based) */
     int valid;              /* 1 if signature and expiry are valid */
 } cookbook_jwt_claims;
+
+/* ==== Token revocation ==== */
+
+/* Bounded revocation list. Entries auto-expire when the JWT expires. */
+typedef struct {
+    char   jti[64];
+    int64_t exp;   /* when this revocation entry expires */
+} cookbook_revocation_entry;
+
+typedef struct {
+    cookbook_revocation_entry *entries;
+    int count;
+    int capacity;
+} cookbook_revocation_list;
+
+/* Initialize a revocation list with given capacity. */
+COOKBOOK_API void cookbook_revocation_init(cookbook_revocation_list *rl, int capacity);
+
+/* Free the revocation list. */
+COOKBOOK_API void cookbook_revocation_free(cookbook_revocation_list *rl);
+
+/* Add a jti to the revocation list. Expired entries are pruned on insert. */
+COOKBOOK_API int cookbook_revocation_add(cookbook_revocation_list *rl,
+                                        const char *jti, int64_t exp);
+
+/* Check if a jti is revoked. Returns 1 if revoked, 0 if not. */
+COOKBOOK_API int cookbook_revocation_check(const cookbook_revocation_list *rl,
+                                           const char *jti);
 
 /* Free malloc'd fields in claims (grants_json, exclude_json). */
 COOKBOOK_API void cookbook_jwt_claims_free(cookbook_jwt_claims *claims);

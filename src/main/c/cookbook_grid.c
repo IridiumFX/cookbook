@@ -3,9 +3,12 @@
    artifacts from any peer via redirect (307) or proxy. */
 
 #include "cookbook_grid.h"
+#include "cookbook_ed25519.h"
+#include "cookbook_auth.h"  /* for cookbook_base64url_encode */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
   #include <winsock2.h>
@@ -52,6 +55,18 @@ static int peer_load_cb(const cookbook_db_row *row, void *user) {
     p->mode    = (row->values[3] && row->values[3][0] == 'p') ? 'p' : 'r';
     p->priority = row->values[4] ? atoi(row->values[4]) : 100;
     p->enabled  = 1;
+    p->has_public_key = 0;
+    memset(p->public_key, 0, 32);
+    if (row->ncols > 5 && row->values[5] && strlen(row->values[5]) == 64) {
+        const char *hex = row->values[5];
+        int valid = 1;
+        for (int i = 0; i < 32 && valid; i++) {
+            unsigned int byte;
+            if (sscanf(hex + i * 2, "%2x", &byte) != 1) valid = 0;
+            else p->public_key[i] = (unsigned char)byte;
+        }
+        if (valid) p->has_public_key = 1;
+    }
     ctx->count++;
     return 0;
 }
@@ -59,7 +74,7 @@ static int peer_load_cb(const cookbook_db_row *row, void *user) {
 int cookbook_grid_load_peers(cookbook_db *db, cookbook_peer **out) {
     peer_load_ctx ctx = { NULL, 0, 0 };
     db->query(db,
-        "SELECT peer_id, name, url, mode, priority "
+        "SELECT peer_id, name, url, mode, priority, public_key "
         "FROM peers WHERE enabled = 1 ORDER BY priority ASC",
         peer_load_cb, &ctx);
     *out = ctx.peers;
@@ -236,13 +251,14 @@ static char *grid_recv_response(sock_t fd, size_t *out_len, int *status) {
 
 /* ---- Grid HTTP client ---- */
 
-static int grid_request(const cookbook_peer *peer,
-                         const char *method,
-                         const char *path,
-                         const char *origin_id,
-                         const char *via_chain,
-                         int hop_count,
-                         cookbook_grid_response *response) {
+static int grid_request_ex(const cookbook_peer *peer,
+                            const char *method,
+                            const char *path,
+                            const char *origin_id,
+                            const char *via_chain,
+                            int hop_count,
+                            const char *extra_headers,
+                            cookbook_grid_response *response) {
     char *host = NULL, *port = NULL;
     const char *prefix = NULL;
 
@@ -270,18 +286,20 @@ static int grid_request(const cookbook_peer *peer,
         snprintf(via, sizeof(via), "%s", origin_id);
 
     /* build request */
-    char request[4096];
+    char request[8192];
     int rlen = snprintf(request, sizeof(request),
         "%s %s%s HTTP/1.1\r\n"
         "Host: %s:%s\r\n"
         "X-Cookbook-Via: %s\r\n"
         "X-Cookbook-Hop-Count: %d\r\n"
+        "%s"
         "Connection: close\r\n"
         "\r\n",
         method, prefix, path,
         host, port,
         via,
-        hop_count + 1);
+        hop_count + 1,
+        extra_headers ? extra_headers : "");
 
     int rc = grid_send_all(fd, request, (size_t)rlen);
     if (rc != 0) {
@@ -308,8 +326,19 @@ int cookbook_grid_get(const cookbook_peer *peer,
                       const char *via_chain,
                       int hop_count,
                       cookbook_grid_response *response) {
-    return grid_request(peer, "GET", path, origin_id, via_chain,
-                        hop_count, response);
+    return grid_request_ex(peer, "GET", path, origin_id, via_chain,
+                           hop_count, NULL, response);
+}
+
+int cookbook_grid_get_ex(const cookbook_peer *peer,
+                          const char *path,
+                          const char *origin_id,
+                          const char *via_chain,
+                          int hop_count,
+                          const char *extra_headers,
+                          cookbook_grid_response *response) {
+    return grid_request_ex(peer, "GET", path, origin_id, via_chain,
+                           hop_count, extra_headers, response);
 }
 
 int cookbook_grid_head(const cookbook_peer *peer,
@@ -318,8 +347,217 @@ int cookbook_grid_head(const cookbook_peer *peer,
                        const char *via_chain,
                        int hop_count,
                        cookbook_grid_response *response) {
-    return grid_request(peer, "HEAD", path, origin_id, via_chain,
-                        hop_count, response);
+    return grid_request_ex(peer, "HEAD", path, origin_id, via_chain,
+                           hop_count, NULL, response);
+}
+
+int cookbook_grid_head_ex(const cookbook_peer *peer,
+                           const char *path,
+                           const char *origin_id,
+                           const char *via_chain,
+                           int hop_count,
+                           const char *extra_headers,
+                           cookbook_grid_response *response) {
+    return grid_request_ex(peer, "HEAD", path, origin_id, via_chain,
+                           hop_count, extra_headers, response);
+}
+
+/* ---- Peer key lookup ---- */
+
+typedef struct { unsigned char pk[32]; int found; } peer_key_ctx;
+
+static int peer_key_cb(const cookbook_db_row *row, void *user) {
+    peer_key_ctx *ctx = (peer_key_ctx *)user;
+    if (!row->values[0] || strlen(row->values[0]) != 64) return 0;
+    const char *hex = row->values[0];
+    for (int i = 0; i < 32; i++) {
+        unsigned int byte;
+        if (sscanf(hex + i * 2, "%2x", &byte) != 1) return 0;
+        ctx->pk[i] = (unsigned char)byte;
+    }
+    ctx->found = 1;
+    return 0;
+}
+
+int cookbook_grid_load_peer_key(cookbook_db *db, const char *peer_id,
+                                unsigned char pk_out[32]) {
+    if (!db || !peer_id) return -1;
+    peer_key_ctx ctx = { {0}, 0 };
+    char sql[256];
+    snprintf(sql, sizeof(sql),
+        "SELECT public_key FROM peers "
+        "WHERE peer_id = '%s' AND enabled = 1 AND public_key IS NOT NULL",
+        peer_id);
+    db->query(db, sql, peer_key_cb, &ctx);
+    if (!ctx.found) return -1;
+    memcpy(pk_out, ctx.pk, 32);
+    return 0;
+}
+
+/* ---- Canonical signing input ---- */
+
+char *cookbook_grid_build_canonical(const char *method, const char *path,
+                                     const char *via, int hop_count,
+                                     const char *grants, const char *exclude,
+                                     int64_t timestamp, size_t *out_len) {
+    size_t cap = 4096;
+    char *buf = (char *)malloc(cap);
+    if (!buf) { *out_len = 0; return NULL; }
+
+    int n = snprintf(buf, cap,
+        "%s\n%s\n%s\n%d\n%s\n%s\n%lld\n",
+        method ? method : "",
+        path ? path : "",
+        via ? via : "",
+        hop_count,
+        grants ? grants : "",
+        exclude ? exclude : "",
+        (long long)timestamp);
+
+    if (n < 0 || (size_t)n >= cap) {
+        cap = (size_t)n + 64;
+        char *tmp = (char *)realloc(buf, cap);
+        if (!tmp) { free(buf); *out_len = 0; return NULL; }
+        buf = tmp;
+        n = snprintf(buf, cap,
+            "%s\n%s\n%s\n%d\n%s\n%s\n%lld\n",
+            method ? method : "",
+            path ? path : "",
+            via ? via : "",
+            hop_count,
+            grants ? grants : "",
+            exclude ? exclude : "",
+            (long long)timestamp);
+    }
+    *out_len = (size_t)n;
+    return buf;
+}
+
+/* ---- Extract header value from raw extra_headers string ---- */
+
+static const char *extract_header_value(const char *headers, const char *name,
+                                          char *out, size_t out_sz) {
+    if (!headers || !name) { out[0] = '\0'; return out; }
+    size_t nlen = strlen(name);
+    const char *p = headers;
+    while (*p) {
+        if (strncmp(p, name, nlen) == 0 && p[nlen] == ':') {
+            p += nlen + 1;
+            while (*p == ' ') p++;
+            const char *end = strstr(p, "\r\n");
+            if (!end) end = p + strlen(p);
+            size_t vlen = (size_t)(end - p);
+            if (vlen >= out_sz) vlen = out_sz - 1;
+            memcpy(out, p, vlen);
+            out[vlen] = '\0';
+            return out;
+        }
+        const char *nl = strstr(p, "\r\n");
+        if (!nl) break;
+        p = nl + 2;
+    }
+    out[0] = '\0';
+    return out;
+}
+
+/* ---- Signed grid requests ---- */
+
+static int grid_request_signed(const cookbook_peer *peer,
+                                 const char *method,
+                                 const char *path,
+                                 const char *origin_id,
+                                 const char *via_chain,
+                                 int hop_count,
+                                 const char *extra_headers,
+                                 const cookbook_grid_sign_ctx *sign_ctx,
+                                 cookbook_grid_response *response) {
+    /* Build the full extra_headers with signature if signing is available */
+    char *signed_headers = NULL;
+
+    if (sign_ctx && sign_ctx->has_key && sign_ctx->registry_sk) {
+        /* Build via chain as it will be sent */
+        char via[1024] = {0};
+        if (via_chain && via_chain[0])
+            snprintf(via, sizeof(via), "%s,%s", via_chain, origin_id);
+        else
+            snprintf(via, sizeof(via), "%s", origin_id);
+
+        /* Extract grants/exclude from extra_headers */
+        char grants[2048] = {0}, exclude_val[2048] = {0};
+        extract_header_value(extra_headers, "X-Cookbook-Grid-Grants",
+                              grants, sizeof(grants));
+        extract_header_value(extra_headers, "X-Cookbook-Grid-Exclude",
+                              exclude_val, sizeof(exclude_val));
+
+        int64_t timestamp = (int64_t)time(NULL);
+
+        /* Build canonical and sign */
+        size_t canon_len = 0;
+        char *canonical = cookbook_grid_build_canonical(
+            method, path, via, hop_count + 1,
+            grants, exclude_val, timestamp, &canon_len);
+
+        if (canonical) {
+            unsigned char sig[64];
+            if (cookbook_ed25519_sign(sig, canonical, canon_len,
+                                      sign_ctx->registry_sk) == 0) {
+                /* base64url encode signature */
+                char sig_b64[128];
+                size_t sig_b64_len = cookbook_base64url_encode(
+                    sig, 64, sig_b64, sizeof(sig_b64));
+
+                /* Build combined extra headers */
+                size_t eh_len = (extra_headers ? strlen(extra_headers) : 0);
+                size_t cap = eh_len + 512;
+                signed_headers = (char *)malloc(cap);
+                if (signed_headers) {
+                    int off = 0;
+                    if (extra_headers)
+                        off += snprintf(signed_headers + off, cap - (size_t)off,
+                                         "%s", extra_headers);
+                    off += snprintf(signed_headers + off, cap - (size_t)off,
+                        "X-Cookbook-Grid-Origin: %s\r\n"
+                        "X-Cookbook-Grid-Signature: %.*s\r\n"
+                        "X-Cookbook-Timestamp: %lld\r\n",
+                        sign_ctx->registry_id,
+                        (int)sig_b64_len, sig_b64,
+                        (long long)timestamp);
+                }
+            }
+            free(canonical);
+        }
+    }
+
+    int rc = grid_request_ex(peer, method, path, origin_id, via_chain,
+                              hop_count,
+                              signed_headers ? signed_headers : extra_headers,
+                              response);
+    free(signed_headers);
+    return rc;
+}
+
+int cookbook_grid_get_signed(const cookbook_peer *peer,
+                              const char *path,
+                              const char *origin_id,
+                              const char *via_chain,
+                              int hop_count,
+                              const char *extra_headers,
+                              const cookbook_grid_sign_ctx *sign_ctx,
+                              cookbook_grid_response *response) {
+    return grid_request_signed(peer, "GET", path, origin_id, via_chain,
+                                hop_count, extra_headers, sign_ctx, response);
+}
+
+int cookbook_grid_head_signed(const cookbook_peer *peer,
+                               const char *path,
+                               const char *origin_id,
+                               const char *via_chain,
+                               int hop_count,
+                               const char *extra_headers,
+                               const cookbook_grid_sign_ctx *sign_ctx,
+                               cookbook_grid_response *response) {
+    return grid_request_signed(peer, "HEAD", path, origin_id, via_chain,
+                                hop_count, extra_headers, sign_ctx, response);
 }
 
 /* ---- Loop detection ---- */

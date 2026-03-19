@@ -9,9 +9,14 @@
 #include "cookbook_auth.h"
 #include "cookbook_grid.h"
 #include "cookbook_policy.h"
+#include "cookbook_ed25519.h"
 #include "alforno.h"
 #include "pasta.h"
+#ifdef COOKBOOK_HAS_BASTA
+#include "basta.h"
+#endif
 #include <sodium.h>
+#include <time.h>
 
 static int tests_run    = 0;
 static int tests_failed = 0;
@@ -2030,6 +2035,991 @@ static void test_jwt_v1_v2_compat(void) {
     free(token);
 }
 
+/* ---- auth v2 phase 3: enforcement tests ---- */
+
+static void test_enforcement_v1_reads_open(void) {
+    /* v1 tokens: reads are open (no per-group check), writes need has_group */
+    unsigned char pk[32], sk[64];
+    cookbook_keygen(pk, sk);
+
+    char *token = cookbook_jwt_create("alice", "org.acme", 3600, sk);
+    ASSERT(token != NULL, "v1 token create");
+
+    cookbook_jwt_claims c;
+    cookbook_jwt_verify(token, pk, &c);
+    ASSERT(c.version == 1, "enforcement: v1 version");
+
+    /* v1 has no grants_json — auth_check should deny (used for v2 path) */
+    ASSERT(cookbook_auth_check(c.grants_json, c.exclude_json,
+                               "org.acme", 'r') == 0,
+           "auth_check with NULL grants denies (v1 would bypass this)");
+
+    /* v1 group check: has_group is exact match (not hierarchical) */
+    ASSERT(cookbook_jwt_has_group(&c, "org.acme") == 1,
+           "v1 has_group matches exact");
+    ASSERT(cookbook_jwt_has_group(&c, "org.acme.sdk") == 0,
+           "v1 has_group rejects child (exact only)");
+    ASSERT(cookbook_jwt_has_group(&c, "net.other") == 0,
+           "v1 has_group rejects unrelated");
+
+    cookbook_jwt_claims_free(&c);
+    free(token);
+}
+
+static void test_enforcement_v2_all_ops(void) {
+    /* v2 tokens: all 4 ops checked via cookbook_auth_check */
+    unsigned char pk[32], sk[64];
+    cookbook_keygen(pk, sk);
+
+    const char *resolved = "{\"grants\":{\"com.iridiumfx\":\"crwd\","
+                           "\"org.readonly\":\"r\","
+                           "\"org.readwrite\":\"rw\"},"
+                           "\"exclude\":{\"com.iridiumfx.internal\":true}}";
+
+    char *token = cookbook_jwt_create_v2("bob", "com.iridiumfx",
+                                          resolved, 3600, sk);
+    cookbook_jwt_claims c;
+    cookbook_jwt_verify(token, pk, &c);
+    ASSERT(c.version == 2, "enforcement: v2 version");
+
+    /* full CRWD on com.iridiumfx */
+    ASSERT(cookbook_auth_check(c.grants_json, c.exclude_json,
+                               "com.iridiumfx.pasta", 'c') == 1,
+           "v2 create on granted group");
+    ASSERT(cookbook_auth_check(c.grants_json, c.exclude_json,
+                               "com.iridiumfx.pasta", 'r') == 1,
+           "v2 read on granted group");
+    ASSERT(cookbook_auth_check(c.grants_json, c.exclude_json,
+                               "com.iridiumfx.pasta", 'w') == 1,
+           "v2 write on granted group");
+    ASSERT(cookbook_auth_check(c.grants_json, c.exclude_json,
+                               "com.iridiumfx.pasta", 'd') == 1,
+           "v2 delete on granted group");
+
+    /* read-only group */
+    ASSERT(cookbook_auth_check(c.grants_json, c.exclude_json,
+                               "org.readonly.lib", 'r') == 1,
+           "v2 read on readonly group");
+    ASSERT(cookbook_auth_check(c.grants_json, c.exclude_json,
+                               "org.readonly.lib", 'c') == 0,
+           "v2 create denied on readonly group");
+    ASSERT(cookbook_auth_check(c.grants_json, c.exclude_json,
+                               "org.readonly.lib", 'w') == 0,
+           "v2 write denied on readonly group");
+    ASSERT(cookbook_auth_check(c.grants_json, c.exclude_json,
+                               "org.readonly.lib", 'd') == 0,
+           "v2 delete denied on readonly group");
+
+    /* read-write group: no create/delete */
+    ASSERT(cookbook_auth_check(c.grants_json, c.exclude_json,
+                               "org.readwrite.tool", 'r') == 1,
+           "v2 read on rw group");
+    ASSERT(cookbook_auth_check(c.grants_json, c.exclude_json,
+                               "org.readwrite.tool", 'w') == 1,
+           "v2 write on rw group");
+    ASSERT(cookbook_auth_check(c.grants_json, c.exclude_json,
+                               "org.readwrite.tool", 'c') == 0,
+           "v2 create denied on rw group");
+    ASSERT(cookbook_auth_check(c.grants_json, c.exclude_json,
+                               "org.readwrite.tool", 'd') == 0,
+           "v2 delete denied on rw group");
+
+    /* excluded group: denied despite parent grant */
+    ASSERT(cookbook_auth_check(c.grants_json, c.exclude_json,
+                               "com.iridiumfx.internal", 'r') == 0,
+           "v2 excluded group denied read");
+    ASSERT(cookbook_auth_check(c.grants_json, c.exclude_json,
+                               "com.iridiumfx.internal.keys", 'r') == 0,
+           "v2 excluded child denied read");
+
+    /* ungranted group */
+    ASSERT(cookbook_auth_check(c.grants_json, c.exclude_json,
+                               "net.unknown", 'r') == 0,
+           "v2 ungranted group denied");
+
+    cookbook_jwt_claims_free(&c);
+    free(token);
+}
+
+static void test_enforcement_mirror_visibility(void) {
+    /* simulate mirror manifest filtering: iterate groups, check visibility */
+    const char *grants = "{\"com.iridiumfx\":\"crwd\",\"org.acme\":\"r\"}";
+    const char *exclude = "{\"com.iridiumfx.secret\":true}";
+
+    const char *groups[] = {
+        "com.iridiumfx.pasta",   /* visible: granted */
+        "com.iridiumfx.basta",   /* visible: granted */
+        "com.iridiumfx.secret",  /* hidden: excluded */
+        "org.acme.sdk",          /* visible: read granted */
+        "net.private.tools",     /* hidden: no grant */
+    };
+    int expected[] = { 1, 1, 0, 1, 0 };
+
+    int visible_count = 0;
+    for (int i = 0; i < 5; i++) {
+        int allowed = cookbook_auth_check(grants, exclude, groups[i], 'r');
+        ASSERT(allowed == expected[i], "mirror visibility filter");
+        if (allowed) visible_count++;
+    }
+    ASSERT(visible_count == 3, "mirror: 3 of 5 groups visible");
+}
+
+static void test_enforcement_policy_to_enforcement(void) {
+    /* end-to-end: two users with different policies see different things */
+    cookbook_db *db = cookbook_db_open_sqlite(NULL);
+    cookbook_db_migrate(db);
+
+    /* admin: full access to com.iridiumfx */
+    cookbook_policy_put(db, "admin", "user",
+        "@identity {\n  subject: \"admin\",\n  kind: \"user\"\n}\n"
+        "@grants {\n  com.iridiumfx: \"crwd\"\n}\n");
+
+    /* viewer: read-only access to com.iridiumfx */
+    cookbook_policy_put(db, "viewer", "user",
+        "@identity {\n  subject: \"viewer\",\n  kind: \"user\"\n}\n"
+        "@grants {\n  com.iridiumfx: \"r\"\n}\n");
+
+    unsigned char pk[32], sk[64];
+    cookbook_keygen(pk, sk);
+
+    /* resolve and create tokens */
+    char *admin_resolved = cookbook_policy_resolve(db, "admin");
+    char *viewer_resolved = cookbook_policy_resolve(db, "viewer");
+    ASSERT(admin_resolved != NULL, "admin policy resolves");
+    ASSERT(viewer_resolved != NULL, "viewer policy resolves");
+
+    char *admin_tok = cookbook_jwt_create_v2("admin", NULL, admin_resolved, 3600, sk);
+    char *viewer_tok = cookbook_jwt_create_v2("viewer", NULL, viewer_resolved, 3600, sk);
+    free(admin_resolved);
+    free(viewer_resolved);
+
+    cookbook_jwt_claims ac, vc;
+    cookbook_jwt_verify(admin_tok, pk, &ac);
+    cookbook_jwt_verify(viewer_tok, pk, &vc);
+
+    /* admin can PUT (create) */
+    ASSERT(cookbook_auth_check(ac.grants_json, ac.exclude_json,
+                               "com.iridiumfx.pasta", 'c') == 1,
+           "admin can create artifact");
+    /* viewer cannot PUT */
+    ASSERT(cookbook_auth_check(vc.grants_json, vc.exclude_json,
+                               "com.iridiumfx.pasta", 'c') == 0,
+           "viewer cannot create artifact");
+    /* both can GET */
+    ASSERT(cookbook_auth_check(ac.grants_json, ac.exclude_json,
+                               "com.iridiumfx.pasta", 'r') == 1,
+           "admin can read artifact");
+    ASSERT(cookbook_auth_check(vc.grants_json, vc.exclude_json,
+                               "com.iridiumfx.pasta", 'r') == 1,
+           "viewer can read artifact");
+    /* admin can yank (write), viewer cannot */
+    ASSERT(cookbook_auth_check(ac.grants_json, ac.exclude_json,
+                               "com.iridiumfx.pasta", 'w') == 1,
+           "admin can yank artifact");
+    ASSERT(cookbook_auth_check(vc.grants_json, vc.exclude_json,
+                               "com.iridiumfx.pasta", 'w') == 0,
+           "viewer cannot yank artifact");
+
+    cookbook_jwt_claims_free(&ac);
+    cookbook_jwt_claims_free(&vc);
+    free(admin_tok);
+    free(viewer_tok);
+    db->close(db);
+}
+
+static void test_enforcement_grid_grant_roundtrip(void) {
+    /* test that grants JSON → header format → JSON produces valid auth_check input */
+    /* simulate the header format: "com.iridiumfx:crwd,org.acme:r" */
+    /* and parse it back to JSON manually (same logic as parse_grid_grants_header) */
+
+    /* original grants */
+    const char *orig_grants = "{\"com.iridiumfx\":\"crwd\",\"org.acme\":\"r\"}";
+    const char *orig_exclude = "{\"com.iridiumfx.secret\":true}";
+
+    /* simulate header format (what build_grid_grant_headers produces) */
+    const char *hdr_grants = "com.iridiumfx:crwd,org.acme:r";
+    const char *hdr_exclude = "com.iridiumfx.secret";
+
+    /* parse grants header format back to JSON */
+    size_t cap = strlen(hdr_grants) * 3 + 16;
+    char *parsed_grants = (char *)malloc(cap);
+    size_t pos = 0;
+    parsed_grants[pos++] = '{';
+
+    char buf[2048];
+    snprintf(buf, sizeof(buf), "%s", hdr_grants);
+    char *saveptr = NULL;
+    char *tok = strtok_r(buf, ",", &saveptr);
+    int first = 1;
+    while (tok) {
+        while (*tok == ' ') tok++;
+        char *colon = strchr(tok, ':');
+        if (colon) {
+            *colon = '\0';
+            if (!first) parsed_grants[pos++] = ',';
+            pos += (size_t)snprintf(parsed_grants + pos, cap - pos,
+                "\"%s\":\"%s\"", tok, colon + 1);
+            first = 0;
+        }
+        tok = strtok_r(NULL, ",", &saveptr);
+    }
+    parsed_grants[pos++] = '}';
+    parsed_grants[pos] = '\0';
+
+    /* parse exclude header format back to JSON */
+    cap = strlen(hdr_exclude) * 3 + 16;
+    char *parsed_exclude = (char *)malloc(cap);
+    pos = 0;
+    parsed_exclude[pos++] = '{';
+    snprintf(buf, sizeof(buf), "%s", hdr_exclude);
+    tok = strtok_r(buf, ",", &saveptr);
+    first = 1;
+    while (tok) {
+        while (*tok == ' ') tok++;
+        if (!first) parsed_exclude[pos++] = ',';
+        pos += (size_t)snprintf(parsed_exclude + pos, cap - pos,
+            "\"%s\":true", tok);
+        first = 0;
+        tok = strtok_r(NULL, ",", &saveptr);
+    }
+    parsed_exclude[pos++] = '}';
+    parsed_exclude[pos] = '\0';
+
+    /* roundtripped grants should produce same auth_check results */
+    ASSERT(cookbook_auth_check(parsed_grants, parsed_exclude,
+                               "com.iridiumfx.pasta", 'r') == 1,
+           "grid roundtrip: read allowed");
+    ASSERT(cookbook_auth_check(parsed_grants, parsed_exclude,
+                               "com.iridiumfx.pasta", 'c') == 1,
+           "grid roundtrip: create allowed");
+    ASSERT(cookbook_auth_check(parsed_grants, parsed_exclude,
+                               "com.iridiumfx.secret", 'r') == 0,
+           "grid roundtrip: excluded denied");
+    ASSERT(cookbook_auth_check(parsed_grants, parsed_exclude,
+                               "org.acme.sdk", 'r') == 1,
+           "grid roundtrip: readonly read allowed");
+    ASSERT(cookbook_auth_check(parsed_grants, parsed_exclude,
+                               "org.acme.sdk", 'w') == 0,
+           "grid roundtrip: readonly write denied");
+    ASSERT(cookbook_auth_check(parsed_grants, parsed_exclude,
+                               "net.unknown", 'r') == 0,
+           "grid roundtrip: ungranted denied");
+
+    /* compare with original grants */
+    ASSERT(cookbook_auth_check(orig_grants, orig_exclude,
+                               "com.iridiumfx.pasta", 'r') ==
+           cookbook_auth_check(parsed_grants, parsed_exclude,
+                               "com.iridiumfx.pasta", 'r'),
+           "grid roundtrip matches original: read");
+    ASSERT(cookbook_auth_check(orig_grants, orig_exclude,
+                               "com.iridiumfx.secret", 'r') ==
+           cookbook_auth_check(parsed_grants, parsed_exclude,
+                               "com.iridiumfx.secret", 'r'),
+           "grid roundtrip matches original: excluded");
+
+    free(parsed_grants);
+    free(parsed_exclude);
+}
+
+/* ---- Phase 4: grid peer auth tests ---- */
+
+static void test_grid_peer_key_crud(void) {
+    cookbook_db *db = cookbook_db_open_sqlite(NULL);
+    cookbook_db_migrate(db);
+
+    /* insert peer with public_key */
+    db->exec(db,
+        "INSERT INTO peers (peer_id, name, url, mode, priority, enabled, public_key) "
+        "VALUES ('node-a', 'Node A', 'http://node-a:8080', 'redirect', 100, 1, "
+        "'d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a')");
+
+    unsigned char pk[32];
+    int rc = cookbook_grid_load_peer_key(db, "node-a", pk);
+    ASSERT(rc == 0, "peer key: load existing key");
+    ASSERT(pk[0] == 0xd7 && pk[1] == 0x5a, "peer key: first bytes match");
+    ASSERT(pk[31] == 0x1a, "peer key: last byte matches");
+
+    /* peer with NULL key */
+    db->exec(db,
+        "INSERT INTO peers (peer_id, name, url, mode, priority, enabled) "
+        "VALUES ('node-b', 'Node B', 'http://node-b:8080', 'redirect', 100, 1)");
+    rc = cookbook_grid_load_peer_key(db, "node-b", pk);
+    ASSERT(rc == -1, "peer key: NULL key returns -1");
+
+    /* unknown peer */
+    rc = cookbook_grid_load_peer_key(db, "node-z", pk);
+    ASSERT(rc == -1, "peer key: unknown peer returns -1");
+
+    /* disabled peer */
+    db->exec(db,
+        "INSERT INTO peers (peer_id, name, url, mode, priority, enabled, public_key) "
+        "VALUES ('node-c', 'Node C', 'http://node-c:8080', 'redirect', 100, 0, "
+        "'d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a')");
+    rc = cookbook_grid_load_peer_key(db, "node-c", pk);
+    ASSERT(rc == -1, "peer key: disabled peer returns -1");
+
+    db->close(db);
+}
+
+static void test_grid_peer_load_with_key(void) {
+    cookbook_db *db = cookbook_db_open_sqlite(NULL);
+    cookbook_db_migrate(db);
+
+    /* peer with key */
+    db->exec(db,
+        "INSERT INTO peers (peer_id, name, url, mode, priority, enabled, public_key) "
+        "VALUES ('keyed', 'Keyed', 'http://keyed:8080', 'redirect', 50, 1, "
+        "'d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a')");
+
+    /* peer without key */
+    db->exec(db,
+        "INSERT INTO peers (peer_id, name, url, mode, priority, enabled) "
+        "VALUES ('nokey', 'NoKey', 'http://nokey:8080', 'proxy', 100, 1)");
+
+    cookbook_peer *peers = NULL;
+    int n = cookbook_grid_load_peers(db, &peers);
+    ASSERT(n == 2, "peer load key: 2 peers");
+    /* keyed first (priority 50) */
+    ASSERT(peers[0].has_public_key == 1, "peer load key: keyed has key");
+    ASSERT(peers[0].public_key[0] == 0xd7, "peer load key: keyed pk byte 0");
+    ASSERT(peers[1].has_public_key == 0, "peer load key: nokey has no key");
+
+    cookbook_grid_free_peers(peers, n);
+    db->close(db);
+}
+
+static void test_grid_canonical_string(void) {
+    size_t len1, len2;
+    char *c1 = cookbook_grid_build_canonical("GET", "/grid/resolve/org/acme/lib/*",
+        "central", 1, "org.acme:r", "", 1710800000, &len1);
+    ASSERT(c1 != NULL, "canonical: not null");
+    ASSERT(len1 > 0, "canonical: length > 0");
+
+    /* same inputs produce same output */
+    char *c2 = cookbook_grid_build_canonical("GET", "/grid/resolve/org/acme/lib/*",
+        "central", 1, "org.acme:r", "", 1710800000, &len2);
+    ASSERT(len1 == len2, "canonical: deterministic length");
+    ASSERT(memcmp(c1, c2, len1) == 0, "canonical: deterministic content");
+    free(c2);
+
+    /* different method produces different string */
+    char *c3 = cookbook_grid_build_canonical("HEAD", "/grid/resolve/org/acme/lib/*",
+        "central", 1, "org.acme:r", "", 1710800000, &len2);
+    ASSERT(memcmp(c1, c3, len1 < len2 ? len1 : len2) != 0,
+           "canonical: different method differs");
+    free(c3);
+    free(c1);
+}
+
+static void test_grid_sign_verify_roundtrip(void) {
+    /* Generate keypair */
+    unsigned char pk[32], sk[64];
+    int rc = cookbook_ed25519_keygen(pk, sk);
+    ASSERT(rc == 0, "grid sig: keygen");
+
+    /* Build canonical and sign */
+    size_t canon_len;
+    char *canonical = cookbook_grid_build_canonical("GET", "/grid/resolve/org/acme/lib/*",
+        "central", 1, "org.acme:crwd", "org.secret", 1710800000, &canon_len);
+    ASSERT(canonical != NULL, "grid sig: canonical");
+
+    unsigned char sig[64];
+    rc = cookbook_ed25519_sign(sig, canonical, canon_len, sk);
+    ASSERT(rc == 0, "grid sig: sign");
+
+    /* Verify */
+    rc = cookbook_ed25519_verify(sig, canonical, canon_len, pk);
+    ASSERT(rc == 0, "grid sig: verify ok");
+
+    /* Tamper with canonical — should fail */
+    canonical[5] ^= 0x01;
+    rc = cookbook_ed25519_verify(sig, canonical, canon_len, pk);
+    ASSERT(rc != 0, "grid sig: tampered canonical rejected");
+    canonical[5] ^= 0x01; /* restore */
+
+    /* Tamper with signature — should fail */
+    sig[10] ^= 0xff;
+    rc = cookbook_ed25519_verify(sig, canonical, canon_len, pk);
+    ASSERT(rc != 0, "grid sig: tampered sig rejected");
+
+    free(canonical);
+}
+
+static void test_grid_timestamp_validation(void) {
+    /* Timestamps are validated in verify_grid_peer_sig (server code),
+       but we can test the canonical builder handles timestamps correctly */
+    size_t len1, len2;
+    char *c1 = cookbook_grid_build_canonical("GET", "/grid/resolve/x",
+        "a", 1, "", "", 1000000, &len1);
+    char *c2 = cookbook_grid_build_canonical("GET", "/grid/resolve/x",
+        "a", 1, "", "", 1000300, &len2);
+    ASSERT(c1 != NULL && c2 != NULL, "timestamp: both canonical ok");
+    /* different timestamps produce different canonicals */
+    ASSERT(len1 != len2 || memcmp(c1, c2, len1) != 0,
+           "timestamp: different ts differs");
+    free(c1);
+    free(c2);
+}
+
+/* ---- wildcard grants tests ---- */
+
+static void test_auth_check_wildcard(void) {
+    /* wildcard grant: "*" matches any group */
+    const char *grants = "{\"grants\":{\"*\":\"r\"}}";
+    ASSERT(cookbook_auth_check(grants, NULL, "com.anything", 'r') == 1,
+           "wildcard: r on any group");
+    ASSERT(cookbook_auth_check(grants, NULL, "org.acme.sdk", 'r') == 1,
+           "wildcard: r on different group");
+    ASSERT(cookbook_auth_check(grants, NULL, "com.anything", 'w') == 0,
+           "wildcard: w denied when only r granted");
+
+    /* wildcard with full perms */
+    const char *admin = "{\"grants\":{\"*\":\"crwd\"}}";
+    ASSERT(cookbook_auth_check(admin, NULL, "com.foo", 'c') == 1,
+           "wildcard admin: c allowed");
+    ASSERT(cookbook_auth_check(admin, NULL, "com.foo", 'r') == 1,
+           "wildcard admin: r allowed");
+    ASSERT(cookbook_auth_check(admin, NULL, "com.foo", 'w') == 1,
+           "wildcard admin: w allowed");
+    ASSERT(cookbook_auth_check(admin, NULL, "com.foo", 'd') == 1,
+           "wildcard admin: d allowed");
+
+    /* specific grant overrides wildcard */
+    const char *mixed = "{\"grants\":{\"*\":\"r\",\"com.iridiumfx\":\"crwd\"}}";
+    ASSERT(cookbook_auth_check(mixed, NULL, "com.iridiumfx", 'w') == 1,
+           "wildcard+specific: specific wins for w");
+    ASSERT(cookbook_auth_check(mixed, NULL, "com.iridiumfx.sub", 'w') == 1,
+           "wildcard+specific: hierarchical specific wins");
+    ASSERT(cookbook_auth_check(mixed, NULL, "org.acme", 'w') == 0,
+           "wildcard+specific: non-matching falls to wildcard (no w)");
+    ASSERT(cookbook_auth_check(mixed, NULL, "org.acme", 'r') == 1,
+           "wildcard+specific: non-matching falls to wildcard (has r)");
+
+    /* wildcard with exclude */
+    const char *excl = "{\"grants\":{\"*\":\"crwd\"},\"exclude\":{\"com.secret\":true}}";
+    ASSERT(cookbook_auth_check(excl, NULL, "com.foo", 'r') == 1,
+           "wildcard+exclude: non-excluded allowed");
+    ASSERT(cookbook_auth_check(excl, NULL, "com.secret", 'r') == 0,
+           "wildcard+exclude: excluded denied");
+    ASSERT(cookbook_auth_check(excl, NULL, "com.secret.sub", 'r') == 0,
+           "wildcard+exclude: sub-excluded denied");
+}
+
+/* ---- revocation list tests ---- */
+
+static void test_revocation_list(void) {
+    cookbook_revocation_list rl;
+    cookbook_revocation_init(&rl, 16);
+
+    /* initially empty */
+    ASSERT(cookbook_revocation_check(&rl, "abc123") == 0,
+           "revoke: empty list returns not-revoked");
+
+    /* add and check */
+    int64_t future = (int64_t)time(NULL) + 3600;
+    ASSERT(cookbook_revocation_add(&rl, "tok1", future) == 0,
+           "revoke: add succeeds");
+    ASSERT(cookbook_revocation_check(&rl, "tok1") == 1,
+           "revoke: tok1 is revoked");
+    ASSERT(cookbook_revocation_check(&rl, "tok2") == 0,
+           "revoke: tok2 is not revoked");
+
+    /* duplicate add succeeds (no-op) */
+    ASSERT(cookbook_revocation_add(&rl, "tok1", future) == 0,
+           "revoke: duplicate add ok");
+    ASSERT(rl.count == 1, "revoke: duplicate doesn't grow count");
+
+    /* add second entry */
+    ASSERT(cookbook_revocation_add(&rl, "tok2", future) == 0,
+           "revoke: add tok2");
+    ASSERT(rl.count == 2, "revoke: count is 2");
+    ASSERT(cookbook_revocation_check(&rl, "tok2") == 1,
+           "revoke: tok2 now revoked");
+
+    /* expired entries get pruned on next add */
+    int64_t past = (int64_t)time(NULL) - 10;
+    ASSERT(cookbook_revocation_add(&rl, "old_tok", past) == 0,
+           "revoke: add expired entry");
+    /* add another to trigger prune */
+    ASSERT(cookbook_revocation_add(&rl, "tok3", future) == 0,
+           "revoke: add tok3 triggers prune");
+    ASSERT(cookbook_revocation_check(&rl, "old_tok") == 0,
+           "revoke: expired entry pruned");
+
+    cookbook_revocation_free(&rl);
+}
+
+static void test_jwt_jti(void) {
+    /* JWT v1 now includes jti */
+    unsigned char pk[32], sk[64];
+    cookbook_keygen(pk, sk);
+
+    char *tok1 = cookbook_jwt_create("alice", "admin", 3600, sk);
+    ASSERT(tok1 != NULL, "jti: v1 token created");
+
+    cookbook_jwt_claims c1;
+    ASSERT(cookbook_jwt_verify(tok1, pk, &c1) == 0, "jti: v1 verify ok");
+    ASSERT(c1.jti[0] != '\0', "jti: v1 has jti claim");
+
+    /* jti is unique per token */
+    char *tok2 = cookbook_jwt_create("alice", "admin", 3600, sk);
+    cookbook_jwt_claims c2;
+    ASSERT(cookbook_jwt_verify(tok2, pk, &c2) == 0, "jti: v1 second verify");
+    ASSERT(strcmp(c1.jti, c2.jti) != 0, "jti: different tokens have different jti");
+
+    cookbook_jwt_claims_free(&c1);
+    cookbook_jwt_claims_free(&c2);
+    free(tok1);
+    free(tok2);
+
+    /* JWT v2 also includes jti */
+    char *resolved = "{\"grants\":{\"com.x\":\"r\"},\"exclude\":{}}";
+    char *tok3 = cookbook_jwt_create_v2("bob", NULL, resolved, 3600, sk);
+    ASSERT(tok3 != NULL, "jti: v2 token created");
+
+    cookbook_jwt_claims c3;
+    ASSERT(cookbook_jwt_verify(tok3, pk, &c3) == 0, "jti: v2 verify ok");
+    ASSERT(c3.jti[0] != '\0', "jti: v2 has jti claim");
+    ASSERT(c3.version == 2, "jti: v2 version correct");
+
+    cookbook_jwt_claims_free(&c3);
+    free(tok3);
+}
+
+/* ---- credential admin tests ---- */
+
+typedef struct {
+    char hash[256];
+    char groups[1024];
+    int found;
+} test_cred_ctx;
+
+static int test_cred_lookup_cb(const cookbook_db_row *row, void *user) {
+    test_cred_ctx *ctx = (test_cred_ctx *)user;
+    if (row->ncols >= 2 && row->values[0] && row->values[1]) {
+        snprintf(ctx->hash, sizeof(ctx->hash), "%s", row->values[0]);
+        snprintf(ctx->groups, sizeof(ctx->groups), "%s", row->values[1]);
+        ctx->found = 1;
+    }
+    return 0;
+}
+
+static void test_credential_admin_lifecycle(void) {
+    cookbook_db *db = cookbook_db_open_sqlite(":memory:");
+    ASSERT(db != NULL, "cred admin: db open");
+    ASSERT(cookbook_db_migrate(db) == COOKBOOK_DB_OK, "cred admin: migrate");
+
+    /* insert a credential */
+    char *hash = cookbook_credential_hash("secret123");
+    ASSERT(hash != NULL, "cred admin: hash ok");
+
+    cookbook_db_param ip[] = {
+        COOKBOOK_P_TEXT("alice"),
+        COOKBOOK_P_TEXT(hash),
+        COOKBOOK_P_TEXT("admin,publish")
+    };
+    ASSERT(db->exec_p(db,
+        "INSERT INTO credentials (subject, token_hash, groups, created_at) "
+        "VALUES (?1, ?2, ?3, datetime('now'))",
+        ip, 3) == COOKBOOK_DB_OK, "cred admin: insert alice");
+
+    /* verify credential works */
+    ASSERT(cookbook_credential_verify("secret123", hash) == 0,
+           "cred admin: verify ok");
+    ASSERT(cookbook_credential_verify("wrong", hash) != 0,
+           "cred admin: wrong token rejected");
+    free(hash);
+
+    /* verify the record exists via a lookup */
+    test_cred_ctx lctx = { {0}, {0}, 0 };
+    cookbook_db_param lp[] = { COOKBOOK_P_TEXT("alice") };
+    db->query_p(db,
+        "SELECT token_hash, groups FROM credentials "
+        "WHERE subject = ?1 AND revoked_at IS NULL",
+        lp, 1, test_cred_lookup_cb, &lctx);
+    ASSERT(lctx.found == 1, "cred admin: alice found");
+    ASSERT(strstr(lctx.groups, "admin") != NULL,
+           "cred admin: groups include admin");
+
+    /* revoke credential */
+    cookbook_db_param rp[] = { COOKBOOK_P_TEXT("alice") };
+    ASSERT(db->exec_p(db,
+        "UPDATE credentials SET revoked_at = datetime('now') "
+        "WHERE subject = ?1 AND revoked_at IS NULL",
+        rp, 1) == COOKBOOK_DB_OK, "cred admin: revoke ok");
+
+    /* lookup after revoke should fail */
+    test_cred_ctx lctx2 = { {0}, {0}, 0 };
+    db->query_p(db,
+        "SELECT token_hash, groups FROM credentials "
+        "WHERE subject = ?1 AND revoked_at IS NULL",
+        lp, 1, test_cred_lookup_cb, &lctx2);
+    ASSERT(lctx2.found == 0, "cred admin: revoked not found");
+
+    /* re-create after revoke (INSERT OR REPLACE) */
+    char *hash2 = cookbook_credential_hash("newsecret");
+    ASSERT(hash2 != NULL, "cred admin: hash2 ok");
+    cookbook_db_param ip2[] = {
+        COOKBOOK_P_TEXT("alice"),
+        COOKBOOK_P_TEXT(hash2),
+        COOKBOOK_P_TEXT("readonly")
+    };
+    ASSERT(db->exec_p(db,
+        "INSERT OR REPLACE INTO credentials "
+        "(subject, token_hash, groups, created_at, revoked_at) "
+        "VALUES (?1, ?2, ?3, datetime('now'), NULL)",
+        ip2, 3) == COOKBOOK_DB_OK, "cred admin: re-create ok");
+
+    /* new credential works */
+    test_cred_ctx lctx3 = { {0}, {0}, 0 };
+    db->query_p(db,
+        "SELECT token_hash, groups FROM credentials "
+        "WHERE subject = ?1 AND revoked_at IS NULL",
+        lp, 1, test_cred_lookup_cb, &lctx3);
+    ASSERT(lctx3.found == 1, "cred admin: re-created found");
+    ASSERT(strcmp(lctx3.groups, "readonly") == 0,
+           "cred admin: groups updated to readonly");
+    ASSERT(cookbook_credential_verify("newsecret", hash2) == 0,
+           "cred admin: new token verifies");
+    free(hash2);
+
+    /* delete credential */
+    cookbook_db_param dp[] = { COOKBOOK_P_TEXT("alice") };
+    ASSERT(db->exec_p(db,
+        "DELETE FROM credentials WHERE subject = ?1",
+        dp, 1) == COOKBOOK_DB_OK, "cred admin: delete ok");
+
+    test_cred_ctx lctx4 = { {0}, {0}, 0 };
+    db->query_p(db,
+        "SELECT token_hash, groups FROM credentials "
+        "WHERE subject = ?1 AND revoked_at IS NULL",
+        lp, 1, test_cred_lookup_cb, &lctx4);
+    ASSERT(lctx4.found == 0, "cred admin: deleted not found");
+
+    db->close(db);
+}
+
+static void test_full_auth_flow(void) {
+    /* End-to-end: create credential → create JWT → verify → check revocation */
+    unsigned char pk[32], sk[64];
+    cookbook_keygen(pk, sk);
+
+    /* 1. hash credential */
+    char *hash = cookbook_credential_hash("mytoken");
+    ASSERT(hash != NULL, "flow: hash");
+    ASSERT(cookbook_credential_verify("mytoken", hash) == 0, "flow: verify cred");
+
+    /* 2. create JWT v1 */
+    char *jwt = cookbook_jwt_create("alice", "admin", 3600, sk);
+    ASSERT(jwt != NULL, "flow: jwt create");
+
+    /* 3. verify JWT */
+    cookbook_jwt_claims claims;
+    ASSERT(cookbook_jwt_verify(jwt, pk, &claims) == 0, "flow: jwt verify");
+    ASSERT(strcmp(claims.sub, "alice") == 0, "flow: sub is alice");
+    ASSERT(claims.jti[0] != '\0', "flow: jti present");
+
+    /* 4. check revocation (not revoked) */
+    cookbook_revocation_list rl;
+    cookbook_revocation_init(&rl, 16);
+    ASSERT(cookbook_revocation_check(&rl, claims.jti) == 0,
+           "flow: not revoked initially");
+
+    /* 5. revoke */
+    ASSERT(cookbook_revocation_add(&rl, claims.jti, claims.exp) == 0,
+           "flow: revoke ok");
+    ASSERT(cookbook_revocation_check(&rl, claims.jti) == 1,
+           "flow: now revoked");
+
+    /* 6. second token still works */
+    char *jwt2 = cookbook_jwt_create("alice", "admin", 3600, sk);
+    cookbook_jwt_claims c2;
+    ASSERT(cookbook_jwt_verify(jwt2, pk, &c2) == 0, "flow: jwt2 verify");
+    ASSERT(cookbook_revocation_check(&rl, c2.jti) == 0,
+           "flow: jwt2 not revoked");
+
+    cookbook_revocation_free(&rl);
+    cookbook_jwt_claims_free(&claims);
+    cookbook_jwt_claims_free(&c2);
+    free(hash);
+    free(jwt);
+    free(jwt2);
+}
+
+#ifdef COOKBOOK_HAS_BASTA
+/* ---- basta integration tests ---- */
+
+static void test_basta_integration(void) {
+    /* basic: create values programmatically */
+    BastaValue *s = basta_new_string("hello");
+    ASSERT(s != NULL, "basta: new string");
+    ASSERT(basta_type(s) == BASTA_STRING, "basta: type is string");
+    ASSERT(strcmp(basta_get_string(s), "hello") == 0,
+           "basta: string value");
+    basta_free(s);
+
+    /* map construction */
+    BastaValue *m = basta_new_map();
+    ASSERT(m != NULL, "basta: new map");
+    ASSERT(basta_set(m, "key", basta_new_string("val")) == 0,
+           "basta: set key");
+    ASSERT(basta_count(m) == 1, "basta: map has 1 entry");
+    const BastaValue *v = basta_map_get(m, "key");
+    ASSERT(v != NULL, "basta: get key");
+    ASSERT(strcmp(basta_get_string(v), "val") == 0,
+           "basta: value is val");
+
+    /* write and verify */
+    size_t out_len = 0;
+    char *out = basta_write(m, BASTA_COMPACT, &out_len);
+    ASSERT(out != NULL, "basta: write map");
+    ASSERT(strstr(out, "key") != NULL, "basta: output has key");
+    free(out);
+    basta_free(m);
+
+    /* blob creation and read-back */
+    const uint8_t blob_data[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x42 };
+    BastaValue *blob = basta_new_blob(blob_data, 6);
+    ASSERT(blob != NULL, "basta: blob create");
+    ASSERT(basta_type(blob) == BASTA_BLOB, "basta: is blob");
+    size_t blen = 0;
+    const uint8_t *bdata = basta_get_blob(blob, &blen);
+    ASSERT(blen == 6, "basta: blob length");
+    ASSERT(bdata != NULL && bdata[0] == 0xDE && bdata[5] == 0x42,
+           "basta: blob data matches");
+    basta_free(blob);
+
+    /* parse a basta document from text */
+    const char *doc = "{ name: \"cookbook\", version: \"1.0\" }";
+    BastaResult br;
+    memset(&br, 0, sizeof(br));
+    BastaValue *root = basta_parse_cstr(doc, &br);
+    ASSERT(root != NULL, "basta: parse cstr");
+    if (!root) {
+        fprintf(stderr, "  basta parse error: %s (line %d col %d)\n",
+                br.message, br.line, br.col);
+    } else {
+        ASSERT(br.code == BASTA_OK, "basta: parse ok");
+        ASSERT(basta_type(root) == BASTA_MAP, "basta: root is map");
+        const BastaValue *name = basta_map_get(root, "name");
+        ASSERT(name != NULL, "basta: name field");
+        if (name) {
+            ASSERT(basta_type(name) == BASTA_STRING, "basta: name is string");
+            const char *ns = basta_get_string(name);
+            ASSERT(ns != NULL && strcmp(ns, "cookbook") == 0,
+                   "basta: name is cookbook");
+        }
+        basta_free(root);
+    }
+}
+#endif /* COOKBOOK_HAS_BASTA */
+
+/* ---- native Ed25519 tests ---- */
+
+static void hex_to_bytes(const char *hex, unsigned char *out, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        unsigned int b;
+        sscanf(hex + i * 2, "%2x", &b);
+        out[i] = (unsigned char)b;
+    }
+}
+
+extern void cookbook_ed25519_sha512_test(const void *data, size_t len, unsigned char out[64]);
+
+static void test_ed25519_sha512(void) {
+    /* compare native SHA-512 against libsodium */
+    unsigned char native[64], sodium_out[64];
+    const unsigned char seed[] = {
+        0x9d,0x61,0xb1,0x9d,0xef,0xfd,0x5a,0x60,
+        0xba,0x84,0x4a,0xf4,0x92,0xec,0x2c,0xc4,
+        0x44,0x49,0xc5,0x69,0x7b,0x32,0x69,0x19,
+        0x70,0x3b,0xac,0x03,0x1c,0xae,0x7f,0x60
+    };
+
+    cookbook_ed25519_sha512_test(seed, 32, native);
+    crypto_hash_sha512(sodium_out, seed, 32);
+
+    if (memcmp(native, sodium_out, 64) != 0) {
+        fprintf(stderr, "  SHA512 native : %02x%02x%02x%02x%02x%02x%02x%02x\n",
+                native[0],native[1],native[2],native[3],
+                native[4],native[5],native[6],native[7]);
+        fprintf(stderr, "  SHA512 sodium : %02x%02x%02x%02x%02x%02x%02x%02x\n",
+                sodium_out[0],sodium_out[1],sodium_out[2],sodium_out[3],
+                sodium_out[4],sodium_out[5],sodium_out[6],sodium_out[7]);
+    }
+    ASSERT(memcmp(native, sodium_out, 64) == 0, "SHA-512 matches libsodium");
+
+    /* also test empty message: SHA-512("") should be cf83e135... */
+    cookbook_ed25519_sha512_test(NULL, 0, native);
+    ASSERT(native[0] == 0xcf && native[1] == 0x83 && native[2] == 0xe1,
+           "SHA-512 empty message prefix correct");
+}
+
+extern void cookbook_ed25519_scalarmult_base_test(const unsigned char scalar[32],
+                                                   unsigned char out[32]);
+
+static void test_ed25519_scalarmult_base(void) {
+    /* Test [1]B — scalar=1 should produce the Ed25519 basepoint encoding */
+    unsigned char scalar[32] = {0};
+    unsigned char result[32];
+    scalar[0] = 1;  /* scalar = 1 in little-endian */
+
+    cookbook_ed25519_scalarmult_base_test(scalar, result);
+
+    /* Known Ed25519 basepoint compressed encoding:
+       y = 4/5 mod p, x-sign bit set → 0x5866666666...66 */
+    unsigned char expected_bp[32];
+    hex_to_bytes(
+        "5866666666666666666666666666666666"
+        "66666666666666666666666666666666", expected_bp, 32);
+
+    ASSERT(memcmp(result, expected_bp, 32) == 0, "[1]B == basepoint");
+
+    /* Test [0]B — should be identity (0, 1) → encoded as 01000...00 */
+    unsigned char zero_scalar[32] = {0};
+    unsigned char id_result[32];
+    cookbook_ed25519_scalarmult_base_test(zero_scalar, id_result);
+
+    unsigned char expected_id[32] = {0};
+    expected_id[0] = 0x01;  /* y=1, x=0 in compressed: 01 00 00 ... 00 */
+    ASSERT(memcmp(id_result, expected_id, 32) == 0, "[0]B == identity");
+}
+
+static void test_ed25519_rfc8032_vector1(void) {
+    /* RFC 8032 Section 7.1 Test Vector 1: empty message */
+    unsigned char sk[64], pk[32], sig[64];
+    unsigned char expected_pk[32], expected_sig[64];
+
+    /* sk = seed(32) || pk(32) per libsodium/ref10 convention */
+    hex_to_bytes(
+        "9d61b19deffd5a60ba844af492ec2cc4"
+        "4449c5697b326919703bac031cae7f60", sk, 32);
+    hex_to_bytes(
+        "d75a980182b10ab7d54bfed3c964073a"
+        "0ee172f3daa62325af021a68f707511a", sk + 32, 32);
+
+    hex_to_bytes(
+        "d75a980182b10ab7d54bfed3c964073a"
+        "0ee172f3daa62325af021a68f707511a", expected_pk, 32);
+    hex_to_bytes(
+        "e5564300c360ac729086e2cc806e828a"
+        "84877f1eb8e5d974d873e06522490155"
+        "5fb8821590a33bacc61e39701cf9b46b"
+        "d25bf5f0595bbe24655141438e7a100b", expected_sig, 64);
+
+    /* test sign */
+    int rc = cookbook_ed25519_sign(sig, NULL, 0, sk);
+    ASSERT(rc == 0, "rfc8032 v1: sign succeeds");
+
+    ASSERT(memcmp(sig, expected_sig, 64) == 0, "rfc8032 v1: signature matches");
+
+    /* test verify */
+    memcpy(pk, expected_pk, 32);
+    rc = cookbook_ed25519_verify(expected_sig, NULL, 0, pk);
+    ASSERT(rc == 0, "rfc8032 v1: verify succeeds");
+
+    /* tampered message should fail */
+    unsigned char byte = 0x42;
+    rc = cookbook_ed25519_verify(expected_sig, &byte, 1, pk);
+    ASSERT(rc != 0, "rfc8032 v1: tampered msg rejected");
+}
+
+static void test_ed25519_rfc8032_vector2(void) {
+    /* RFC 8032 Section 7.1 Test Vector 2: single byte 0x72 */
+    unsigned char sk[64], pk[32], sig[64];
+    unsigned char expected_sig[64];
+    unsigned char msg[] = { 0x72 };
+
+    hex_to_bytes(
+        "4ccd089b28ff96da9db6c346ec114e0f"
+        "5b8a319f35aba624da8cf6ed4fb8a6fb", sk, 32);
+    hex_to_bytes(
+        "3d4017c3e843895a92b70aa74d1b7ebc"
+        "9c982ccf2ec4968cc0cd55f12af4660c", sk + 32, 32);
+
+    hex_to_bytes(
+        "3d4017c3e843895a92b70aa74d1b7ebc"
+        "9c982ccf2ec4968cc0cd55f12af4660c", pk, 32);
+    hex_to_bytes(
+        "92a009a9f0d4cab8720e820b5f642540"
+        "a2b27b5416503f8fb3762223ebdb69da"
+        "085ac1e43e15996e458f3613d0f11d8c"
+        "387b2eaeb4302aeeb00d291612bb0c00", expected_sig, 64);
+
+    int rc = cookbook_ed25519_sign(sig, msg, 1, sk);
+    ASSERT(rc == 0, "rfc8032 v2: sign succeeds");
+    ASSERT(memcmp(sig, expected_sig, 64) == 0, "rfc8032 v2: signature matches");
+
+    rc = cookbook_ed25519_verify(sig, msg, 1, pk);
+    ASSERT(rc == 0, "rfc8032 v2: verify succeeds");
+}
+
+static void test_ed25519_rfc8032_vector3(void) {
+    /* RFC 8032 Section 7.1 Test Vector 3: two-byte message */
+    unsigned char sk[64], pk[32], sig[64];
+    unsigned char expected_sig[64];
+    unsigned char msg[] = { 0xaf, 0x82 };
+
+    hex_to_bytes(
+        "c5aa8df43f9f837bedb7442f31dcb7b1"
+        "66d38535076f094b85ce3a2e0b4458f7", sk, 32);
+    hex_to_bytes(
+        "fc51cd8e6218a1a38da47ed00230f058"
+        "0816ed13ba3303ac5deb911548908025", sk + 32, 32);
+
+    hex_to_bytes(
+        "fc51cd8e6218a1a38da47ed00230f058"
+        "0816ed13ba3303ac5deb911548908025", pk, 32);
+    hex_to_bytes(
+        "6291d657deec24024827e69c3abe01a3"
+        "0ce548a284743a445e3680d7db5ac3ac"
+        "18ff9b538d16f290ae67f760984dc659"
+        "4a7c15e9716ed28dc027beceea1ec40a", expected_sig, 64);
+
+    int rc = cookbook_ed25519_sign(sig, msg, 2, sk);
+    ASSERT(rc == 0, "rfc8032 v3: sign succeeds");
+    ASSERT(memcmp(sig, expected_sig, 64) == 0, "rfc8032 v3: signature matches");
+
+    rc = cookbook_ed25519_verify(sig, msg, 2, pk);
+    ASSERT(rc == 0, "rfc8032 v3: verify succeeds");
+}
+
+static void test_ed25519_cross_validation(void) {
+    /* generate key with libsodium, sign with native, verify with both */
+    if (sodium_init() < -1) return;
+
+    unsigned char pk[32], sk[64], sig_native[64], sig_sodium[64];
+    crypto_sign_ed25519_keypair(pk, sk);
+
+    const char *msg = "cross-validation test message";
+    size_t mlen = strlen(msg);
+
+    /* sign with native */
+    int rc = cookbook_ed25519_sign(sig_native, msg, mlen, sk);
+    ASSERT(rc == 0, "cross: native sign succeeds");
+
+    /* verify native sig with libsodium */
+    rc = crypto_sign_ed25519_verify_detached(sig_native, (const unsigned char *)msg, mlen, pk);
+    ASSERT(rc == 0, "cross: sodium verifies native sig");
+
+    /* sign with libsodium */
+    crypto_sign_ed25519_detached(sig_sodium, NULL, (const unsigned char *)msg, mlen, sk);
+
+    /* verify sodium sig with native */
+    rc = cookbook_ed25519_verify(sig_sodium, msg, mlen, pk);
+    ASSERT(rc == 0, "cross: native verifies sodium sig");
+
+    /* generate key with native, verify with sodium */
+    unsigned char pk2[32], sk2[64], sig2[64];
+    rc = cookbook_ed25519_keygen(pk2, sk2);
+    ASSERT(rc == 0, "cross: native keygen succeeds");
+
+    rc = cookbook_ed25519_sign(sig2, msg, mlen, sk2);
+    ASSERT(rc == 0, "cross: native sign with native key");
+    rc = crypto_sign_ed25519_verify_detached(sig2, (const unsigned char *)msg, mlen, pk2);
+    ASSERT(rc == 0, "cross: sodium verifies native key+sig");
+}
+
 int main(void) {
     printf("cookbook test suite\n\n");
 
@@ -2101,6 +3091,30 @@ int main(void) {
     test_jwt_v2_roundtrip();
     test_jwt_v2_policy_integration();
     test_jwt_v1_v2_compat();
+    test_enforcement_v1_reads_open();
+    test_enforcement_v2_all_ops();
+    test_enforcement_mirror_visibility();
+    test_enforcement_policy_to_enforcement();
+    test_enforcement_grid_grant_roundtrip();
+    test_grid_peer_key_crud();
+    test_grid_peer_load_with_key();
+    test_grid_canonical_string();
+    test_grid_sign_verify_roundtrip();
+    test_grid_timestamp_validation();
+    test_auth_check_wildcard();
+    test_revocation_list();
+    test_jwt_jti();
+    test_credential_admin_lifecycle();
+    test_full_auth_flow();
+#ifdef COOKBOOK_HAS_BASTA
+    test_basta_integration();
+#endif
+    test_ed25519_sha512();
+    test_ed25519_scalarmult_base();
+    test_ed25519_rfc8032_vector1();
+    test_ed25519_rfc8032_vector2();
+    test_ed25519_rfc8032_vector3();
+    test_ed25519_cross_validation();
 
     printf("\n%d/%d tests passed\n", tests_run - tests_failed, tests_run);
     return tests_failed ? 1 : 0;

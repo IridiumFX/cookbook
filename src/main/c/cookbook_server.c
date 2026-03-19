@@ -3,6 +3,7 @@
 #include "cookbook_sha256.h"
 #include "cookbook_auth.h"
 #include "cookbook_grid.h"
+#include "cookbook_ed25519.h"
 #include "cookbook_policy.h"
 #include "civetweb.h"
 #include "pasta.h"
@@ -63,6 +64,8 @@ struct cookbook_server {
     cookbook_metrics     metrics;
     int                 grid_enabled;
     int                 grid_max_hops;
+    int                 grid_peer_auth;
+    cookbook_revocation_list revocations;
     volatile int        reconcile_running;
 #ifdef _WIN32
     HANDLE              reconcile_thread;
@@ -492,7 +495,249 @@ static int extract_bearer_jwt(cookbook_server *srv,
     if (!auth) return -1;
     if (strncmp(auth, "Bearer ", 7) != 0) return -1;
 
-    return cookbook_jwt_verify(auth + 7, srv->registry_pk, claims);
+    int rc = cookbook_jwt_verify(auth + 7, srv->registry_pk, claims);
+    if (rc != 0) return rc;
+
+    /* check revocation list */
+    if (claims->jti[0] &&
+        cookbook_revocation_check(&srv->revocations, claims->jti)) {
+        cookbook_jwt_claims_free(claims);
+        memset(claims, 0, sizeof(*claims));
+        return -1; /* token revoked */
+    }
+
+    return 0;
+}
+
+/* Phase 3: v2 auth enforcement helper.
+   Extracts JWT, checks v2 grants or v1 group, handles rate limiting.
+   Returns 1 if allowed (claims populated), 0 if denied (error sent).
+   If auth is disabled (no registry key), returns 1 with zeroed claims. */
+static int require_auth_v2(cookbook_server *srv, struct mg_connection *conn,
+                            const struct mg_request_info *ri,
+                            const char *group_id, char op,
+                            cookbook_jwt_claims *claims) {
+    memset(claims, 0, sizeof(*claims));
+    if (!srv->has_registry_key) return 1; /* auth disabled */
+
+    if (extract_bearer_jwt(srv, ri, claims) != 0) {
+        METRIC_INC(srv->metrics.responses_4xx);
+        METRIC_INC(srv->metrics.auth_failures);
+        send_json(conn, 401,
+            "{\"error\":\"Valid Bearer JWT required\"}\n");
+        return 0;
+    }
+
+    /* rate limiting */
+    if (check_rate_limit(srv, claims->sub)) {
+        METRIC_INC(srv->metrics.responses_4xx);
+        cookbook_jwt_claims_free(claims);
+        send_json(conn, 429, "{\"error\":\"Rate limit exceeded\"}\n");
+        return 0;
+    }
+
+    if (claims->version == 2) {
+        /* v2: fine-grained auth check */
+        if (!cookbook_auth_check(claims->grants_json, claims->exclude_json,
+                                group_id, op)) {
+            METRIC_INC(srv->metrics.responses_4xx);
+            METRIC_INC(srv->metrics.auth_failures);
+            cookbook_jwt_claims_free(claims);
+            send_json(conn, 403,
+                "{\"error\":\"Insufficient permissions\"}\n");
+            return 0;
+        }
+    } else {
+        /* v1: for writes check group membership, reads are open */
+        if (op != 'r' && !cookbook_jwt_has_group(claims, group_id)) {
+            METRIC_INC(srv->metrics.responses_4xx);
+            METRIC_INC(srv->metrics.auth_failures);
+            send_json(conn, 403,
+                "{\"error\":\"JWT does not authorize this group\"}\n");
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+/* Build X-Cookbook-Grid-Grants/Exclude headers from JWT claims.
+   Returns malloc'd header string or NULL. Caller must free. */
+static char *build_grid_grant_headers(const cookbook_jwt_claims *claims) {
+    if (claims->version != 2 || !claims->grants_json) return NULL;
+
+    size_t cap = 2048;
+    char *hdrs = (char *)malloc(cap);
+    if (!hdrs) return NULL;
+    size_t pos = 0;
+
+    /* serialize grants_json to compact header format: group:perms,... */
+    pos += (size_t)snprintf(hdrs + pos, cap - pos,
+        "X-Cookbook-Grid-Grants: ");
+
+    /* walk the grants JSON map */
+    const char *gs = claims->grants_json;
+    const char *p = strchr(gs, '{');
+    if (p) p++;
+    int first = 1;
+    while (p && *p && *p != '}') {
+        while (*p == ' ' || *p == '\n' || *p == ',') p++;
+        if (*p == '"') {
+            p++;
+            const char *kend = strchr(p, '"');
+            if (!kend) break;
+            size_t klen = (size_t)(kend - p);
+            const char *key = p;
+            p = kend + 1;
+            while (*p == ' ' || *p == ':') p++;
+            if (*p == '"') {
+                p++;
+                const char *vend = strchr(p, '"');
+                if (!vend) break;
+                size_t vlen = (size_t)(vend - p);
+                if (!first && pos < cap)
+                    hdrs[pos++] = ',';
+                pos += (size_t)snprintf(hdrs + pos, cap - pos,
+                    "%.*s:%.*s", (int)klen, key, (int)vlen, p);
+                p = vend + 1;
+                first = 0;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    pos += (size_t)snprintf(hdrs + pos, cap - pos, "\r\n");
+
+    /* serialize exclude if present */
+    if (claims->exclude_json) {
+        pos += (size_t)snprintf(hdrs + pos, cap - pos,
+            "X-Cookbook-Grid-Exclude: ");
+        const char *es = claims->exclude_json;
+        const char *ep = strchr(es, '{');
+        if (ep) ep++;
+        first = 1;
+        while (ep && *ep && *ep != '}') {
+            while (*ep == ' ' || *ep == '\n' || *ep == ',') ep++;
+            if (*ep == '"') {
+                ep++;
+                const char *kend = strchr(ep, '"');
+                if (!kend) break;
+                size_t klen = (size_t)(kend - ep);
+                if (!first && pos < cap)
+                    hdrs[pos++] = ',';
+                pos += (size_t)snprintf(hdrs + pos, cap - pos,
+                    "%.*s", (int)klen, ep);
+                ep = kend + 1;
+                /* skip past : and value */
+                while (*ep && *ep != ',' && *ep != '}') ep++;
+                first = 0;
+            } else {
+                break;
+            }
+        }
+        pos += (size_t)snprintf(hdrs + pos, cap - pos, "\r\n");
+    }
+
+    hdrs[pos] = '\0';
+    return hdrs;
+}
+
+/* Parse X-Cookbook-Grid-Grants header into a JSON string for auth_check.
+   Input format: "com.iridiumfx:crwd,org.acme:r"
+   Returns malloc'd JSON string like {"com.iridiumfx":"crwd","org.acme":"r"}
+   or NULL if header not present. */
+static char *parse_grid_grants_header(const struct mg_request_info *ri) {
+    const char *hval = NULL;
+    for (int i = 0; i < ri->num_headers; i++) {
+        if (strcasecmp(ri->http_headers[i].name,
+                       "X-Cookbook-Grid-Grants") == 0) {
+            hval = ri->http_headers[i].value;
+            break;
+        }
+    }
+    if (!hval || !*hval) return NULL;
+
+    size_t cap = strlen(hval) * 3 + 16;
+    char *json = (char *)malloc(cap);
+    if (!json) return NULL;
+    size_t pos = 0;
+    json[pos++] = '{';
+
+    char buf[2048];
+    snprintf(buf, sizeof(buf), "%s", hval);
+    char *saveptr = NULL;
+    char *tok = strtok_r(buf, ",", &saveptr);
+    int first = 1;
+    while (tok) {
+        while (*tok == ' ') tok++;
+        char *colon = strchr(tok, ':');
+        if (colon) {
+            *colon = '\0';
+            if (!first) json[pos++] = ',';
+            pos += (size_t)snprintf(json + pos, cap - pos,
+                "\"%s\":\"%s\"", tok, colon + 1);
+            first = 0;
+        }
+        tok = strtok_r(NULL, ",", &saveptr);
+    }
+    json[pos++] = '}';
+    json[pos] = '\0';
+    return json;
+}
+
+/* Parse X-Cookbook-Grid-Exclude header into a JSON string.
+   Input format: "com.iridiumfx.secret,org.acme.internal"
+   Returns malloc'd JSON like {"com.iridiumfx.secret":true,...} */
+static char *parse_grid_exclude_header(const struct mg_request_info *ri) {
+    const char *hval = NULL;
+    for (int i = 0; i < ri->num_headers; i++) {
+        if (strcasecmp(ri->http_headers[i].name,
+                       "X-Cookbook-Grid-Exclude") == 0) {
+            hval = ri->http_headers[i].value;
+            break;
+        }
+    }
+    if (!hval || !*hval) return NULL;
+
+    size_t cap = strlen(hval) * 3 + 16;
+    char *json = (char *)malloc(cap);
+    if (!json) return NULL;
+    size_t pos = 0;
+    json[pos++] = '{';
+
+    char buf[2048];
+    snprintf(buf, sizeof(buf), "%s", hval);
+    char *saveptr = NULL;
+    char *tok = strtok_r(buf, ",", &saveptr);
+    int first = 1;
+    while (tok) {
+        while (*tok == ' ') tok++;
+        if (!first) json[pos++] = ',';
+        pos += (size_t)snprintf(json + pos, cap - pos,
+            "\"%s\":true", tok);
+        first = 0;
+        tok = strtok_r(NULL, ",", &saveptr);
+    }
+    json[pos++] = '}';
+    json[pos] = '\0';
+    return json;
+}
+
+/* Check grid grant headers for authorization.
+   Returns 1 if allowed, 0 if denied.
+   If no grid grant headers present, returns 1 (open access). */
+static int check_grid_auth(const struct mg_request_info *ri,
+                            const char *group_id, char op) {
+    char *grants = parse_grid_grants_header(ri);
+    if (!grants) return 1; /* no grant headers = open */
+
+    char *exclude = parse_grid_exclude_header(ri);
+    int allowed = cookbook_auth_check(grants, exclude, group_id, op);
+    free(grants);
+    free(exclude);
+    return allowed;
 }
 
 /* ==== #6: triple extraction from archive filename ==== */
@@ -961,9 +1206,17 @@ static int handle_resolve(struct mg_connection *conn, void *cbdata) {
         return 1;
     }
 
+    /* Phase 3: auth enforcement on resolve */
+    cookbook_jwt_claims claims;
+    if (!require_auth_v2(srv, conn, ri, group, 'r', &claims)) {
+        free(path); free(group); free(artifact); free(range_str);
+        return 1;
+    }
+
     cookbook_range range;
     if (cookbook_range_parse(range_str, &range) != 0) {
         send_json(conn, 400, "{\"error\":\"Malformed range string\"}\n");
+        cookbook_jwt_claims_free(&claims);
         free(path); free(group); free(artifact); free(range_str);
         return 1;
     }
@@ -1013,6 +1266,7 @@ static int handle_resolve(struct mg_connection *conn, void *cbdata) {
         if (ctx.count == 0 && srv->grid_enabled &&
             !grid_get_via(ri)) {
             /* this is a client request with no local results — fan out */
+            char *grid_hdrs = build_grid_grant_headers(&claims);
             cookbook_peer *peers = NULL;
             int npeers = cookbook_grid_load_peers(srv->db, &peers);
             for (int pi = 0; pi < npeers && ctx.count == 0; pi++) {
@@ -1026,8 +1280,13 @@ static int handle_resolve(struct mg_connection *conn, void *cbdata) {
                              "?%s", ri->query_string);
                 }
                 cookbook_grid_response gresp;
-                if (cookbook_grid_get(&peers[pi], grid_path,
-                        srv->registry_id, NULL, 0, &gresp) == 0
+                cookbook_grid_sign_ctx sctx = {
+                    srv->registry_id, srv->registry_sk,
+                    srv->has_registry_key
+                };
+                if (cookbook_grid_get_signed(&peers[pi], grid_path,
+                        srv->registry_id, NULL, 0, grid_hdrs,
+                        &sctx, &gresp) == 0
                     && gresp.status == 200 && gresp.body) {
                     /* copy peer response into result_buf */
                     /* find "versions":[ ... ] and extract the array content */
@@ -1052,6 +1311,7 @@ static int handle_resolve(struct mg_connection *conn, void *cbdata) {
                 }
             }
             cookbook_grid_free_peers(peers, npeers);
+            free(grid_hdrs);
         }
 
         METRIC_INC(srv->metrics.responses_2xx);
@@ -1065,6 +1325,7 @@ static int handle_resolve(struct mg_connection *conn, void *cbdata) {
                 "{\"error\":\"Not Acceptable — "
                 "supported: application/x-pasta, "
                 "application/json\"}\n");
+            cookbook_jwt_claims_free(&claims);
             free(path); free(group); free(artifact); free(range_str);
             return 1;
         }
@@ -1088,12 +1349,13 @@ static int handle_resolve(struct mg_connection *conn, void *cbdata) {
                     size_t plen = strlen(pasta_out);
                     mg_printf(conn,
                         "HTTP/1.1 200 OK\r\n"
-                        "Content-Type: application/x-pasta\r\n"
+                        "Content-Type: application/x-pasta; charset=US-ASCII\r\n"
                         "Content-Length: %zu\r\n"
                         "\r\n",
                         plen);
                     mg_write(conn, pasta_out, plen);
                     free(pasta_out);
+                    cookbook_jwt_claims_free(&claims);
                     free(path); free(group); free(artifact);
                     free(range_str);
                     return 1;
@@ -1105,6 +1367,7 @@ static int handle_resolve(struct mg_connection *conn, void *cbdata) {
         send_json(conn, 200, response);
     }
 
+    cookbook_jwt_claims_free(&claims);
     free(path); free(group); free(artifact); free(range_str);
     return 1;
 }
@@ -1174,6 +1437,15 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
                 "{\"error\":\"Invalid group, artifact, or version\"}\n");
             free(path); free(ygroup); free(yartifact); free(yversion);
             return 1;
+        }
+        /* Phase 3: auth enforcement on yank */
+        {
+            cookbook_jwt_claims yclaims;
+            if (!require_auth_v2(srv, conn, ri, ygroup, 'w', &yclaims)) {
+                free(path); free(ygroup); free(yartifact); free(yversion);
+                return 1;
+            }
+            cookbook_jwt_claims_free(&yclaims);
         }
         /* F1: read optional reason from POST body */
         char reason[256] = {0};
@@ -1281,6 +1553,17 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
     }
     char *ver_file = version_str; /* alias for cleanup */
 
+    /* Phase 3: auth enforcement on artifact access */
+    char art_auth_op = 'r'; /* GET */
+    if (strcmp(ri->request_method, "PUT") == 0) art_auth_op = 'c';
+
+    cookbook_jwt_claims art_claims;
+    if (!require_auth_v2(srv, conn, ri, group, art_auth_op, &art_claims)) {
+        free(path); free(group); free(artifact);
+        free(ver_file); free(filename);
+        return 1;
+    }
+
     /* build object store key: registry_id/path */
     size_t key_len = strlen(srv->registry_id) + 1 + strlen(path);
     char *key = malloc(key_len + 1);
@@ -1296,6 +1579,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
             /* G4: grid fan-out on local 404 */
             int grid_handled = 0;
             if (srv->grid_enabled && !grid_get_via(ri)) {
+                char *art_grid_hdrs = build_grid_grant_headers(&art_claims);
                 cookbook_peer *peers = NULL;
                 int npeers = cookbook_grid_load_peers(srv->db, &peers);
                 for (int pi = 0; pi < npeers; pi++) {
@@ -1303,11 +1587,16 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
                     snprintf(grid_path, sizeof(grid_path),
                         "/grid/artifact/%s", path);
 
+                    cookbook_grid_sign_ctx asctx = {
+                        srv->registry_id, srv->registry_sk,
+                        srv->has_registry_key
+                    };
                     if (peers[pi].mode == 'r') {
                         /* redirect mode: HEAD check then 307 */
                         cookbook_grid_response gresp;
-                        if (cookbook_grid_head(&peers[pi], grid_path,
-                                srv->registry_id, NULL, 0, &gresp) == 0
+                        if (cookbook_grid_head_signed(&peers[pi], grid_path,
+                                srv->registry_id, NULL, 0,
+                                art_grid_hdrs, &asctx, &gresp) == 0
                             && gresp.status == 200) {
                             char location[2048];
                             snprintf(location, sizeof(location),
@@ -1327,8 +1616,9 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
                     } else {
                         /* proxy mode: GET and relay */
                         cookbook_grid_response gresp;
-                        if (cookbook_grid_get(&peers[pi], grid_path,
-                                srv->registry_id, NULL, 0, &gresp) == 0
+                        if (cookbook_grid_get_signed(&peers[pi], grid_path,
+                                srv->registry_id, NULL, 0,
+                                art_grid_hdrs, &asctx, &gresp) == 0
                             && gresp.status == 200 && gresp.body) {
                             mg_printf(conn,
                                 "HTTP/1.1 200 OK\r\n"
@@ -1346,6 +1636,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
                     }
                 }
                 cookbook_grid_free_peers(peers, npeers);
+                free(art_grid_hdrs);
             }
             if (!grid_handled)
                 send_json(conn, 404, "{\"error\":\"Not found\"}\n");
@@ -1357,7 +1648,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
             if (strstr(path, ".sha256")) ct = "text/plain";
             else if (strstr(path, ".sig")) ct = "application/octet-stream";
             else if (filename && strcmp(filename, "now.pasta") == 0) {
-                ct = "application/x-pasta";
+                ct = "application/x-pasta; charset=US-ASCII";
                 is_pasta = 1;
             }
             else if (strstr(path, ".tar.gz")) ct = "application/gzip";
@@ -1466,7 +1757,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
                                        (long)plen);
                             mg_printf(conn,
                                 "HTTP/1.1 200 OK\r\n"
-                                "Content-Type: application/x-pasta\r\n"
+                                "Content-Type: application/x-pasta; charset=US-ASCII\r\n"
                                 "Content-Length: %zu\r\n"
                                 "%s"
                                 "\r\n",
@@ -1511,40 +1802,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
             return 1;
         }
 
-        /* #10: JWT validation on PUT (if registry key is configured) */
-        if (srv->has_registry_key) {
-            cookbook_jwt_claims claims;
-            if (extract_bearer_jwt(srv, ri, &claims) != 0) {
-                METRIC_INC(srv->metrics.responses_4xx);
-                METRIC_INC(srv->metrics.auth_failures);
-                send_json(conn, 401,
-                    "{\"error\":\"Valid Bearer JWT required\"}\n");
-                free(key); free(path); free(group); free(artifact);
-                free(ver_file); free(filename);
-                return 1;
-            }
-
-            /* #11: group claim checking */
-            if (!cookbook_jwt_has_group(&claims, group)) {
-                METRIC_INC(srv->metrics.responses_4xx);
-                METRIC_INC(srv->metrics.auth_failures);
-                send_json(conn, 403,
-                    "{\"error\":\"JWT does not authorize this group\"}\n");
-                free(key); free(path); free(group); free(artifact);
-                free(ver_file); free(filename);
-                return 1;
-            }
-
-            /* #28: rate limiting per JWT sub */
-            if (check_rate_limit(srv, claims.sub)) {
-                METRIC_INC(srv->metrics.responses_4xx);
-                send_json(conn, 429,
-                    "{\"error\":\"Rate limit exceeded\"}\n");
-                free(key); free(path); free(group); free(artifact);
-                free(ver_file); free(filename);
-                return 1;
-            }
-        }
+        /* auth already checked by require_auth_v2 above */
 
         /* immutability check */
         if (srv->store->exists(srv->store, key) == COOKBOOK_STORE_OK) {
@@ -1771,6 +2029,7 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
         send_json(conn, 405, "{\"error\":\"Method not allowed\"}\n");
     }
 
+    cookbook_jwt_claims_free(&art_claims);
     free(key);
     free(path);
     free(group);
@@ -1992,6 +2251,97 @@ static int handle_auth_token(struct mg_connection *conn, void *cbdata) {
     return 1;
 }
 
+/* ==== Token revocation: POST /auth/revoke ==== */
+
+static int handle_auth_revoke(struct mg_connection *conn, void *cbdata) {
+    cookbook_server *srv = (cookbook_server *)cbdata;
+    const struct mg_request_info *ri = mg_get_request_info(conn);
+
+    METRIC_INC(srv->metrics.requests_total);
+    METRIC_INC(srv->metrics.requests_post);
+
+    if (strcmp(ri->request_method, "POST") != 0) {
+        METRIC_INC(srv->metrics.responses_4xx);
+        send_json(conn, 405, "{\"error\":\"Method not allowed\"}\n");
+        return 1;
+    }
+
+    if (!srv->has_registry_key) {
+        send_json(conn, 503,
+            "{\"error\":\"Auth not configured\"}\n");
+        return 1;
+    }
+
+    /* read body: {"token":"eyJ..."} */
+    size_t body_len = 0;
+    char *body = read_body(conn, ri, &body_len, 16384);
+    if (!body || body_len == 0) {
+        send_json(conn, 400,
+            "{\"error\":\"Body required with 'token' field\"}\n");
+        free(body);
+        return 1;
+    }
+
+    /* extract token from body */
+    const char *tp = strstr(body, "\"token\":\"");
+    if (!tp) {
+        free(body);
+        METRIC_INC(srv->metrics.responses_4xx);
+        send_json(conn, 400,
+            "{\"error\":\"Missing 'token' field\"}\n");
+        return 1;
+    }
+    tp += 9;
+    const char *tend = strchr(tp, '"');
+    if (!tend) {
+        free(body);
+        METRIC_INC(srv->metrics.responses_4xx);
+        send_json(conn, 400, "{\"error\":\"Malformed token field\"}\n");
+        return 1;
+    }
+    size_t tlen = (size_t)(tend - tp);
+    char *token_str = (char *)malloc(tlen + 1);
+    if (!token_str) { free(body); return 1; }
+    memcpy(token_str, tp, tlen);
+    token_str[tlen] = '\0';
+    free(body);
+
+    /* verify the token first (must be a valid JWT) */
+    cookbook_jwt_claims claims;
+    if (cookbook_jwt_verify(token_str, srv->registry_pk, &claims) != 0) {
+        free(token_str);
+        METRIC_INC(srv->metrics.responses_4xx);
+        send_json(conn, 401,
+            "{\"error\":\"Invalid or expired token\"}\n");
+        return 1;
+    }
+    free(token_str);
+
+    if (!claims.jti[0]) {
+        cookbook_jwt_claims_free(&claims);
+        METRIC_INC(srv->metrics.responses_4xx);
+        send_json(conn, 400,
+            "{\"error\":\"Token has no jti claim (pre-revocation era)\"}\n");
+        return 1;
+    }
+
+    /* add to revocation list */
+    int rc = cookbook_revocation_add(&srv->revocations,
+                                      claims.jti, claims.exp);
+    cookbook_jwt_claims_free(&claims);
+
+    if (rc != 0) {
+        send_json(conn, 507,
+            "{\"error\":\"Revocation list full\"}\n");
+        return 1;
+    }
+
+    METRIC_INC(srv->metrics.responses_2xx);
+    send_json(conn, 200,
+        "{\"status\":\"revoked\"}\n");
+    return 1;
+}
+
 /* ==== #12/#13: route: POST /keys, POST /keys/{id}/revoke ==== */
 
 static int handle_keys(struct mg_connection *conn, void *cbdata) {
@@ -2080,6 +2430,15 @@ static int handle_keys(struct mg_connection *conn, void *cbdata) {
         send_json(conn, 400,
             "{\"error\":\"Missing key_id, group_id, or public_key\"}\n");
         return 1;
+    }
+
+    /* Phase 3: auth enforcement on key registration */
+    {
+        cookbook_jwt_claims kclaims;
+        if (!require_auth_v2(srv, conn, ri, group_id, 'c', &kclaims)) {
+            return 1;
+        }
+        cookbook_jwt_claims_free(&kclaims);
     }
 
     char now[64];
@@ -2182,6 +2541,8 @@ typedef struct {
     size_t cap;
     int    count;
     const char *registry_id;
+    const char *grants_json;   /* v2 visibility filter (NULL = no filtering) */
+    const char *exclude_json;  /* v2 exclude filter (NULL = no filtering) */
 } mirror_ctx;
 
 static int mirror_collect_cb(const cookbook_db_row *row, void *user) {
@@ -2192,6 +2553,13 @@ static int mirror_collect_cb(const cookbook_db_row *row, void *user) {
     const char *ver = row->values[2];
 
     if (!grp || !art || !ver) return 0;
+
+    /* Phase 3: visibility filtering */
+    if (ctx->grants_json) {
+        if (!cookbook_auth_check(ctx->grants_json, ctx->exclude_json,
+                                grp, 'r'))
+            return 0; /* skip — not visible to this user */
+    }
 
     /* convert group dots to slashes for store path */
     char grp_path[256];
@@ -2231,6 +2599,19 @@ static int handle_mirror_manifest(struct mg_connection *conn, void *cbdata) {
         return 1;
     }
 
+    /* Phase 3: auth enforcement on mirror manifest */
+    cookbook_jwt_claims mirror_claims;
+    memset(&mirror_claims, 0, sizeof(mirror_claims));
+    if (srv->has_registry_key) {
+        if (extract_bearer_jwt(srv, ri, &mirror_claims) != 0) {
+            METRIC_INC(srv->metrics.responses_4xx);
+            METRIC_INC(srv->metrics.auth_failures);
+            send_json(conn, 401,
+                "{\"error\":\"Valid Bearer JWT required\"}\n");
+            return 1;
+        }
+    }
+
     /* parse ?coords=group:artifact:range,group:artifact:range,... */
     const char *coords_param = NULL;
     if (ri->query_string)
@@ -2245,7 +2626,9 @@ static int handle_mirror_manifest(struct mg_connection *conn, void *cbdata) {
 
         char result_buf[65536] = {0};
         mirror_ctx ctx = { result_buf, 0, sizeof(result_buf), 0,
-                           srv->registry_id };
+                           srv->registry_id,
+                           mirror_claims.grants_json,
+                           mirror_claims.exclude_json };
 
         cookbook_db_status st = srv->db->query(srv->db, sql,
                                                mirror_collect_cb, &ctx);
@@ -2266,8 +2649,13 @@ static int handle_mirror_manifest(struct mg_connection *conn, void *cbdata) {
             int npeers = cookbook_grid_load_peers(srv->db, &peers);
             for (int pi = 0; pi < npeers; pi++) {
                 cookbook_grid_response gresp;
-                if (cookbook_grid_get(&peers[pi], "/grid/manifest",
-                        srv->registry_id, NULL, 0, &gresp) == 0
+                cookbook_grid_sign_ctx msctx = {
+                    srv->registry_id, srv->registry_sk,
+                    srv->has_registry_key
+                };
+                if (cookbook_grid_get_signed(&peers[pi], "/grid/manifest",
+                        srv->registry_id, NULL, 0, NULL,
+                        &msctx, &gresp) == 0
                     && gresp.status == 200 && gresp.body) {
                     /* extract "artifacts":[ ... ] from peer response */
                     const char *as = strstr(gresp.body, "\"artifacts\":[");
@@ -2310,6 +2698,7 @@ static int handle_mirror_manifest(struct mg_connection *conn, void *cbdata) {
             "\r\n"
             "%s", rlen, response);
         free(response);
+        cookbook_jwt_claims_free(&mirror_claims);
         return 1;
     }
 
@@ -2323,7 +2712,9 @@ static int handle_mirror_manifest(struct mg_connection *conn, void *cbdata) {
 
     char result_buf[65536] = {0};
     mirror_ctx ctx = { result_buf, 0, sizeof(result_buf), 0,
-                       srv->registry_id };
+                       srv->registry_id,
+                       mirror_claims.grants_json,
+                       mirror_claims.exclude_json };
 
     /* split on comma, each entry is "group:artifact" or "group:artifact:version" */
     char *saveptr = NULL;
@@ -2383,6 +2774,7 @@ static int handle_mirror_manifest(struct mg_connection *conn, void *cbdata) {
     if (!response) {
         METRIC_INC(srv->metrics.responses_5xx);
         send_json(conn, 500, "{\"error\":\"Out of memory\"}\n");
+        cookbook_jwt_claims_free(&mirror_claims);
         return 1;
     }
     int rlen = sprintf(response,
@@ -2397,6 +2789,7 @@ static int handle_mirror_manifest(struct mg_connection *conn, void *cbdata) {
         "\r\n"
         "%s", rlen, response);
     free(response);
+    cookbook_jwt_claims_free(&mirror_claims);
     return 1;
 }
 
@@ -2421,6 +2814,67 @@ static const char *grid_get_via(const struct mg_request_info *ri) {
     return NULL;
 }
 
+/* ==== grid peer auth verification ==== */
+
+static const char *grid_get_header(const struct mg_request_info *ri,
+                                     const char *name) {
+    for (int i = 0; i < ri->num_headers; i++) {
+        if (strcasecmp(ri->http_headers[i].name, name) == 0)
+            return ri->http_headers[i].value;
+    }
+    return NULL;
+}
+
+/* Verify inbound grid peer signature. Returns 1 if OK, 0 if rejected.
+   When grid_peer_auth is 0, unsigned requests are accepted. */
+static int verify_grid_peer_sig(cookbook_server *srv,
+                                  const struct mg_request_info *ri) {
+    const char *origin = grid_get_header(ri, "X-Cookbook-Grid-Origin");
+    const char *sig_b64 = grid_get_header(ri, "X-Cookbook-Grid-Signature");
+    const char *ts_str = grid_get_header(ri, "X-Cookbook-Timestamp");
+
+    /* No signature headers — accept if auth not required */
+    if (!sig_b64 || !origin || !ts_str) {
+        return srv->grid_peer_auth ? 0 : 1;
+    }
+
+    /* Check timestamp freshness (5-minute window) */
+    int64_t ts = strtoll(ts_str, NULL, 10);
+    int64_t now = (int64_t)time(NULL);
+    int64_t diff = now - ts;
+    if (diff < 0) diff = -diff;
+    if (diff > 300) return 0;
+
+    /* Look up peer's public key */
+    unsigned char peer_pk[32];
+    if (cookbook_grid_load_peer_key(srv->db, origin, peer_pk) != 0)
+        return 0;
+
+    /* Decode signature */
+    unsigned char sig[64];
+    size_t sig_len = cookbook_base64url_decode(sig_b64, strlen(sig_b64),
+                                                sig, sizeof(sig));
+    if (sig_len != 64) return 0;
+
+    /* Reconstruct canonical signing input */
+    const char *via = grid_get_via(ri);
+    int hop_count = grid_get_hop_count(ri);
+    const char *grants = grid_get_header(ri, "X-Cookbook-Grid-Grants");
+    const char *exclude = grid_get_header(ri, "X-Cookbook-Grid-Exclude");
+
+    size_t canon_len = 0;
+    char *canonical = cookbook_grid_build_canonical(
+        ri->request_method, ri->local_uri,
+        via, hop_count,
+        grants, exclude,
+        ts, &canon_len);
+    if (!canonical) return 0;
+
+    int ok = (cookbook_ed25519_verify(sig, canonical, canon_len, peer_pk) == 0);
+    free(canonical);
+    return ok;
+}
+
 /* ==== route: /grid/resolve/ (internal, local-only) ==== */
 
 static int handle_grid_resolve(struct mg_connection *conn, void *cbdata) {
@@ -2443,6 +2897,10 @@ static int handle_grid_resolve(struct mg_connection *conn, void *cbdata) {
         send_json(conn, 508, "{\"error\":\"Grid loop detected\"}\n");
         return 1;
     }
+    if (!verify_grid_peer_sig(srv, ri)) {
+        send_json(conn, 401, "{\"error\":\"Invalid grid peer signature\"}\n");
+        return 1;
+    }
 
     /* reuse resolve logic but path is /grid/resolve/... */
     char *path = path_after(ri->local_uri, "/grid/resolve/");
@@ -2454,6 +2912,14 @@ static int handle_grid_resolve(struct mg_connection *conn, void *cbdata) {
     char *group = NULL, *artifact = NULL, *range_str = NULL;
     if (split_coord(path, &group, &artifact, &range_str) != 0 || !range_str) {
         send_json(conn, 400, "{\"error\":\"Malformed path\"}\n");
+        free(path); free(group); free(artifact); free(range_str);
+        return 1;
+    }
+
+    /* Phase 3: grid grant enforcement */
+    if (!check_grid_auth(ri, group, 'r')) {
+        send_json(conn, 403,
+            "{\"error\":\"Grid grants deny access to this group\"}\n");
         free(path); free(group); free(artifact); free(range_str);
         return 1;
     }
@@ -2527,11 +2993,46 @@ static int handle_grid_artifact(struct mg_connection *conn, void *cbdata) {
         send_json(conn, 508, "{\"error\":\"Grid loop detected\"}\n");
         return 1;
     }
+    if (!verify_grid_peer_sig(srv, ri)) {
+        send_json(conn, 401, "{\"error\":\"Invalid grid peer signature\"}\n");
+        return 1;
+    }
 
     char *path = path_after(ri->local_uri, "/grid/artifact/");
     if (!path) {
         send_json(conn, 400, "{\"error\":\"Bad request\"}\n");
         return 1;
+    }
+
+    /* Phase 3: extract group from artifact path for grid grant check.
+       Path format: {group_path}/{artifact}/{version}/{filename}
+       Peel off last 3 segments to get group_path, convert slashes to dots. */
+    {
+        const char *s3 = strrchr(path, '/');
+        if (s3 && s3 > path) {
+            const char *s2 = s3 - 1;
+            while (s2 > path && *s2 != '/') s2--;
+            if (*s2 == '/') {
+                const char *s1 = s2 - 1;
+                while (s1 > path && *s1 != '/') s1--;
+                if (*s1 == '/') {
+                    size_t grp_len = (size_t)(s1 - path);
+                    char grid_group[256] = {0};
+                    if (grp_len < sizeof(grid_group)) {
+                        memcpy(grid_group, path, grp_len);
+                        grid_group[grp_len] = '\0';
+                        for (size_t gi = 0; gi < grp_len; gi++)
+                            if (grid_group[gi] == '/') grid_group[gi] = '.';
+                        if (!check_grid_auth(ri, grid_group, 'r')) {
+                            send_json(conn, 403,
+                                "{\"error\":\"Grid grants deny access\"}\n");
+                            free(path);
+                            return 1;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     if (strcmp(ri->request_method, "HEAD") == 0) {
@@ -2590,6 +3091,12 @@ static int handle_grid_artifact(struct mg_connection *conn, void *cbdata) {
 /* ==== route: /grid/manifest (internal, local-only) ==== */
 
 static int handle_grid_manifest(struct mg_connection *conn, void *cbdata) {
+    cookbook_server *srv = (cookbook_server *)cbdata;
+    const struct mg_request_info *ri = mg_get_request_info(conn);
+    if (!verify_grid_peer_sig(srv, ri)) {
+        send_json(conn, 401, "{\"error\":\"Invalid grid peer signature\"}\n");
+        return 1;
+    }
     /* delegates to existing mirror manifest logic (local-only) */
     return handle_mirror_manifest(conn, cbdata);
 }
@@ -2611,12 +3118,26 @@ static int handle_admin_peers(struct mg_connection *conn, void *cbdata) {
         for (int i = 0; i < n; i++) {
             if (i > 0)
                 pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, ",");
-            pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
-                "{\"peer_id\":\"%s\",\"name\":\"%s\",\"url\":\"%s\","
-                "\"mode\":\"%s\",\"priority\":%d}",
-                peers[i].peer_id, peers[i].name, peers[i].url,
-                peers[i].mode == 'p' ? "proxy" : "redirect",
-                peers[i].priority);
+            if (peers[i].has_public_key) {
+                char pk_hex[65];
+                for (int b = 0; b < 32; b++)
+                    snprintf(pk_hex + b * 2, 3, "%02x",
+                              peers[i].public_key[b]);
+                pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
+                    "{\"peer_id\":\"%s\",\"name\":\"%s\",\"url\":\"%s\","
+                    "\"mode\":\"%s\",\"priority\":%d,"
+                    "\"public_key\":\"%s\"}",
+                    peers[i].peer_id, peers[i].name, peers[i].url,
+                    peers[i].mode == 'p' ? "proxy" : "redirect",
+                    peers[i].priority, pk_hex);
+            } else {
+                pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
+                    "{\"peer_id\":\"%s\",\"name\":\"%s\",\"url\":\"%s\","
+                    "\"mode\":\"%s\",\"priority\":%d}",
+                    peers[i].peer_id, peers[i].name, peers[i].url,
+                    peers[i].mode == 'p' ? "proxy" : "redirect",
+                    peers[i].priority);
+            }
         }
         pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, "]}\n");
 
@@ -2656,10 +3177,12 @@ static int handle_admin_peers(struct mg_connection *conn, void *cbdata) {
             } \
         } while(0)
 
+        char public_key[128] = {0};
         GRID_PARSE_STR(peer_id, "peer_id", sizeof(peer_id));
         GRID_PARSE_STR(name, "name", sizeof(name));
         GRID_PARSE_STR(url, "url", sizeof(url));
         GRID_PARSE_STR(mode, "mode", sizeof(mode));
+        GRID_PARSE_STR(public_key, "public_key", sizeof(public_key));
         #undef GRID_PARSE_STR
 
         /* parse priority */
@@ -2677,19 +3200,41 @@ static int handle_admin_peers(struct mg_connection *conn, void *cbdata) {
         char mode_char = (strcmp(mode, "proxy") == 0) ? 'p' : 'r';
         const char *mode_str = mode_char == 'p' ? "proxy" : "redirect";
 
+        /* validate public_key if provided: must be exactly 64 hex chars */
+        const char *pk_sql = NULL;
+        if (public_key[0]) {
+            if (strlen(public_key) != 64) {
+                send_json(conn, 400,
+                    "{\"error\":\"public_key must be 64 hex characters\"}\n");
+                return 1;
+            }
+            for (size_t k = 0; k < 64; k++) {
+                char c = public_key[k];
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                      (c >= 'A' && c <= 'F'))) {
+                    send_json(conn, 400,
+                        "{\"error\":\"public_key contains non-hex chars\"}\n");
+                    return 1;
+                }
+            }
+            pk_sql = public_key;
+        }
+
         cookbook_db_param pp2[] = {
             COOKBOOK_P_TEXT(peer_id),
             COOKBOOK_P_TEXT(name),
             COOKBOOK_P_TEXT(url),
             COOKBOOK_P_TEXT(mode_str),
-            COOKBOOK_P_INT(priority)
+            COOKBOOK_P_INT(priority),
+            pk_sql ? (cookbook_db_param)COOKBOOK_P_TEXT(pk_sql)
+                   : (cookbook_db_param)COOKBOOK_P_NULL()
         };
         /* upsert: try insert, on conflict update */
         cookbook_db_status st = srv->db->exec_p(srv->db,
             "INSERT OR REPLACE INTO peers "
-            "(peer_id, name, url, mode, priority, enabled, added_at) "
-            "VALUES (?1, ?2, ?3, ?4, ?5, 1, datetime('now'))",
-            pp2, 5);
+            "(peer_id, name, url, mode, priority, enabled, public_key, added_at) "
+            "VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, datetime('now'))",
+            pp2, 6);
 
         if (st != COOKBOOK_DB_OK) {
             send_json(conn, 500, "{\"error\":\"Database error\"}\n");
@@ -2747,6 +3292,222 @@ static int policy_list_cb(const cookbook_db_row *row, void *user) {
     return 0;
 }
 
+/* ==== Credential management: /admin/credentials ==== */
+
+/* callback for listing credentials */
+typedef struct {
+    char *buf;
+    size_t pos;
+    size_t cap;
+    int count;
+} cred_list_ctx;
+
+static int cred_list_cb(const cookbook_db_row *row, void *user) {
+    cred_list_ctx *ctx = (cred_list_ctx *)user;
+    if (row->ncols < 4 || !row->values[0]) return 0;
+
+    /* subject, groups, created_at, revoked_at */
+    const char *subject = row->values[0] ? row->values[0] : "";
+    const char *groups = row->values[1] ? row->values[1] : "";
+    const char *created = row->values[2] ? row->values[2] : "";
+    int revoked = row->values[3] != NULL;
+
+    if (ctx->count > 0 && ctx->pos < ctx->cap)
+        ctx->buf[ctx->pos++] = ',';
+
+    int n = snprintf(ctx->buf + ctx->pos, ctx->cap - ctx->pos,
+        "{\"subject\":\"%s\",\"groups\":\"%s\",\"created_at\":\"%s\"%s}",
+        subject, groups, created,
+        revoked ? ",\"revoked\":true" : "");
+    if (n > 0) ctx->pos += (size_t)n;
+    ctx->count++;
+    return 0;
+}
+
+static int handle_admin_credentials(struct mg_connection *conn, void *cbdata) {
+    cookbook_server *srv = (cookbook_server *)cbdata;
+    const struct mg_request_info *ri = mg_get_request_info(conn);
+
+    METRIC_INC(srv->metrics.requests_total);
+
+    /* extract sub-path: /admin/credentials or /admin/credentials/{subject}
+       or /admin/credentials/{subject}/revoke */
+    const char *uri = ri->local_uri;
+    const char *path = uri + strlen("/admin/credentials");
+    char subject[128] = {0};
+    int is_revoke = 0;
+
+    if (path[0] == '/' && path[1]) {
+        const char *start = path + 1;
+        /* check for /revoke suffix */
+        const char *revoke_suf = strstr(start, "/revoke");
+        if (revoke_suf) {
+            size_t slen = (size_t)(revoke_suf - start);
+            if (slen >= sizeof(subject)) slen = sizeof(subject) - 1;
+            memcpy(subject, start, slen);
+            subject[slen] = '\0';
+            is_revoke = 1;
+        } else {
+            size_t slen = strlen(start);
+            if (slen >= sizeof(subject)) slen = sizeof(subject) - 1;
+            memcpy(subject, start, slen);
+            subject[slen] = '\0';
+        }
+    }
+
+    if (strcmp(ri->request_method, "GET") == 0) {
+        /* list all credentials (no password hashes) */
+        char buf[8192];
+        size_t pos = 0;
+        pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
+            "{\"credentials\":[");
+
+        cred_list_ctx ctx = { buf, pos, sizeof(buf), 0 };
+        srv->db->query(srv->db,
+            "SELECT subject, groups, created_at, revoked_at "
+            "FROM credentials ORDER BY subject",
+            cred_list_cb, &ctx);
+        pos = ctx.pos;
+
+        pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, "]}\n");
+        METRIC_INC(srv->metrics.responses_2xx);
+        send_json(conn, 200, buf);
+        return 1;
+    }
+
+    if (strcmp(ri->request_method, "POST") == 0 && is_revoke && subject[0]) {
+        /* POST /admin/credentials/{subject}/revoke */
+        cookbook_db_param rp[] = { COOKBOOK_P_TEXT(subject) };
+        int rc = srv->db->exec_p(srv->db,
+            "UPDATE credentials SET revoked_at = datetime('now') "
+            "WHERE subject = ?1 AND revoked_at IS NULL",
+            rp, 1);
+        if (rc == COOKBOOK_DB_OK) {
+            METRIC_INC(srv->metrics.responses_2xx);
+            send_json(conn, 200, "{\"status\":\"revoked\"}\n");
+        } else {
+            send_json(conn, 500,
+                "{\"error\":\"Failed to revoke credential\"}\n");
+        }
+        return 1;
+    }
+
+    if (strcmp(ri->request_method, "PUT") == 0) {
+        /* PUT /admin/credentials — create/update credential
+           Body: {"subject":"alice","token":"secret123","groups":"admin,publish"} */
+        size_t body_len = 0;
+        char *body = read_body(conn, ri, &body_len, 4096);
+        if (!body || body_len == 0) {
+            free(body);
+            METRIC_INC(srv->metrics.responses_4xx);
+            send_json(conn, 400,
+                "{\"error\":\"Body required\"}\n");
+            return 1;
+        }
+
+        char cred_sub[128] = {0}, token[512] = {0}, groups[1024] = {0};
+
+        /* parse subject */
+        const char *sp = strstr(body, "\"subject\":\"");
+        if (sp) {
+            sp += 11;
+            const char *se = strchr(sp, '"');
+            if (se) {
+                size_t len = (size_t)(se - sp);
+                if (len >= sizeof(cred_sub)) len = sizeof(cred_sub) - 1;
+                memcpy(cred_sub, sp, len);
+            }
+        }
+
+        /* parse token */
+        const char *tp = strstr(body, "\"token\":\"");
+        if (tp) {
+            tp += 9;
+            const char *te = strchr(tp, '"');
+            if (te) {
+                size_t len = (size_t)(te - tp);
+                if (len >= sizeof(token)) len = sizeof(token) - 1;
+                memcpy(token, tp, len);
+            }
+        }
+
+        /* parse groups */
+        const char *gp = strstr(body, "\"groups\":\"");
+        if (gp) {
+            gp += 10;
+            const char *ge = strchr(gp, '"');
+            if (ge) {
+                size_t len = (size_t)(ge - gp);
+                if (len >= sizeof(groups)) len = sizeof(groups) - 1;
+                memcpy(groups, gp, len);
+            }
+        }
+
+        free(body);
+
+        if (!cred_sub[0] || !token[0] || !groups[0]) {
+            METRIC_INC(srv->metrics.responses_4xx);
+            send_json(conn, 400,
+                "{\"error\":\"subject, token, and groups required\"}\n");
+            return 1;
+        }
+
+        /* hash the token with Argon2id */
+        char *hash = cookbook_credential_hash(token);
+        if (!hash) {
+            send_json(conn, 500,
+                "{\"error\":\"Failed to hash credential\"}\n");
+            return 1;
+        }
+
+        /* insert or update */
+        cookbook_db_param ip[] = {
+            COOKBOOK_P_TEXT(cred_sub),
+            COOKBOOK_P_TEXT(hash),
+            COOKBOOK_P_TEXT(groups)
+        };
+        int rc = srv->db->exec_p(srv->db,
+            "INSERT OR REPLACE INTO credentials "
+            "(subject, token_hash, groups, created_at, revoked_at) "
+            "VALUES (?1, ?2, ?3, datetime('now'), NULL)",
+            ip, 3);
+        free(hash);
+
+        if (rc == COOKBOOK_DB_OK) {
+            METRIC_INC(srv->metrics.responses_2xx);
+            char resp[256];
+            snprintf(resp, sizeof(resp),
+                "{\"status\":\"created\",\"subject\":\"%s\"}\n",
+                cred_sub);
+            send_json(conn, 201, resp);
+        } else {
+            send_json(conn, 500,
+                "{\"error\":\"Failed to store credential\"}\n");
+        }
+        return 1;
+    }
+
+    if (strcmp(ri->request_method, "DELETE") == 0 && subject[0]) {
+        /* DELETE /admin/credentials/{subject} — hard delete */
+        cookbook_db_param dp[] = { COOKBOOK_P_TEXT(subject) };
+        int rc = srv->db->exec_p(srv->db,
+            "DELETE FROM credentials WHERE subject = ?1",
+            dp, 1);
+        if (rc == COOKBOOK_DB_OK) {
+            METRIC_INC(srv->metrics.responses_2xx);
+            send_json(conn, 200, "{\"status\":\"deleted\"}\n");
+        } else {
+            send_json(conn, 500,
+                "{\"error\":\"Failed to delete credential\"}\n");
+        }
+        return 1;
+    }
+
+    METRIC_INC(srv->metrics.responses_4xx);
+    send_json(conn, 405, "{\"error\":\"Method not allowed\"}\n");
+    return 1;
+}
+
 static int handle_admin_policies(struct mg_connection *conn, void *cbdata) {
     cookbook_server *srv = (cookbook_server *)cbdata;
     const struct mg_request_info *ri = mg_get_request_info(conn);
@@ -2788,7 +3549,7 @@ static int handle_admin_policies(struct mg_connection *conn, void *cbdata) {
             size_t plen = strlen(pastlet);
             mg_printf(conn,
                 "HTTP/1.1 200 OK\r\n"
-                "Content-Type: application/x-pasta\r\n"
+                "Content-Type: application/x-pasta; charset=US-ASCII\r\n"
                 "Content-Length: %zu\r\n"
                 "\r\n"
                 "%s", plen, pastlet);
@@ -2915,6 +3676,10 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
     srv->grid_max_hops = opts->grid_max_hops > 0
         ? opts->grid_max_hops
         : COOKBOOK_GRID_MAX_HOPS_DEFAULT;
+    srv->grid_peer_auth = opts->grid_peer_auth;
+
+    /* initialize token revocation list (max 4096 entries) */
+    cookbook_revocation_init(&srv->revocations, 4096);
 
     /* initialize rate limiter lock */
 #ifdef _WIN32
@@ -2957,6 +3722,7 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
     mg_set_request_handler(srv->ctx, "/.well-known/now-registry-key",
                            handle_registry_key, srv);
     mg_set_request_handler(srv->ctx, "/auth/token", handle_auth_token, srv);
+    mg_set_request_handler(srv->ctx, "/auth/revoke", handle_auth_revoke, srv);
     mg_set_request_handler(srv->ctx, "/keys", handle_keys, srv);
     mg_set_request_handler(srv->ctx, "/metrics", handle_metrics, srv);
     mg_set_request_handler(srv->ctx, "/mirror/manifest", handle_mirror_manifest, srv);
@@ -2974,6 +3740,10 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
         mg_set_request_handler(srv->ctx, "/admin/peers",
                                handle_admin_peers, srv);
     }
+
+    /* credential management endpoints */
+    mg_set_request_handler(srv->ctx, "/admin/credentials",
+                           handle_admin_credentials, srv);
 
     /* auth v2: policy admin endpoints */
     mg_set_request_handler(srv->ctx, "/admin/policies",
@@ -3032,6 +3802,9 @@ void cookbook_server_stop(cookbook_server *srv) {
 #endif
 
     if (srv->ctx) mg_stop(srv->ctx);
+
+    /* clean up revocation list */
+    cookbook_revocation_free(&srv->revocations);
 
     /* clean up rate limit buckets */
     rate_bucket *b = srv->rate_buckets;

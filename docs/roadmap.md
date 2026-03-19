@@ -1,6 +1,6 @@
 # cookbook — M1 Roadmap
 
-**Status as of**: Cookbook #0001 — Initial Check-in
+**Status as of**: 2026-03-19
 **Spec reference**: cookbook-architecture-M1.docx (d3 final)
 
 ---
@@ -25,10 +25,13 @@
 
 | Dependency | Version | License | Purpose |
 |------------|---------|---------|---------|
-| libpasta | git submodule | MIT | Pasta parsing (now.pasta descriptors) |
+| libbasta | Basta #2 (git submodule) | MIT | Pasta superset — text + binary blobs. Replaces libpasta (compat header at `src/main/h/pasta.h`) |
+| alforno | Alforno #4 (git submodule) | MIT | Config merging — merge:"collect", conflate, scatter/gather. Built with `ALF_USE_BASTA` |
 | SQLite | 3.49.1 | Public domain | Dev/CI metadata backend |
 | civetweb | 1.16 | MIT | HTTP server |
-| libsodium | 1.0.21 | ISC | Ed25519 signing, JWT, HMAC-SHA256 |
+| libsodium | 1.0.21 | ISC | Argon2id credential hashing, HMAC-SHA256 for S3 Sig V4 |
+
+*Note: Ed25519 signing uses a native implementation (RFC 8032) — libsodium is no longer used for Ed25519.*
 
 ## Optional dependencies (system-provided)
 
@@ -36,138 +39,69 @@
 |------------|---------|---------|--------|
 | libpq | PostgreSQL License | PostgreSQL metadata backend | Optional; stub when absent |
 
-*Note: S3 support was implemented without libcurl — uses raw sockets + libsodium HMAC-SHA256 for AWS Signature V4.*
+*Note: S3 support uses raw sockets + libsodium HMAC-SHA256 for AWS Signature V4 (no libcurl).*
 
 ---
 
-## Gaps — by spec section
+## All M1 spec gaps — RESOLVED
 
-### §3 HTTP API
-
-| # | Gap | Spec ref | Difficulty | Blocked by |
-|---|-----|----------|------------|------------|
-| 1 | `POST /artifact/.../yank` | §3.4 | Easy | — |
-| 2 | `GET /readyz` (DB + store health) | §10.2 | Easy | — |
-| 3 | `GET /metrics` (Prometheus) | §10.2 | Medium | — |
-| 4 | Snapshot policy (exclude from resolve unless `snapshot: true`) | §6.3 | Easy | — |
-| 5 | `X-Now-Yanked: true` header on yanked artifact GET | §3.4 | Easy | — |
-| 6 | Triple-specific metadata from archive filenames | §3.3 | Medium | — |
-| 7 | Max upload size enforcement (`COOKBOOK_MAX_ARTIFACT_MB`) | §10.1 | Easy | — |
-| 8 | `Accept: application/x-pasta` content negotiation | §8.3 | Medium | now spec §23 |
-
-### §5 Authentication and Authorization
-
-| # | Gap | Spec ref | Difficulty | Blocked by |
-|---|-----|----------|------------|------------|
-| 9 | `POST /auth/token` — JWT exchange | §5.1 | Medium | libsodium |
-| 10 | Bearer JWT validation on PUT | §5.1 | Medium | libsodium |
-| 11 | Group claim checking (JWT `groups` vs artifact group) | §5.2 | Easy | #10 |
-| 12 | `POST /keys` — publisher key registration | §5.3 | Easy | — |
-| 13 | `POST /keys/{id}/revoke` | §5.3 | Easy | — |
-
-### §7 Signing and Integrity
-
-| # | Gap | Spec ref | Difficulty | Blocked by |
-|---|-----|----------|------------|------------|
-| 14 | SHA-256 compute on ingest + cross-check | §7.1 | Easy | — |
-| 15 | `.sig` verification against publisher Ed25519 key | §7.2 | Medium | libsodium |
-| 16 | Registry countersign | §7.3 | Medium | libsodium |
-| 17 | `GET /.well-known/now-registry-key` | §7.3 | Easy | — |
-| 18 | `now.pasta.sha256` generation | §7.1 | Easy | — |
-
-### §4 Data Model
-
-| # | Gap | Spec ref | Difficulty | Blocked by |
-|---|-----|----------|------------|------------|
-| 19 | Two-phase write (pending → published) | §4.2 | Medium | — |
-| 20 | Reconciliation job for stale pending rows | §4.2 | Medium | #19 |
-| 21 | PostgreSQL backend | §4.1 | Medium | libpq |
-| 22 | S3 object store backend | §4.2 | Medium | libcurl, libsodium (Sig V4) |
-
-### §8 Descriptor Validation
-
-| # | Gap | Spec ref | Difficulty | Blocked by |
-|---|-----|----------|------------|------------|
-| 23 | Installed descriptor stripping (remove build-only fields) | §8.2 | Medium | — |
-| 24 | Field validation (lowercase artifact, valid semver, output.type enum) | §8.1 | Easy | — |
-
-### §9 Offline and Mirror
-
-| # | Gap | Spec ref | Difficulty | Blocked by |
-|---|-----|----------|------------|------------|
-| 25 | `GET /mirror/manifest?coords=...` | §9.1 | Medium | — |
-
-### Air-gap Addendum
-
-| # | Gap | Spec ref | Difficulty | Blocked by |
-|---|-----|----------|------------|------------|
-| 26 | `cookbook-import` CLI tool | §A.4 | Medium | — |
-
-### Security
-
-| # | Gap | Notes | Difficulty | Blocked by |
-|---|-----|-------|------------|------------|
-| 27 | SQL injection prevention | Switch to parameterized queries (sqlite3_prepare_v2) | Medium | — |
-| 28 | Rate limiting | Per JWT-sub | Medium | #10 |
-| 29 | Input validation | Group/artifact length limits, path traversal checks | Easy | — |
+All 29 original gaps from the M1 spec are implemented and tested.
 
 ---
 
-## Recommended implementation order
+## Implementation phases — all complete
 
-### Phase A — Correctness (no new dependencies) ✓
-
-1. ~~**#27** SQL injection — parameterized queries~~
-2. ~~**#29** Input validation — path traversal, length limits~~
-3. ~~**#14** SHA-256 on ingest (vendored FIPS 180-4 implementation)~~
-4. ~~**#18** now.pasta.sha256 generation~~
-5. ~~**#24** Descriptor field validation~~
-6. ~~**#1** Yank endpoint~~
-7. ~~**#5** X-Now-Yanked header~~
-8. ~~**#4** Snapshot policy~~
-9. ~~**#7** Max upload size~~
-
+### Phase A — Correctness ✓
 ### Phase B — Metadata completeness ✓
-
-10. ~~**#6** Triple-specific metadata from archive filenames~~
-11. ~~**#23** Installed descriptor stripping~~
-12. ~~**#19** Two-phase write protocol~~
-13. ~~**#20** Reconciliation job~~
-14. ~~**#2** Readyz probe~~
-15. ~~**#17** /.well-known/now-registry-key~~
-
-### Phase C — Auth and signing (requires libsodium) ✓
-
-16. ~~**Vendor libsodium** (1.0.21, ISC license)~~
-17. ~~**#9** POST /auth/token~~
-18. ~~**#10** JWT validation on PUT~~
-19. ~~**#11** Group claim checking~~
-20. ~~**#12** Publisher key registration~~
-21. ~~**#13** Key revocation~~
-22. ~~**#15** .sig verification on publish~~
-23. ~~**#16** Registry countersign~~
-24. ~~**#28** Rate limiting~~
-
+### Phase C — Auth and signing ✓
 ### Phase D — Production backends ✓
-
-25. ~~**#21** PostgreSQL backend (optional libpq; stub when unavailable)~~
-26. ~~**#22** S3 object store backend (raw sockets + libsodium HMAC-SHA256; no libcurl)~~
-27. ~~**#25** Mirror manifest endpoint~~
-28. ~~**#3** Prometheus metrics~~
-29. ~~**#26** cookbook-import CLI tool~~
-
 ### Phase E — Content negotiation ✓
 
-30. ~~**#8** application/x-pasta support~~
-    - Proposal: `docs/proposal-pasta-content-negotiation.md`
-    - Response: `specs/response-pasta-content-negotiation.md`
-    - All 7 decisions from spec response implemented:
-      1. Media type: `application/x-pasta` (accepts `application/pasta` alias)
-      2. Canonical form: compact + sorted keys (`PASTA_COMPACT | PASTA_SORTED`)
-      3. JSON mapping: trivial 1:1 via `pasta_to_json()` (~90 lines)
-      4. Charset: US-ASCII enforced on PUT (reject >0x7F and 0x00 with 400)
-      5. Versioning: in-document `spec-version` field (no media type param)
-      6. Scope: content negotiation on `/resolve/` and `/artifact/.../now.pasta`
-      7. 406 safety: only when Accept present with no supported types
-    - Pretty-print via `?pretty` query parameter
-    - 219 unit tests + stress test driver (4 concurrent phases)
+### Phase F — Feature gaps ✓
+
+- **F1**: Yank reason (`yank_reason TEXT`, `POST .../yank` body, `X-Now-Yank-Reason` header)
+- **F2**: Resolve yank visibility (`?include_yanked=true`, yanked/reason fields in response)
+- **F3**: Credential verification (`Authorization: Basic`, Argon2id hash, `credentials` table)
+
+### Phase G — Grid federation ✓
+
+- **G1**: Peers table (`peer_id`, `url`, `mode`, `priority`, `public_key`, `enabled`)
+- **G2**: Raw-socket HTTP client for peer communication
+- **G3**: Loop detection (`X-Cookbook-Via` breadcrumb, `X-Cookbook-Hop-Count` limit)
+- **G4**: Grid-internal endpoints (`/grid/resolve/`, `/grid/artifact/`, `/grid/manifest`)
+- **G5**: Grid-aware mirror manifest (`?grid=true` aggregation across peers)
+- Fan-out: resolve → iterate peers, artifact → redirect/proxy mode, manifest → merge
+
+### Auth v2 — Policy-based access control ✓
+
+- **Phase 1**: `policies` table, CRUD endpoints, alforno conflate resolver, `cookbook_auth_check()`
+- **Phase 2**: JWT v2 (embedded grants/exclude), merge:"collect" wiring, v1 backward compat
+- **Phase 3**: Per-handler enforcement on all endpoints, mirror visibility filtering, grid grant propagation
+- **Phase 4**: Grid peer Ed25519 request signing, replay prevention, `COOKBOOK_GRID_PEER_AUTH` mode
+
+### Native Ed25519 ✓
+
+- Full RFC 8032 implementation (~2800 lines) — keygen, sign, verify
+- Replaced all libsodium Ed25519 calls in JWT, publisher keys, registry signing, grid peer auth
+- Verified against all 5 RFC 8032 test vectors
+- libsodium retained only for Argon2id and HMAC-SHA256
+
+### Auth v2.5 — Wildcard grants, token revocation, credential management ✓
+
+- **Wildcard grants**: `*: "crwd"` matches any group_id at lowest priority (specific grants override)
+- **JWT ID (jti)**: unique per token via atomic counter + PRNG, embedded in all JWTs
+- **Token revocation**: `POST /auth/revoke` — in-memory bounded list (4096 entries), auto-prunes expired, revocation checked at verification time
+- **Credential management**: `PUT/GET/POST/DELETE /admin/credentials` — full CRUD with Argon2id hashing
+- **Content-Type conformance**: `application/x-pasta; charset=US-ASCII` per now spec §20
+
+### Basta migration ✓
+
+- **libpasta removed from build** — libbasta is the sole text/binary format library
+- Pasta compatibility header (`src/main/h/pasta.h`) maps all `pasta_*` API → `basta_*`
+- Alforno compiled with `ALF_USE_BASTA=ON` (uses its own `alf_backend.h` compat layer)
+- `FetchContent_SetPopulated` prevents alforno from re-fetching basta
+- Root cause of previous basta segfault: 50+ internal symbol collisions between pasta/basta (`lexer_init`, `parse_array`, `write_value`, etc.) — eliminated by using basta exclusively
+
+### Test suite
+
+512 unit tests + stress test driver (4 concurrent phases). All passing.

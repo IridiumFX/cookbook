@@ -1,9 +1,9 @@
 # Cookbook Auth v2 — Proposal
 
 **Created**: 2026-03-10
-**Updated**: 2026-03-14
-**Status**: Phases 1–2 implemented, Phase 3 next
-**Depends on**: Pasta #4 (dotted labels), Alforno #4 (merge:"collect"), Basta #2 (optional)
+**Updated**: 2026-03-19
+**Status**: Phases 1–4 implemented (complete)
+**Depends on**: Basta #2 (superset of Pasta #4), Alforno #4 (merge:"collect", built with ALF_USE_BASTA)
 
 ---
 
@@ -344,9 +344,8 @@ ALTER TABLE credentials ADD COLUMN kind TEXT NOT NULL DEFAULT 'user';
 
 | Dependency | Version | Needed for | Status |
 |------------|---------|------------|--------|
-| Pasta | #4 (dotted labels) | Bare dotted keys in pastlets, `PASTA_LABEL` for team refs | Vendored, integrated |
-| Alforno | #4 (7 features) | `merge: "collect"` for permission OR, conflate mode | Vendored, integrated |
-| Basta | #2 (dot sync) | Optional: binary credential storage | Vendored, not yet integrated |
+| Basta | #2 (dot sync) | Pasta superset — all text parsing + binary blobs. Replaces libpasta | Integrated, sole format lib |
+| Alforno | #4 (7 features) | `merge: "collect"` for permission OR, conflate mode | Integrated with `ALF_USE_BASTA` |
 
 ### 8.1 Alforno Integration
 
@@ -378,14 +377,18 @@ The dynamic recipe contains:
 
 ### 8.2 Build System
 
-All libraries are statically linked. Alforno uses cookbook's vendored pasta
-via `FETCHCONTENT_FULLY_DISCONNECTED`:
+All libraries are statically linked. Basta replaces libpasta as the sole
+format library. Alforno uses basta via `ALF_USE_BASTA` (its existing
+`alf_backend.h` maps `pasta_*` → `basta_*`). Cookbook code uses a compat
+header at `src/main/h/pasta.h` for the same mapping. `FetchContent_SetPopulated`
+prevents alforno from re-fetching basta.
 
 ```cmake
-target_compile_definitions(pasta PUBLIC PASTA_STATIC)
+add_library(basta STATIC ...)  # manual build (basta CMakeLists hardcodes SHARED)
+FetchContent_SetPopulated(basta ...)
+set(ALF_USE_BASTA ON CACHE BOOL "" FORCE)
 add_subdirectory(vendor/alforno)
-target_compile_definitions(alforno PUBLIC ALF_STATIC)
-target_link_libraries(cookbook PUBLIC sqlite3 civetweb pasta alforno sodium)
+target_link_libraries(cookbook PUBLIC sqlite3 civetweb basta alforno sodium)
 ```
 
 ---
@@ -408,15 +411,23 @@ target_link_libraries(cookbook PUBLIC sqlite3 civetweb pasta alforno sodium)
 - Build system overhauled: all-static linking, PUBLIC compile definitions
 - 40 new tests (302 → 342)
 
-### Phase 3: Enforcement — NEXT
-- Wire `cookbook_auth_check()` into all request handlers
-- Mirror manifest filtering by visibility
-- Grid grant propagation headers
+### Phase 3: Per-handler enforcement — DONE
+- `cookbook_auth_check()` wired into all request handlers (resolve, artifact GET/PUT, yank, mirror)
+- Mirror manifest filtering by visibility (grants-based group filtering)
+- Grid grant propagation via `X-Cookbook-Grid-Grants` and `X-Cookbook-Grid-Exclude` headers
+- Backward compatible: v1 JWTs skip enforcement (no grants = allow-all)
+- 42 new tests (342 → 384)
 
-### Phase 4: Grid peer auth
-- Peer request signing with Ed25519
-- `X-Cookbook-Grid-Grants` header enforcement
-- Peer key exchange via `/admin/peers` update
+### Phase 4: Grid peer auth — DONE
+- Ed25519 request signing for grid peer-to-peer communication
+- Canonical signing input: `METHOD\nPATH\nVIA\nHOP_COUNT\nGRANTS\nEXCLUDE\nTIMESTAMP\n`
+- `X-Cookbook-Grid-Signature`, `X-Cookbook-Grid-Origin`, `X-Cookbook-Timestamp` headers
+- Replay prevention via 300-second timestamp window
+- Peer public key exchange via `/admin/peers` PUT (hex-encoded Ed25519 pk)
+- `COOKBOOK_GRID_PEER_AUTH` env var (0=permissive, 1=required)
+- Inbound verification on all `/grid/*` handlers
+- Outbound signing on all fan-out requests
+- 45 new tests (384 → 429)
 
 ---
 
@@ -427,23 +438,29 @@ target_link_libraries(cookbook PUBLIC sqlite3 civetweb pasta alforno sodium)
    permission characters together. Input order no longer matters. Verified by
    `test_policy_resolve_collect()`: user `"r"` + team `"cw"` → `"rcw"`.
 
-2. **Wildcard grants**: Should `*: "r"` mean "read everything"? Useful for
-   admin accounts but dangerous. Alternative: reserved `@admin` role.
+2. ~~**Wildcard grants**~~: **RESOLVED** — `*: "crwd"` is supported. Wildcard
+   matches any `group_id` at lowest priority (prefix length 0). Specific grants
+   always override wildcards. Tested: wildcard r-only, admin full access,
+   specific overrides wildcard, wildcard + exclude interaction.
 
 3. **Group ownership**: Currently `groups` table has `owner_sub`. Should
    ownership be expressed in the policy pastlet instead?
 
-4. **Token refresh**: How does the client know to refresh when policies change?
-   Options: short TTL, push notification, or explicit revocation endpoint.
+4. ~~**Token refresh**~~: **RESOLVED** — `POST /auth/revoke` endpoint accepts
+   `{"token":"eyJ..."}`, extracts `jti` claim, adds to in-memory bounded
+   revocation list (4096 entries, auto-prunes expired). All JWTs now include
+   unique `jti` claims (atomic counter + PRNG). Revocation checked at JWT
+   verification time.
 
 5. ~~**Alforno maturity**~~: **RESOLVED** — Alforno #4 shipped with 7 features
    including `merge: "collect"`, `merge: "deep"`, conditional `when` sections,
    validation pass, `@include` directive, scatter, and gather. Vendored at
    commit 0bee5ee and fully integrated.
 
-6. **Basta for policies**: Should policy pastlets support blobs (for embedding
-   keys/certs)? Basta #2 is vendored but not yet integrated into the build.
-   Would require `ALF_USE_BASTA` compile toggle.
+6. ~~**Basta for policies**~~: **RESOLVED** — Basta #2 is now the sole format
+   library (replaces libpasta). All code uses basta via compat headers. Alforno
+   compiled with `ALF_USE_BASTA`. Policy pastlets can now contain binary blobs
+   for key/cert embedding.
 
 ---
 

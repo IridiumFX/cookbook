@@ -305,7 +305,7 @@ Full client-server integration path is now unblocked. Remaining: `dep:updates` a
 
 | Source | Current | Future |
 |--------|---------|--------|
-| pasta | `pasta_parse()`, `pasta_write()`, `PASTA_SORTED`, `PASTA_LABEL`, dotted keys | IANA `application/pasta` registration |
+| basta | `basta_parse()`, `basta_write()` via compat `pasta.h` header — `PASTA_SORTED`, `PASTA_LABEL`, dotted keys, `BASTA_BLOB` | IANA `application/pasta` registration |
 | pico-http | *(nothing — cookbook is the server)* | *(nothing)* |
 | now | Spec compliance | Yank CLI (#27) |
 
@@ -337,7 +337,7 @@ Full client-server integration path is now unblocked. Remaining: `dep:updates` a
 4. **G1–G4** — Grid federation (peers table, raw HTTP client, loop detection, internal endpoints, fan-out on resolve + artifact) ✓
 5. **G5** — Grid-aware mirror manifest (`?grid=true` aggregation across peers) ✓
 
-342 unit tests. All passing.
+512 unit tests. All passing. Native Ed25519 (no libsodium for signing). Basta replaces libpasta.
 
 ### Completed (now team, Now #0003)
 
@@ -350,25 +350,28 @@ Full client-server integration path is now unblocked. Remaining: `dep:updates` a
 9. `now dep:updates` — client UI for `?include_yanked=true` and `*` range
 10. `now cache:mirror` — client for `/mirror/manifest?grid=true`
 
-### Auth v2 — Phases 1–2 done, Phase 3 next
+### Auth v2 — All 4 phases + Auth v2.5 complete
 
 11. **Auth v2 spec drafted** — `specs/cookbook-auth-v2-proposal.md` ✓
 12. **Pasta #4 submodule** — dotted bare keys, `PASTA_LABEL` ✓
 13. **Alforno #4 submodule** — `merge: "collect"` + 6 other features ✓
-14. **Basta #2 submodule** — vendored, integration deferred ✓
+14. **Basta #2 submodule** — now sole format lib (replaces libpasta) ✓
 15. **Build system overhaul** — all-static linking, PUBLIC compile defs ✓
 16. **Auth v2 Phase 1** — `policies` table, CRUD endpoints, resolver, auth_check ✓ (302 tests)
 17. **Auth v2 Phase 2** — JWT v2, merge:"collect" wiring, v1 compat ✓ (342 tests)
-18. **Auth v2 Phase 3** — per-handler enforcement + mirror visibility filtering — **NEXT**
-19. **Auth v2 Phase 4** — grid peer auth + scoped grant propagation
+18. **Auth v2 Phase 3** — per-handler enforcement + mirror visibility filtering ✓ (384 tests)
+19. **Auth v2 Phase 4** — grid peer auth + Ed25519 request signing ✓ (429 tests)
+20. **Native Ed25519** — RFC 8032, replaces libsodium Ed25519 ✓ (464 tests)
+21. **Auth v2.5** — wildcard grants, JWT jti, token revocation, credential CRUD ✓ (492 tests)
+22. **Basta migration** — libpasta removed, basta sole format lib, compat headers ✓ (512 tests)
 
 ### Waiting on other teams (nice-to-have)
 
-20. `now dep:updates` — client UI for `?include_yanked=true` and `*` range
-21. `now cache:mirror` — client for `/mirror/manifest?grid=true`
+23. `now dep:updates` — client UI for `?include_yanked=true` and `*` range
+24. `now cache:mirror` — client for `/mirror/manifest?grid=true`
 
 ### Can defer
 
-22. IANA `application/pasta` registration — coordination across all three projects
-23. Build graph / CAC (#25, #26) — separate infrastructure
-24. Reproducibility metadata (#30) — needs design on both sides
+25. IANA `application/pasta` registration — coordination across all three projects
+26. Build graph / CAC (#25, #26) — separate infrastructure
+27. Reproducibility metadata (#30) — needs design on both sides

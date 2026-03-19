@@ -1,8 +1,8 @@
 # cookbook — Current Capabilities
 
 **Version**: 0.1.0
-**Last updated**: 2026-03-07
-**Phases complete**: A (Correctness), B (Metadata completeness), C (Auth and signing), D (Production backends), E (Content negotiation)
+**Last updated**: 2026-03-19
+**Phases complete**: A–E (M1 spec), F1–F3 (feature gaps), G1–G5 (grid federation), Auth v2 (Phases 1–4), Auth v2.5 (wildcard/revocation/credentials), Native Ed25519, Basta migration
 
 ---
 
@@ -82,49 +82,96 @@ Stores an artifact file into the object store and registers metadata in the data
 POST /artifact/{group}/{artifact}/{version}/{filename}/yank
 ```
 
-Marks an artifact as yanked. Yanked artifacts are excluded from version resolution but remain downloadable (with the `X-Now-Yanked: true` header).
+Marks an artifact as yanked. Accepts optional `{"reason":"..."}` JSON body. Yanked artifacts are excluded from version resolution but remain downloadable with `X-Now-Yanked: true` and `X-Now-Yank-Reason: <reason>` headers.
 
 ### Authentication
 
 ```
 POST /auth/token
+Authorization: Basic base64(subject:token)
 ```
 
-Exchanges credentials for a signed JWT. The token is signed with the registry's Ed25519 secret key using the EdDSA algorithm. Token lifetime is configurable via `COOKBOOK_JWT_TTL_SEC` (default: 3600s).
+Exchanges credentials for a signed JWT. Credentials are verified against Argon2id hashes in the `credentials` table. Falls back to JSON body `{"sub":"...","groups":"..."}` when no credential record exists.
 
-JWT claims include: `sub` (subject), `groups` (comma-separated group list), `iat` (issued-at), `exp` (expiration).
+**JWT v1** (no policy): `sub`, `groups` (comma-separated), `iat`, `exp`.
+
+**JWT v2** (with policy): `sub`, `grants` (resolved permission map), `exclude` (deny map), `teams`, `v:2`, `iat`, `exp`. Grants are computed once at token issue time via alforno conflate with merge:"collect".
+
+Token lifetime configurable via `COOKBOOK_JWT_TTL_SEC` (default: 3600s). Signed with the registry's Ed25519 key (native implementation).
 
 ### Publisher key management
 
 ```
 POST /keys
-```
-
-Registers an Ed25519 public key for a publisher. Keys are associated with the authenticated subject.
-
-```
 POST /keys/{id}/revoke
 ```
 
-Revokes a previously registered publisher key.
+Register and revoke Ed25519 public keys for publishers.
+
+### Access policies (Auth v2)
+
+```
+GET    /admin/policies                    — list all policies
+GET    /admin/policies/{subject}          — get policy pastlet
+GET    /admin/policies/{subject}/effective — resolved grants via alforno
+PUT    /admin/policies/{subject}          — upload/replace pastlet
+DELETE /admin/policies/{subject}          — remove policy
+```
+
+Policies are pasta pastlets with `@identity`, `@grants`, and `@exclude` sections. The resolver uses alforno conflate with merge:"collect" to aggregate user + team grants. Permission characters: `c` (create), `r` (read), `w` (write), `d` (delete). Hierarchical prefix matching — grant on `com.iridiumfx` implies access to `com.iridiumfx.pasta`. Excludes override grants (deny-wins).
+
+All request handlers enforce `cookbook_auth_check()` when JWT v2 grants are present.
+
+### Token revocation
+
+```
+POST /auth/revoke         — revoke a JWT by its jti claim
+```
+
+Accepts `{"token":"eyJ..."}` body. Verifies the JWT, extracts the `jti` claim, and adds it to an in-memory bounded revocation list (4096 entries). Expired entries are auto-pruned on insert. All subsequent requests using the revoked token are rejected at JWT verification time.
+
+### Credential management
+
+```
+PUT    /admin/credentials — create credential (Argon2id hash)
+GET    /admin/credentials — list credentials (subject, groups, dates)
+POST   /admin/credentials — revoke credential (sets revoked_at)
+DELETE /admin/credentials — remove credential
+```
+
+Credentials table: `subject TEXT PK`, `token_hash TEXT`, `groups TEXT`, `created_at`, `revoked_at`.
 
 ### Mirror manifest
 
 ```
-GET /mirror/manifest[?coords=group:artifact:version,...]
+GET /mirror/manifest[?coords=...][&grid=true]
 ```
 
-Returns a JSON manifest listing all published artifacts suitable for mirroring. Without the `coords` query parameter, returns all published non-yanked artifacts. With `coords`, returns only the specified coordinates. Each entry includes the group, artifact, version, and the base storage path for fetching files.
+Returns JSON manifest of published artifacts. With `?grid=true`, fans out to all grid peers and merges results. Filtered by requesting user's visibility when JWT v2 grants are present.
 
-Response format:
-```json
-{
-  "registry": "central",
-  "artifacts": [
-    {"group":"org.acme","artifact":"core","version":"1.0.0","base_path":"central/org/acme/core/1.0.0"}
-  ]
-}
+### Grid federation
+
 ```
+GET /grid/resolve/{g}/{a}/{range}   — local-only resolve (grid-internal)
+GET /grid/artifact/{path}           — local-only artifact serve
+HEAD /grid/artifact/{path}          — existence check
+GET /grid/manifest                  — local-only mirror manifest
+```
+
+Grid-internal endpoints never fan out (no cascading). Client-facing `/resolve/` and `/artifact/` fan out to peers on miss when `COOKBOOK_GRID_ENABLED=1`.
+
+**Peer management:**
+```
+GET    /admin/peers          — list peers
+PUT    /admin/peers          — add/update peer (JSON body with optional public_key)
+DELETE /admin/peers/{id}     — remove peer
+```
+
+**Loop prevention:** `X-Cookbook-Via` breadcrumb trail, `X-Cookbook-Hop-Count` (max configurable, default 3).
+
+**Peer authentication** (`COOKBOOK_GRID_PEER_AUTH=1`): Outbound requests signed with Ed25519 (`X-Cookbook-Grid-Signature`, `X-Cookbook-Grid-Origin`, `X-Cookbook-Timestamp`). Inbound requests verified against registered peer public keys. 300-second replay window.
+
+**Grant propagation:** `X-Cookbook-Grid-Grants` and `X-Cookbook-Grid-Exclude` headers carry scoped claims (derived from user's JWT, not the full token).
 
 ### Prometheus metrics
 
@@ -132,38 +179,15 @@ Response format:
 GET /metrics
 ```
 
-Returns Prometheus exposition format (text/plain 0.0.4) with counters:
-
-- `cookbook_requests_total` — total HTTP requests
-- `cookbook_requests_by_method{method="GET|PUT|POST"}` — requests by method
-- `cookbook_responses_by_status{class="2xx|4xx|5xx"}` — responses by class
-- `cookbook_artifacts_published_total` — artifacts published
-- `cookbook_artifacts_yanked_total` — artifacts yanked
-- `cookbook_artifacts_resolved_total` — version resolutions
-- `cookbook_auth_tokens_issued_total` — JWT tokens issued
-- `cookbook_auth_failures_total` — authentication failures
-- `cookbook_bytes_uploaded_total` — total bytes uploaded
-- `cookbook_bytes_downloaded_total` — total bytes downloaded
+Prometheus exposition format with counters: `cookbook_requests_total`, `cookbook_requests_by_method`, `cookbook_responses_by_status`, `cookbook_artifacts_published_total`, `cookbook_artifacts_yanked_total`, `cookbook_artifacts_resolved_total`, `cookbook_auth_tokens_issued_total`, `cookbook_auth_failures_total`, `cookbook_bytes_uploaded_total`, `cookbook_bytes_downloaded_total`.
 
 ### Health and diagnostics
 
 ```
-GET /healthz
+GET /healthz                          — liveness probe (200 always)
+GET /readyz                           — readiness probe (DB + store health)
+GET /.well-known/now-registry-key     — registry Ed25519 public key (hex)
 ```
-
-Liveness probe. Returns `200 OK` unconditionally.
-
-```
-GET /readyz
-```
-
-Readiness probe. Checks database connectivity and object store health. Returns `200` if all backends are healthy, `503` otherwise.
-
-```
-GET /.well-known/now-registry-key
-```
-
-Returns the registry's Ed25519 public key in hex encoding. Used by clients to verify registry countersignatures.
 
 ---
 
@@ -214,15 +238,20 @@ Compatible with `now cache --mirror` output. Sidecar files (`.sha256`, `.sig`, `
 
 ### Authentication and authorization
 
-- JWT-based authentication using EdDSA (Ed25519) signatures via libsodium.
-- Group-level authorization: JWT `groups` claim must include the target artifact group.
+- JWT-based authentication using EdDSA (Ed25519) signatures (native implementation).
+- **v1**: Group-level authorization via `groups` claim.
+- **v2**: Fine-grained access via `grants`/`exclude` maps (alforno-resolved policies).
+- Credential verification via Argon2id (libsodium).
 - Per-subject rate limiting with configurable sliding window.
+- Hierarchical prefix matching with deny-overrides-allow.
 
 ### Cryptographic integrity
 
+- **Native Ed25519** (RFC 8032, ~2800 lines) — keygen, sign, verify. No libsodium for Ed25519.
 - SHA-256 computed on ingest for every uploaded artifact.
 - Publisher Ed25519 signature verification on `.sig` uploads.
 - Registry Ed25519 countersignature on all published artifacts.
+- Grid peer request signing with Ed25519 + replay prevention.
 - Registry key pair auto-generated on first run (when `COOKBOOK_KEY_DIR` is set) and persisted as hex files.
 
 ---
@@ -248,6 +277,9 @@ All configuration is via environment variables:
 | `COOKBOOK_JWT_TTL_SEC` | `3600` | JWT token lifetime in seconds |
 | `COOKBOOK_RATE_LIMIT_PER_MIN` | `0` (unlimited) | Per-subject request rate limit |
 | `COOKBOOK_KEY_DIR` | *(none)* | Directory for registry Ed25519 key pair |
+| `COOKBOOK_GRID_ENABLED` | `0` | Enable grid federation (1 = on) |
+| `COOKBOOK_GRID_MAX_HOPS` | `3` | Maximum grid fan-out hop count |
+| `COOKBOOK_GRID_PEER_AUTH` | `0` | Require Ed25519 peer signatures (1 = required) |
 
 ---
 
@@ -257,16 +289,18 @@ All configuration is via environment variables:
 - **Build system**: CMake 3.20+ with Ninja
 - **Presets**: `default` (Debug), `release` (Release)
 - **Platforms**: Windows (MinGW), Linux, macOS, FreeBSD
-- **Output**: `libcookbook` shared library + `cookbook_server` + `cookbook_import` executables
+- **Output**: `libcookbook` static library + `cookbook_server` + `cookbook_import` executables
+- **Linking**: All-static (no DLLs) — PUBLIC compile definitions propagate to all consumers
 
 ### Vendored dependencies
 
 | Dependency | Version | License | Purpose |
 |------------|---------|---------|---------|
-| libpasta | git submodule | MIT | Pasta descriptor parsing |
+| libbasta | Basta #2 (submodule) | MIT | Pasta superset — text + binary blobs. Sole format library (compat `pasta.h` header maps `pasta_*` → `basta_*`) |
+| alforno | Alforno #4 (submodule) | MIT | Config merging — conflate, merge:"collect". Built with `ALF_USE_BASTA` |
 | SQLite | 3.49.1 | Public domain | Metadata backend |
 | civetweb | 1.16 | MIT | HTTP server |
-| libsodium | 1.0.21 | ISC | Ed25519, JWT, HMAC-SHA256, S3 Sig V4 |
+| libsodium | 1.0.21 | ISC | Argon2id, HMAC-SHA256 (S3 Sig V4) |
 
 ### Optional system dependencies
 
@@ -278,31 +312,35 @@ All configuration is via environment variables:
 
 ## Test suite
 
-219 unit tests covering:
+512 unit tests covering:
 
-- Semver parsing and range evaluation
-- Database operations (raw and parameterized)
-- Object store CRUD
+- Semver parsing, range evaluation, edge cases, comparison details
+- Database operations (parameterized queries, yank/status transitions, pending lifecycle)
+- Object store CRUD, overwrite semantics, large value roundtrip
 - Artifact publish and resolution (HTTP integration tests)
 - Immutability enforcement (409 on duplicate PUT)
-- SHA-256 (NIST test vectors: empty, "abc", 448-bit message)
-- Base64url roundtrip encoding
-- JWT create/verify lifecycle
-- Ed25519 sign/verify
-- Mirror manifest data queries
-- S3 store open/close and parameter validation
-- PostgreSQL stub graceful failure
-- ASCII validation (valid ASCII, UTF-8 rejection, NUL rejection, offset reporting)
-- Pasta-to-JSON serialization (primitives, nested structures, string escaping, empty containers, numbers, deep nesting)
-- Pasta sorted key output (PASTA_SORTED flag, lexicographic ordering, nested map sorting)
-- Semver edge cases (large versions, 0.0.0, build metadata only, reject malformed)
-- Semver comparison details (equal, minor/patch diff, pre-release ordering, build metadata ignored)
-- Range exact match, ^0.0.x caret, bounded inclusive/exclusive variants
-- DB yank/status transitions, NULL parameter handling, pending→published lifecycle
-- Store overwrite semantics, 64KB large value roundtrip
-- JWT expired token rejection, group boundary matching (no prefix/substring matching)
-- Base64url edge cases (empty, single byte, binary roundtrip with all 256 byte values)
-- ASCII validation boundary bytes (0x7F valid, 0x80 invalid, all printable ASCII)
+- SHA-256 (NIST test vectors), Base64url roundtrip (including all 256 byte values)
+- JWT v1 create/verify, expired rejection, group boundary matching
+- JWT v2 create/verify, grants/exclude extraction, v1/v2 compatibility
+- Ed25519 native implementation (RFC 8032 test vectors 1–5, keygen, sign, verify)
+- ASCII validation (boundary bytes, UTF-8 rejection, NUL, offset reporting)
+- Pasta-to-JSON serialization, Pasta sorted key output
+- Policy CRUD, resolve (user + team aggregation), effective permissions
+- Auth check: prefix matching, exclude override, edge cases (NULL, empty)
+- Alforno integration (conflate, merge:"collect" — permission OR)
+- Policy resolve with collect (user "r" + team "cw" → "rcw")
+- Credential hash/verify (Argon2id), credentials table, base64 standard decode
+- Yank reason storage and retrieval, resolve yank visibility
+- Grid loop detection, peers table, peer loading (priority, mode, enabled)
+- Grid peer key CRUD, canonical string construction, sign/verify roundtrip
+- Grid timestamp validation, peer auth enforcement
+- Wildcard grants (specific overrides wildcard, admin full access, exclude interaction)
+- Token revocation (add, check, duplicate, expiry prune, full auth flow roundtrip)
+- JWT jti uniqueness (atomic counter, v1 and v2 tokens)
+- Credential admin lifecycle (insert, verify, lookup, revoke, recreate, delete)
+- Basta integration (string/map/blob create, write, parse)
+- Mirror manifest, S3 store validation, PostgreSQL stub
+- Stress test driver (4 concurrent phases: publish, resolve, get, conneg)
 
 ---
 
@@ -356,4 +394,6 @@ Reports throughput (req/s), status code distribution, and latency percentiles (p
 
 ## Known limitations
 
-- **IANA registration**: Using `application/x-pasta` as interim media type. Will switch to `application/pasta` after IANA registration (coordinated with Pasta and `now` v1.0).
+- **IANA registration**: Using `application/x-pasta` as interim media type. Will switch to `application/pasta` after IANA registration.
+- **No token refresh**: Policy changes take effect only on next token issuance. Revocation endpoint (`POST /auth/revoke`) exists for immediate invalidation.
+- **Revocation list is in-memory**: Bounded to 4096 entries, not persisted across server restarts. Suitable for operational revocation, not long-term audit.

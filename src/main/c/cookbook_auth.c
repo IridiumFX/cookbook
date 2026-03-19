@@ -1,9 +1,13 @@
 #include "cookbook_auth.h"
+#include "cookbook_ed25519.h"
 #include <sodium.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 /* ==== Base64url ==== */
 
@@ -126,6 +130,94 @@ int cookbook_credential_verify(const char *token, const char *hash) {
     return crypto_pwhash_str_verify(hash, token, strlen(token));
 }
 
+/* ==== Token revocation list ==== */
+
+void cookbook_revocation_init(cookbook_revocation_list *rl, int capacity) {
+    if (!rl) return;
+    rl->entries = (cookbook_revocation_entry *)calloc(
+        (size_t)capacity, sizeof(cookbook_revocation_entry));
+    rl->count = 0;
+    rl->capacity = capacity;
+}
+
+void cookbook_revocation_free(cookbook_revocation_list *rl) {
+    if (!rl) return;
+    free(rl->entries);
+    rl->entries = NULL;
+    rl->count = 0;
+    rl->capacity = 0;
+}
+
+/* Prune expired entries to reclaim space */
+static void revocation_prune(cookbook_revocation_list *rl) {
+    int64_t now = (int64_t)time(NULL);
+    int write = 0;
+    for (int i = 0; i < rl->count; i++) {
+        if (rl->entries[i].exp > now) {
+            if (write != i)
+                rl->entries[write] = rl->entries[i];
+            write++;
+        }
+    }
+    rl->count = write;
+}
+
+int cookbook_revocation_add(cookbook_revocation_list *rl,
+                            const char *jti, int64_t exp) {
+    if (!rl || !jti || !rl->entries) return -1;
+
+    /* prune expired entries first */
+    revocation_prune(rl);
+
+    /* check if already revoked */
+    for (int i = 0; i < rl->count; i++) {
+        if (strcmp(rl->entries[i].jti, jti) == 0) return 0;
+    }
+
+    if (rl->count >= rl->capacity) return -1; /* full */
+
+    cookbook_revocation_entry *e = &rl->entries[rl->count++];
+    snprintf(e->jti, sizeof(e->jti), "%s", jti);
+    e->exp = exp;
+    return 0;
+}
+
+int cookbook_revocation_check(const cookbook_revocation_list *rl,
+                               const char *jti) {
+    if (!rl || !jti || !rl->entries) return 0;
+    for (int i = 0; i < rl->count; i++) {
+        if (strcmp(rl->entries[i].jti, jti) == 0) return 1;
+    }
+    return 0;
+}
+
+/* ==== JTI generation ==== */
+
+/* Generate a random 16-byte hex JTI (32 chars). Uses counter + time for uniqueness. */
+static volatile long jti_counter = 0;
+
+static void generate_jti(char *jti, size_t jti_sz) {
+    unsigned char rand_bytes[16];
+    long cnt;
+#ifdef _WIN32
+    cnt = InterlockedIncrement(&jti_counter);
+#else
+    cnt = __sync_add_and_fetch(&jti_counter, 1);
+#endif
+    uint64_t seed = (uint64_t)time(NULL) ^ ((uint64_t)cnt * 2654435761ULL)
+                     ^ (uint64_t)(uintptr_t)jti;
+    for (int i = 0; i < 16; i++) {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        rand_bytes[i] = (unsigned char)(seed >> 33);
+    }
+    size_t written = 0;
+    for (int i = 0; i < 16 && written + 2 < jti_sz; i++) {
+        written += (size_t)snprintf(jti + written, jti_sz - written,
+                                     "%02x", rand_bytes[i]);
+    }
+    jti[written] = '\0';
+}
+
 /* ==== Minimal JSON helpers (for JWT only) ==== */
 
 /* Write a JSON string value, escaping as needed. Returns chars written. */
@@ -180,6 +272,10 @@ char *cookbook_jwt_create(const char *sub, const char *groups,
     int64_t now = (int64_t)time(NULL);
     int64_t exp = now + ttl_sec;
 
+    /* generate unique token ID */
+    char jti[64];
+    generate_jti(jti, sizeof(jti));
+
     /* build payload JSON */
     char payload[2048];
     int off = 0;
@@ -189,6 +285,8 @@ char *cookbook_jwt_create(const char *sub, const char *groups,
     if (groups && *groups)
         off += json_write_string(payload + off, sizeof(payload) - (size_t)off,
                                   "groups", groups, 0);
+    off += json_write_string(payload + off, sizeof(payload) - (size_t)off,
+                              "jti", jti, 0);
     off += json_write_int(payload + off, sizeof(payload) - (size_t)off,
                            "iat", now, 0);
     off += json_write_int(payload + off, sizeof(payload) - (size_t)off,
@@ -210,10 +308,8 @@ char *cookbook_jwt_create(const char *sub, const char *groups,
 
     /* sign with Ed25519 */
     unsigned char sig[64];
-    if (crypto_sign_ed25519_detached(sig, NULL,
-                                      (const unsigned char *)signing_input,
-                                      (unsigned long long)si_len,
-                                      signing_key) != 0)
+    if (cookbook_ed25519_sign(sig, signing_input, (size_t)si_len,
+                              signing_key) != 0)
         return NULL;
 
     /* base64url encode signature */
@@ -240,6 +336,10 @@ char *cookbook_jwt_create_v2(const char *sub, const char *groups,
     int64_t now = (int64_t)time(NULL);
     int64_t exp = now + ttl_sec;
 
+    /* generate unique token ID */
+    char jti[64];
+    generate_jti(jti, sizeof(jti));
+
     /* build payload — embed resolved grants/exclude as raw JSON objects */
     size_t rjlen = strlen(resolved_json);
     size_t cap = 512 + rjlen;
@@ -252,6 +352,7 @@ char *cookbook_jwt_create_v2(const char *sub, const char *groups,
     if (groups && *groups)
         off += json_write_string(payload + off, cap - (size_t)off,
                                   "groups", groups, 0);
+    off += json_write_string(payload + off, cap - (size_t)off, "jti", jti, 0);
     off += json_write_int(payload + off, cap - (size_t)off, "v", 2, 0);
 
     /* splice in the grants/exclude from resolved_json directly.
@@ -300,10 +401,8 @@ char *cookbook_jwt_create_v2(const char *sub, const char *groups,
 
     /* sign */
     unsigned char sig[64];
-    if (crypto_sign_ed25519_detached(sig, NULL,
-                                      (const unsigned char *)signing_input,
-                                      (unsigned long long)si_len,
-                                      signing_key) != 0) {
+    if (cookbook_ed25519_sign(sig, signing_input, (size_t)si_len,
+                              signing_key) != 0) {
         free(signing_input);
         return NULL;
     }
@@ -379,10 +478,7 @@ int cookbook_jwt_verify(const char *token, const unsigned char verify_key[32],
     if (sig_dec_len != 64) return -1;
 
     /* verify Ed25519 signature */
-    if (crypto_sign_ed25519_verify_detached(sig,
-                                             (const unsigned char *)token,
-                                             (unsigned long long)si_len,
-                                             verify_key) != 0)
+    if (cookbook_ed25519_verify(sig, token, si_len, verify_key) != 0)
         return -1;
 
     /* decode payload */
@@ -397,6 +493,7 @@ int cookbook_jwt_verify(const char *token, const unsigned char verify_key[32],
     /* extract claims */
     json_get_string(payload, "sub", claims->sub, sizeof(claims->sub));
     json_get_string(payload, "groups", claims->groups, sizeof(claims->groups));
+    json_get_string(payload, "jti", claims->jti, sizeof(claims->jti));
     json_get_int(payload, "exp", &claims->exp);
     json_get_int(payload, "iat", &claims->iat);
 
@@ -440,25 +537,17 @@ int cookbook_jwt_has_group(const cookbook_jwt_claims *claims, const char *group)
 /* ==== Ed25519 key/sign/verify ==== */
 
 int cookbook_keygen(unsigned char pk[32], unsigned char sk[64]) {
-    if (sodium_init() < 0) return -1;
-    crypto_sign_ed25519_keypair(pk, sk);
-    return 0;
+    return cookbook_ed25519_keygen(pk, sk);
 }
 
 int cookbook_sign(const void *msg, size_t msg_len,
                   unsigned char sig[64],
                   const unsigned char sk[64]) {
-    return crypto_sign_ed25519_detached(sig, NULL,
-                                         (const unsigned char *)msg,
-                                         (unsigned long long)msg_len,
-                                         sk);
+    return cookbook_ed25519_sign(sig, msg, msg_len, sk);
 }
 
 int cookbook_verify(const void *msg, size_t msg_len,
                     const unsigned char sig[64],
                     const unsigned char pk[32]) {
-    return crypto_sign_ed25519_verify_detached(sig,
-                                                (const unsigned char *)msg,
-                                                (unsigned long long)msg_len,
-                                                pk);
+    return cookbook_ed25519_verify(sig, msg, msg_len, pk);
 }

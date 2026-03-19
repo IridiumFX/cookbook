@@ -491,6 +491,16 @@ static int grant_match_cb(const char *key, size_t key_len,
                             void *user) {
     grant_match_ctx *ctx = (grant_match_ctx *)user;
 
+    /* wildcard grant: "*" matches any group_id with lowest priority */
+    if (key_len == 1 && key[0] == '*') {
+        if (ctx->best_prefix_len == 0) {
+            ctx->best_val = val;
+            ctx->best_val_len = val_len;
+            /* leave best_prefix_len at 0 so any specific grant wins */
+        }
+        return 0;
+    }
+
     /* check if key is a prefix of group_id */
     if (key_len > ctx->group_len) return 0;
 

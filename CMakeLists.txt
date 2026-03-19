@@ -49,6 +49,33 @@ add_subdirectory(vendor/alforno)
 set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_SAVED})
 target_compile_definitions(alforno PUBLIC ALF_STATIC)
 
+# ---------- vendor: apennines (TLS 1.3 building blocks) ----------
+# Crypto/encoding/math modules from the apennines project.
+# Used for: AES-GCM, ChaCha20-Poly1305, X25519, ECDH P-256,
+# RSA verify, X.509 cert parsing, HKDF, ASN.1/DER, PEM, bigint.
+
+add_library(apennines STATIC
+    vendor/apennines/sources/t1/buffer/buf.c
+    vendor/apennines/sources/t1/random/entropy.c
+    vendor/apennines/sources/t2/crypto/cipher.c
+    vendor/apennines/sources/t2/crypto/ct.c
+    vendor/apennines/sources/t2/crypto/ec.c
+    vendor/apennines/sources/t2/crypto/ecdsa.c
+    vendor/apennines/sources/t2/crypto/hash.c
+    vendor/apennines/sources/t2/crypto/rsa.c
+    vendor/apennines/sources/t2/crypto/secret.c
+    vendor/apennines/sources/t2/crypto/x509.c
+    vendor/apennines/sources/t2/encoding/asn1_der.c
+    vendor/apennines/sources/t2/encoding/base.c
+    vendor/apennines/sources/t2/encoding/pem.c
+    vendor/apennines/sources/t2/math/bigint/bigint.c
+)
+target_include_directories(apennines
+    PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/vendor/apennines/headers>
+)
+target_compile_definitions(apennines PUBLIC APENNINES_STATIC)
+target_compile_definitions(apennines PRIVATE APENNINES_BUILDING)
+
 # ---------- vendor: sqlite ----------
 
 add_library(sqlite3 STATIC vendor/sqlite/sqlite3.c)
@@ -147,7 +174,7 @@ target_include_directories(cookbook
 
 target_compile_definitions(cookbook PUBLIC COOKBOOK_STATIC)
 target_compile_definitions(cookbook PRIVATE BUILDING_COOKBOOK)
-target_link_libraries(cookbook PUBLIC sqlite3 civetweb basta alforno sodium)
+target_link_libraries(cookbook PUBLIC sqlite3 civetweb basta alforno sodium apennines)
 
 
 if(COOKBOOK_HAS_POSTGRES)

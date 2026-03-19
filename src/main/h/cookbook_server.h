@@ -23,6 +23,9 @@ typedef struct {
     int             grid_peer_auth;       /* 1 = require Ed25519 peer signatures */
     const char     *audit_log_dir;        /* NULL = disabled; directory for pasta audit logs */
     int             object_cache_ttl_sec; /* 0 = no eviction; seconds until cached objects expire */
+    const char     *ldap_url;            /* NULL = LDAP disabled; e.g. "ldap://ldap.example.com:389" */
+    const char     *ldap_base_dn;        /* e.g. "ou=users,dc=example,dc=com" */
+    const char     *ldap_user_attr;      /* e.g. "uid" (default) or "sAMAccountName" */
 } cookbook_server_opts;
 
 /* Create and start the server. Returns NULL on failure. */

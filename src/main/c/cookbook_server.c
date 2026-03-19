@@ -5,6 +5,7 @@
 #include "cookbook_grid.h"
 #include "cookbook_ed25519.h"
 #include "cookbook_policy.h"
+#include "cookbook_ldap.h"
 #include "civetweb.h"
 #include "pasta.h"
 #include <sodium.h>
@@ -70,6 +71,7 @@ struct cookbook_server {
     FILE               *audit_access;
     FILE               *audit_admin;
     int                 object_cache_ttl_sec;
+    cookbook_ldap_config ldap_cfg;
     volatile int        reconcile_running;
 #ifdef _WIN32
     HANDLE              reconcile_thread;
@@ -1283,8 +1285,9 @@ static int handle_registry_discovery(struct mg_connection *conn, void *cbdata) {
     if (srv->has_registry_key) {
         n += snprintf(resp + n, sizeof(resp) - (size_t)n,
             ", auth: { enabled: true"
-            ", methods: [\"token\"]"
-            ", algorithm: \"ed25519\"");
+            ", methods: [\"token\"%s]"
+            ", algorithm: \"ed25519\"",
+            srv->ldap_cfg.url ? ", \"ldap\"" : "");
         char pk_hex[65];
         for (int i = 0; i < 32; i++)
             snprintf(pk_hex + i * 2, 3, "%02x", srv->registry_pk[i]);
@@ -2447,7 +2450,31 @@ static int handle_auth_token(struct mg_connection *conn, void *cbdata) {
             }
         }
 
-        /* if body includes "token", verify against credential store */
+        /* parse method field (optional: "token", "ldap") */
+        char method[32] = "token";
+        {
+            const char *mp = strstr(body, "\"method\":");
+            if (mp) {
+                mp = strchr(mp, ':');
+                if (mp) {
+                    mp++;
+                    while (*mp == ' ' || *mp == '\t') mp++;
+                    if (*mp == '"') {
+                        mp++;
+                        const char *me = strchr(mp, '"');
+                        if (me) {
+                            size_t ml = (size_t)(me - mp);
+                            if (ml >= sizeof(method)) ml = sizeof(method) - 1;
+                            memcpy(method, mp, ml);
+                            method[ml] = '\0';
+                        }
+                    }
+                }
+            }
+        }
+
+        /* extract token/password from body */
+        char body_token[512] = {0};
         if (sub[0]) {
             const char *tp = strstr(body, "\"token\":");
             if (tp) {
@@ -2459,41 +2486,62 @@ static int handle_auth_token(struct mg_connection *conn, void *cbdata) {
                         tp++;
                         const char *te = strchr(tp, '"');
                         if (te) {
-                            char body_token[512] = {0};
                             size_t tl = (size_t)(te - tp);
                             if (tl >= sizeof(body_token))
                                 tl = sizeof(body_token) - 1;
                             memcpy(body_token, tp, tl);
-
-                            /* look up stored hash */
-                            cred_lookup_ctx clctx = { {0}, {0}, 0 };
-                            cookbook_db_param cp[] = {
-                                COOKBOOK_P_TEXT(sub)
-                            };
-                            srv->db->query_p(srv->db,
-                                "SELECT token_hash, groups "
-                                "FROM credentials "
-                                "WHERE subject = ?1 "
-                                "AND revoked_at IS NULL",
-                                cp, 1, cred_lookup_cb, &clctx);
-
-                            if (clctx.found) {
-                                if (cookbook_credential_verify(
-                                        body_token, clctx.hash) != 0) {
-                                    free(body);
-                                    METRIC_INC(srv->metrics.responses_4xx);
-                                    METRIC_INC(srv->metrics.auth_failures);
-                                    audit_log(srv, "auth", sub,
-                                              "token-issue", "bad-credentials");
-                                    send_json(conn, 401,
-                                        "{\"error\":\"Invalid credentials\"}\n");
-                                    return 1;
-                                }
-                                memcpy(groups, clctx.groups, sizeof(groups));
-                                cred_verified = 1;
-                            }
                         }
                     }
+                }
+            }
+        }
+
+        /* verify credentials based on method */
+        if (sub[0] && body_token[0]) {
+            if (strcmp(method, "ldap") == 0 && srv->ldap_cfg.url) {
+                /* LDAP bind verification */
+                char *ldap_groups = NULL;
+                if (cookbook_ldap_bind(&srv->ldap_cfg, sub,
+                                       body_token, &ldap_groups) != 0) {
+                    free(body);
+                    METRIC_INC(srv->metrics.responses_4xx);
+                    METRIC_INC(srv->metrics.auth_failures);
+                    audit_log(srv, "auth", sub,
+                              "token-issue", "ldap-bind-failed");
+                    send_json(conn, 401,
+                        "{\"error\":\"LDAP authentication failed\"}\n");
+                    return 1;
+                }
+                if (ldap_groups && ldap_groups[0]) {
+                    snprintf(groups, sizeof(groups), "%s", ldap_groups);
+                }
+                free(ldap_groups);
+                cred_verified = 1;
+            } else {
+                /* local credential store (Argon2id) */
+                cred_lookup_ctx clctx = { {0}, {0}, 0 };
+                cookbook_db_param cp[] = { COOKBOOK_P_TEXT(sub) };
+                srv->db->query_p(srv->db,
+                    "SELECT token_hash, groups "
+                    "FROM credentials "
+                    "WHERE subject = ?1 "
+                    "AND revoked_at IS NULL",
+                    cp, 1, cred_lookup_cb, &clctx);
+
+                if (clctx.found) {
+                    if (cookbook_credential_verify(
+                            body_token, clctx.hash) != 0) {
+                        free(body);
+                        METRIC_INC(srv->metrics.responses_4xx);
+                        METRIC_INC(srv->metrics.auth_failures);
+                        audit_log(srv, "auth", sub,
+                                  "token-issue", "bad-credentials");
+                        send_json(conn, 401,
+                            "{\"error\":\"Invalid credentials\"}\n");
+                        return 1;
+                    }
+                    memcpy(groups, clctx.groups, sizeof(groups));
+                    cred_verified = 1;
                 }
             }
         }
@@ -4523,6 +4571,16 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
         : COOKBOOK_GRID_MAX_HOPS_DEFAULT;
     srv->grid_peer_auth = opts->grid_peer_auth;
     srv->object_cache_ttl_sec = opts->object_cache_ttl_sec;
+
+    /* LDAP backend config */
+    if (opts->ldap_url) {
+        srv->ldap_cfg.url       = opts->ldap_url;
+        srv->ldap_cfg.base_dn   = opts->ldap_base_dn;
+        srv->ldap_cfg.user_attr = opts->ldap_user_attr;
+        fprintf(stdout, "cookbook: LDAP backend: %s (base: %s)\n",
+                opts->ldap_url,
+                opts->ldap_base_dn ? opts->ldap_base_dn : "(none)");
+    }
 
     /* initialize token revocation list (max 4096 entries) */
     cookbook_revocation_init(&srv->revocations, 4096);

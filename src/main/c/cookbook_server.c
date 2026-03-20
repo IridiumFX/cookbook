@@ -10,6 +10,7 @@
 #include "cookbook_tls.h"
 #include <apennines/t1/random/entropy.h>
 #include <apennines/t3/crypto/pki.h>
+#include <apennines/t3/db/wal.h>
 #include "civetweb.h"
 #include "pasta.h"
 #include <sodium.h>
@@ -74,6 +75,9 @@ struct cookbook_server {
     FILE               *audit_auth;
     FILE               *audit_access;
     FILE               *audit_admin;
+    wal                *wal_auth;
+    wal                *wal_access;
+    wal                *wal_admin;
     int                 object_cache_ttl_sec;
     cookbook_ldap_config ldap_cfg;
     cookbook_oidc_config oidc_cfg;
@@ -356,6 +360,51 @@ static void send_json(struct mg_connection *conn, int status,
               "%s",
               status, (status < 300) ? "OK" : "Error",
               len, body);
+}
+
+/* declared in cookbook_gzip.c */
+void *cookbook_gzip_compress(const void *data, size_t len, size_t *out_len);
+
+static int accepts_gzip(const struct mg_request_info *ri) {
+    for (int i = 0; i < ri->num_headers; i++) {
+        if (strcasecmp(ri->http_headers[i].name, "Accept-Encoding") == 0 &&
+            strstr(ri->http_headers[i].value, "gzip"))
+            return 1;
+    }
+    return 0;
+}
+
+/* Send a response body, gzip-compressed if the client supports it and
+   the body is large enough to benefit (>256 bytes). */
+static void send_response_gzip(struct mg_connection *conn,
+                                 const struct mg_request_info *ri,
+                                 int status, const char *content_type,
+                                 const void *body, size_t len) {
+    if (len > 256 && accepts_gzip(ri)) {
+        size_t gz_len = 0;
+        void *gz = cookbook_gzip_compress(body, len, &gz_len);
+        if (gz && gz_len < len) {
+            mg_printf(conn,
+                "HTTP/1.1 %d %s\r\n"
+                "Content-Type: %s\r\n"
+                "Content-Encoding: gzip\r\n"
+                "Content-Length: %zu\r\n\r\n",
+                status, (status < 300) ? "OK" : "Error",
+                content_type, gz_len);
+            mg_write(conn, gz, gz_len);
+            free(gz);
+            return;
+        }
+        free(gz);
+    }
+    /* fallback: uncompressed */
+    mg_printf(conn,
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %zu\r\n\r\n",
+        status, (status < 300) ? "OK" : "Error",
+        content_type, len);
+    mg_write(conn, body, len);
 }
 
 static char *read_body(struct mg_connection *conn,
@@ -916,12 +965,17 @@ static void utc_now(char *buf, size_t sz) {
 static void audit_log(cookbook_server *srv, const char *event,
                        const char *subject, const char *target,
                        const char *result) {
-    /* select the right file based on event category */
+    /* select the right file/WAL based on event category */
     FILE *f = NULL;
-    if (strcmp(event, "auth") == 0)        f = srv->audit_auth;
-    else if (strcmp(event, "admin") == 0)   f = srv->audit_admin;
-    else                                    f = srv->audit_access;
-    if (!f) return;
+    wal *w = NULL;
+    if (strcmp(event, "auth") == 0) {
+        f = srv->audit_auth;  w = srv->wal_auth;
+    } else if (strcmp(event, "admin") == 0) {
+        f = srv->audit_admin; w = srv->wal_admin;
+    } else {
+        f = srv->audit_access; w = srv->wal_access;
+    }
+    if (!f && !w) return;
 
     char ts[64];
     utc_now(ts, sizeof(ts));
@@ -960,8 +1014,16 @@ static void audit_log(cookbook_server *srv, const char *event,
 #else
         pthread_mutex_lock(&srv->audit_lock);
 #endif
-        fwrite(line, 1, (size_t)n, f);
-        fflush(f);
+        /* write to flat file (human-readable) */
+        if (f) {
+            fwrite(line, 1, (size_t)n, f);
+            fflush(f);
+        }
+        /* write to WAL (durable, CRC-32 integrity) */
+        if (w) {
+            u64 seq;
+            wal_append(&seq, w, (const u8 *)line, (u64)n);
+        }
 #ifdef _WIN32
         LeaveCriticalSection(&srv->audit_lock);
 #else
@@ -5107,17 +5169,27 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
     pthread_mutex_init(&srv->audit_lock, NULL);
 #endif
 
-    /* audit logs — three separate files by category */
+    /* audit logs — three separate files by category + WAL for durability */
     if (opts->audit_log_dir) {
         char path[512];
+        /* flat file logs (human-readable) */
         snprintf(path, sizeof(path), "%s/audit-auth.pasta", opts->audit_log_dir);
         srv->audit_auth = fopen(path, "a");
         snprintf(path, sizeof(path), "%s/audit-access.pasta", opts->audit_log_dir);
         srv->audit_access = fopen(path, "a");
         snprintf(path, sizeof(path), "%s/audit-admin.pasta", opts->audit_log_dir);
         srv->audit_admin = fopen(path, "a");
+
+        /* WAL logs (durable, CRC-32 integrity) */
+        snprintf(path, sizeof(path), "%s/audit-auth.wal", opts->audit_log_dir);
+        wal_create(&srv->wal_auth, path);
+        snprintf(path, sizeof(path), "%s/audit-access.wal", opts->audit_log_dir);
+        wal_create(&srv->wal_access, path);
+        snprintf(path, sizeof(path), "%s/audit-admin.wal", opts->audit_log_dir);
+        wal_create(&srv->wal_admin, path);
+
         if (srv->audit_auth && srv->audit_access && srv->audit_admin)
-            fprintf(stdout, "cookbook: audit logs: %s/audit-{auth,access,admin}.pasta\n",
+            fprintf(stdout, "cookbook: audit logs: %s/audit-{auth,access,admin}.{pasta,wal}\n",
                     opts->audit_log_dir);
         else
             fprintf(stderr, "cookbook: warning: some audit logs failed to open in %s\n",
@@ -5281,6 +5353,9 @@ void cookbook_server_stop(cookbook_server *srv) {
     if (srv->audit_auth)   fclose(srv->audit_auth);
     if (srv->audit_access) fclose(srv->audit_access);
     if (srv->audit_admin)  fclose(srv->audit_admin);
+    if (srv->wal_auth)   wal_close(srv->wal_auth);
+    if (srv->wal_access) wal_close(srv->wal_access);
+    if (srv->wal_admin)  wal_close(srv->wal_admin);
 
     sodium_memzero(srv->registry_sk, 64);
     free(srv->registry_id);

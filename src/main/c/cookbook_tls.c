@@ -18,11 +18,18 @@
 #include <apennines/t2/crypto/hash.h>
 #include <apennines/t2/crypto/ec.h>
 #include <apennines/t2/crypto/ct.h>
+#include <apennines/t2/crypto/x509.h>
+#include <apennines/t2/crypto/rsa.h>
+#include <apennines/t2/crypto/ecdsa.h>
 #include <apennines/t1/random/entropy.h>
+
+/* cookbook's own Ed25519 for Ed25519 cert verify */
+#include "cookbook_ed25519.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ---- TLS 1.3 constants ---- */
 
@@ -478,6 +485,11 @@ cookbook_tls *cookbook_tls_connect(cookbook_sock_t sock, const char *hostname) {
     /* Skip CCS if present (middlebox compat) */
     /* Then: EncryptedExtensions, Certificate, CertificateVerify, Finished */
 
+    /* state for cert verification across messages */
+    x509_cert server_cert;
+    int have_cert = 0;
+    memset(&server_cert, 0, sizeof(server_cert));
+
     int got_finished = 0;
     while (!got_finished) {
         u8 *msg = NULL;
@@ -513,45 +525,240 @@ cookbook_tls *cookbook_tls_connect(cookbook_sock_t sock, const char *hostname) {
             continue;
         }
 
-        /* update transcript with all handshake messages */
+        /* snapshot transcript BEFORE adding this message */
+        sha256_ctx pre_msg_transcript = tls->transcript;
+
+        /* update transcript with this handshake message */
         sha256_update(&tls->transcript, msg, (u64)msg_len);
 
         /* process handshake message */
         u8 hs_type = msg[0];
-        /* size_t hs_len = get_u24(msg + 1); */
+        size_t hs_len = get_u24(msg + 1);
 
         switch (hs_type) {
         case HS_ENC_EXTENSIONS:
-            /* we don't need to parse these */
             break;
-        case HS_CERTIFICATE:
-            /* TODO: verify certificate chain against trusted CAs.
-               For now we accept any certificate (like curl -k).
-               A production deployment should verify. */
+
+        case HS_CERTIFICATE: {
+            /* TLS 1.3 Certificate message (RFC 8446 §4.4.2):
+               opaque certificate_request_context<0..255>;
+               CertificateEntry certificate_list<0..2^24-1>;
+               CertificateEntry = opaque cert_data<1..2^24-1>; extensions<0..2^16-1>; */
+            if (hs_len < 5) break;
+            const u8 *p = msg + 4;
+            u8 ctx_len = *p++;
+            p += ctx_len; /* skip certificate_request_context */
+
+            /* certificate_list length (3 bytes) */
+            if (p + 3 > msg + 4 + hs_len) break;
+            /* uint32_t list_len = get_u24(p); */ p += 3;
+
+            /* first certificate entry */
+            if (p + 3 > msg + 4 + hs_len) break;
+            uint32_t cert_len = get_u24(p); p += 3;
+            if (p + cert_len > msg + 4 + hs_len) break;
+
+            /* parse the X.509 certificate (DER) */
+            if (x509_parse(&server_cert, p, (u64)cert_len) == 0) {
+                have_cert = 1;
+
+                /* check expiry */
+                unsigned long expired = 0;
+                x509_is_expired(&expired, &server_cert, (u64)time(NULL));
+                if (expired) {
+                    x509_destroy(&server_cert);
+                    have_cert = 0;
+                    free(msg);
+                    free(tls);
+                    return NULL;
+                }
+            }
             break;
-        case HS_CERT_VERIFY:
-            /* TODO: verify server's signature over transcript.
-               Requires RSA/ECDSA/Ed25519 verify from apennines. */
+        }
+
+        case HS_CERT_VERIFY: {
+            /* TLS 1.3 CertificateVerify (RFC 8446 §4.4.3):
+               SignatureScheme algorithm (2 bytes);
+               opaque signature<0..2^16-1>; */
+            if (!have_cert || hs_len < 4) break;
+
+            uint16_t sig_scheme = get_u16(msg + 4);
+            uint16_t sig_len = get_u16(msg + 6);
+            const u8 *sig = msg + 8;
+            if (sig_len + 8 > msg_len) break;
+
+            /* build the content to verify:
+               64 spaces + "TLS 1.3, server CertificateVerify" + 0x00 + transcript_hash */
+            u8 verify_content[130];
+            memset(verify_content, 0x20, 64); /* 64 spaces */
+            memcpy(verify_content + 64,
+                   "TLS 1.3, server CertificateVerify", 33);
+            verify_content[97] = 0x00;
+
+            /* transcript hash up to but NOT including CertificateVerify */
+            u8 cv_hash[32];
+            {
+                sha256_ctx tmp = pre_msg_transcript;
+                sha256_final(cv_hash, &tmp);
+            }
+            memcpy(verify_content + 98, cv_hash, 32);
+
+            int sig_ok = 0;
+
+            if (sig_scheme == 0x0804) {
+                /* rsa_pss_rsae_sha256 */
+                const u8 *spki = NULL; u64 spki_len = 0;
+                x509_get_pubkey(&spki, &spki_len, &server_cert);
+                if (spki && spki_len > 0) {
+                    /* extract RSA key from SubjectPublicKeyInfo */
+                    rsa_pubkey rpk;
+                    /* SPKI contains AlgorithmIdentifier + BIT STRING wrapping the key */
+                    /* For RSA, the BIT STRING payload is the PKCS#1 RSAPublicKey */
+                    /* Simple approach: scan for the inner SEQUENCE */
+                    const u8 *key_der = spki;
+                    u64 key_len = spki_len;
+                    /* skip outer SEQUENCE tag+len, AlgId, BIT STRING tag+len+0x00 */
+                    if (key_der[0] == 0x30 && spki_len > 24) {
+                        /* find the BIT STRING (tag 0x03) */
+                        size_t pos = 0;
+                        pos++; /* skip SEQUENCE tag */
+                        /* skip SEQUENCE length */
+                        if (key_der[pos] & 0x80) pos += 1 + (key_der[pos] & 0x7F);
+                        else pos++;
+                        /* skip AlgorithmIdentifier (SEQUENCE) */
+                        if (key_der[pos] == 0x30) {
+                            pos++;
+                            if (key_der[pos] & 0x80) pos += 1 + (key_der[pos] & 0x7F);
+                            else { pos += 1 + key_der[pos]; }
+                        }
+                        /* now at BIT STRING */
+                        if (pos < spki_len && key_der[pos] == 0x03) {
+                            pos++;
+                            size_t bs_len;
+                            if (key_der[pos] & 0x80) {
+                                int nb = key_der[pos] & 0x7F;
+                                pos++;
+                                bs_len = 0;
+                                for (int bi = 0; bi < nb; bi++)
+                                    bs_len = (bs_len << 8) | key_der[pos++];
+                            } else {
+                                bs_len = key_der[pos++];
+                            }
+                            pos++; /* skip unused bits byte (0x00) */
+                            key_der = key_der + pos;
+                            key_len = bs_len - 1;
+                        }
+                    }
+                    if (rsa_pubkey_import_der(&rpk, key_der, key_len) == 0) {
+                        unsigned long valid = 0;
+                        rsa_verify_pss(&valid, &rpk,
+                                        sig, (u64)sig_len,
+                                        verify_content, 130);
+                        if (valid) sig_ok = 1;
+                        rsa_pubkey_destroy(&rpk);
+                    }
+                }
+            } else if (sig_scheme == 0x0403) {
+                /* ecdsa_secp256r1_sha256 */
+                const u8 *spki = NULL; u64 spki_len = 0;
+                x509_get_pubkey(&spki, &spki_len, &server_cert);
+                if (spki && spki_len >= 65) {
+                    /* extract uncompressed P-256 point from SPKI */
+                    /* look for 0x04 marker (uncompressed point) */
+                    const u8 *pt = NULL;
+                    for (u64 i = 0; i + 65 <= spki_len; i++) {
+                        if (spki[i] == 0x04) {
+                            pt = spki + i;
+                            break;
+                        }
+                    }
+                    if (pt) {
+                        ecdsa_pubkey epk;
+                        memcpy(epk.data, pt, 65);
+                        /* DER-decode the ECDSA signature (r,s from ASN.1) */
+                        /* TLS sends DER-encoded, ecdsa_verify wants raw r||s */
+                        if (sig_len > 6 && sig[0] == 0x30) {
+                            ecdsa_sig esig;
+                            /* parse DER: SEQUENCE { INTEGER r, INTEGER s } */
+                            size_t sp2 = 2; /* skip 30 + len */
+                            if (sig[1] & 0x80) sp2 += (sig[1] & 0x7F);
+                            /* r */
+                            if (sig[sp2] == 0x02) {
+                                sp2++;
+                                size_t rlen = sig[sp2++];
+                                /* skip leading zero padding */
+                                while (rlen > 32 && sig[sp2] == 0) { sp2++; rlen--; }
+                                memset(esig.r, 0, 32);
+                                memcpy(esig.r + 32 - rlen, sig + sp2, rlen);
+                                sp2 += rlen;
+                            }
+                            /* s */
+                            if (sig[sp2] == 0x02) {
+                                sp2++;
+                                size_t slen = sig[sp2++];
+                                while (slen > 32 && sig[sp2] == 0) { sp2++; slen--; }
+                                memset(esig.s, 0, 32);
+                                memcpy(esig.s + 32 - slen, sig + sp2, slen);
+                            }
+                            u64 valid = 0;
+                            ecdsa_verify(&valid, &epk,
+                                          verify_content, 130, &esig);
+                            if (valid) sig_ok = 1;
+                        }
+                    }
+                }
+            } else if (sig_scheme == 0x0807) {
+                /* ed25519 */
+                const u8 *spki = NULL; u64 spki_len = 0;
+                x509_get_pubkey(&spki, &spki_len, &server_cert);
+                if (spki && spki_len >= 32) {
+                    /* find the 32-byte key in SPKI */
+                    const u8 *pk = spki + spki_len - 32;
+                    if (cookbook_ed25519_verify(sig,
+                            (const char *)verify_content, 130, pk) == 0)
+                        sig_ok = 1;
+                }
+            }
+
+            if (!sig_ok) {
+                /* signature verification failed */
+                if (have_cert) x509_destroy(&server_cert);
+                free(msg);
+                free(tls);
+                return NULL;
+            }
             break;
+        }
+
         case HS_FINISHED: {
             /* verify server Finished:
-               verify_data = HMAC(finished_key, transcript_hash)
-               where finished_key = HKDF-Expand-Label(hs_secret, "finished", "", Hash.length) */
+               finished_key = HKDF-Expand-Label(s_hs_secret, "finished", "", 32)
+               verify_data = HMAC-SHA-256(finished_key, transcript_hash_before_finished) */
             u8 s_finished_key[HKDF_HASH_LEN];
             tls13_derive_secret(s_finished_key, HKDF_HASH_LEN,
                                  s_hs_secret, "finished", 8, NULL, 0);
 
-            /* transcript hash up to but NOT including Finished */
             u8 pre_fin_hash[32];
             {
-                /* we already added Finished to transcript above,
-                   so snapshot before that — unfortunately we can't undo.
-                   In a proper impl we'd snapshot before adding.
-                   For now, accept the Finished without verify. */
-                /* TODO: snapshot transcript before adding Finished msg */
+                sha256_ctx tmp = pre_msg_transcript;
+                sha256_final(pre_fin_hash, &tmp);
             }
-            (void)pre_fin_hash;
-            (void)s_finished_key;
+
+            u8 expected_verify[32];
+            hmac_digest(expected_verify, HMAC_HASH_SHA256,
+                         s_finished_key, HKDF_HASH_LEN,
+                         pre_fin_hash, 32);
+
+            /* compare with received verify_data (msg+4, 32 bytes) */
+            unsigned long fin_match = 0;
+            if (hs_len == 32)
+                ct_compare(&fin_match, msg + 4, expected_verify, 32);
+            if (hs_len != 32 || fin_match != 0) {
+                if (have_cert) x509_destroy(&server_cert);
+                free(msg);
+                free(tls);
+                return NULL;
+            }
 
             got_finished = 1;
             break;
@@ -561,6 +768,9 @@ cookbook_tls *cookbook_tls_connect(cookbook_sock_t sock, const char *hostname) {
         }
         free(msg);
     }
+
+    /* clean up server cert */
+    if (have_cert) x509_destroy(&server_cert);
 
     /* ---- Send client Finished ---- */
 

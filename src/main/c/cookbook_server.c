@@ -7,6 +7,7 @@
 #include "cookbook_policy.h"
 #include "cookbook_ldap.h"
 #include "cookbook_oidc.h"
+#include <apennines/t1/random/entropy.h>
 #include "civetweb.h"
 #include "pasta.h"
 #include <sodium.h>
@@ -74,6 +75,18 @@ struct cookbook_server {
     int                 object_cache_ttl_sec;
     cookbook_ldap_config ldap_cfg;
     cookbook_oidc_config oidc_cfg;
+
+    /* device code flow state */
+    struct device_code_entry {
+        char device_code[64];
+        char user_code[16];
+        char subject[128];       /* filled when authorized */
+        char groups[1024];       /* filled when authorized */
+        int  authorized;         /* 0=pending, 1=authorized, -1=denied */
+        int64_t expires_at;
+    } device_codes[64];
+    int device_code_count;
+
     volatile int        reconcile_running;
 #ifdef _WIN32
     HANDLE              reconcile_thread;
@@ -2851,6 +2864,283 @@ static int handle_auth_revoke(struct mg_connection *conn, void *cbdata) {
     return 1;
 }
 
+/* ==== OIDC device code flow: /auth/device ==== */
+
+static void generate_user_code(char *out, size_t sz) {
+    /* 8-char alphanumeric code: ABCD-EFGH */
+    unsigned char rand[4];
+    entropy_get_system(rand, 4);
+    const char *alpha = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; /* no I,O,0,1 */
+    snprintf(out, sz, "%c%c%c%c-%c%c%c%c",
+             alpha[rand[0] & 0x1F], alpha[(rand[0] >> 5) | ((rand[1] & 0x03) << 3)],
+             alpha[(rand[1] >> 2) & 0x1F], alpha[(rand[1] >> 7) | ((rand[2] & 0x0F) << 1)],
+             alpha[(rand[2] >> 4) | ((rand[3] & 0x01) << 4)], alpha[(rand[3] >> 1) & 0x1F],
+             alpha[(rand[3] >> 6) | ((rand[0] & 0x0F) << 2)], alpha[(rand[2] >> 3) & 0x1F]);
+}
+
+static int handle_auth_device(struct mg_connection *conn, void *cbdata) {
+    cookbook_server *srv = (cookbook_server *)cbdata;
+    const struct mg_request_info *ri = mg_get_request_info(conn);
+
+    METRIC_INC(srv->metrics.requests_total);
+    METRIC_INC(srv->metrics.requests_post);
+
+    if (strcmp(ri->request_method, "POST") != 0) {
+        send_json(conn, 405, "{\"error\":\"Method not allowed\"}\n");
+        return 1;
+    }
+
+    if (!srv->has_registry_key) {
+        send_json(conn, 503, "{\"error\":\"Auth not configured\"}\n");
+        return 1;
+    }
+
+    /* prune expired device codes */
+    int64_t now = (int64_t)time(NULL);
+    int write = 0;
+    for (int i = 0; i < srv->device_code_count; i++) {
+        if (srv->device_codes[i].expires_at > now)
+            srv->device_codes[write++] = srv->device_codes[i];
+    }
+    srv->device_code_count = write;
+
+    if (srv->device_code_count >= 64) {
+        send_json(conn, 503,
+            "{\"error\":\"Too many pending device codes\"}\n");
+        return 1;
+    }
+
+    /* generate codes */
+    struct device_code_entry *entry =
+        &srv->device_codes[srv->device_code_count++];
+    memset(entry, 0, sizeof(*entry));
+
+    /* device_code: 32-char hex random */
+    unsigned char rand_bytes[16];
+    entropy_get_system(rand_bytes, 16);
+    for (int i = 0; i < 16; i++)
+        snprintf(entry->device_code + i * 2, 3, "%02x", rand_bytes[i]);
+
+    generate_user_code(entry->user_code, sizeof(entry->user_code));
+    entry->authorized = 0;
+    entry->expires_at = now + 900; /* 15 minutes */
+
+    /* build verification URI */
+    char resp[1024];
+    snprintf(resp, sizeof(resp),
+        "{\"device_code\":\"%s\","
+        "\"user_code\":\"%s\","
+        "\"verification_uri\":\"http://localhost:%s/auth/device/verify\","
+        "\"interval\":5,"
+        "\"expires_in\":900}\n",
+        entry->device_code, entry->user_code,
+        "8080"); /* TODO: use actual port */
+
+    audit_log(srv, "auth", "unknown", "device-code-issued", "ok");
+    METRIC_INC(srv->metrics.responses_2xx);
+    send_json(conn, 200, resp);
+    return 1;
+}
+
+static int handle_auth_device_token(struct mg_connection *conn, void *cbdata) {
+    cookbook_server *srv = (cookbook_server *)cbdata;
+    const struct mg_request_info *ri = mg_get_request_info(conn);
+
+    METRIC_INC(srv->metrics.requests_total);
+    METRIC_INC(srv->metrics.requests_post);
+
+    if (strcmp(ri->request_method, "POST") != 0) {
+        send_json(conn, 405, "{\"error\":\"Method not allowed\"}\n");
+        return 1;
+    }
+
+    /* read body: {"device_code":"...", "grant_type":"urn:ietf:params:oauth:grant-type:device_code"} */
+    size_t body_len = 0;
+    char *body = read_body(conn, ri, &body_len, 4096);
+    if (!body || body_len == 0) {
+        free(body);
+        send_json(conn, 400, "{\"error\":\"Body required\"}\n");
+        return 1;
+    }
+
+    /* extract device_code */
+    char dc[64] = {0};
+    const char *dp = strstr(body, "\"device_code\":\"");
+    if (dp) {
+        dp += 15;
+        const char *de = strchr(dp, '"');
+        if (de) {
+            size_t dl = (size_t)(de - dp);
+            if (dl >= sizeof(dc)) dl = sizeof(dc) - 1;
+            memcpy(dc, dp, dl);
+        }
+    }
+    free(body);
+
+    if (!dc[0]) {
+        send_json(conn, 400, "{\"error\":\"Missing device_code\"}\n");
+        return 1;
+    }
+
+    /* find the device code entry */
+    int64_t now = (int64_t)time(NULL);
+    for (int i = 0; i < srv->device_code_count; i++) {
+        if (strcmp(srv->device_codes[i].device_code, dc) != 0)
+            continue;
+
+        if (srv->device_codes[i].expires_at <= now) {
+            send_json(conn, 400, "{\"error\":\"expired_token\"}\n");
+            return 1;
+        }
+
+        if (srv->device_codes[i].authorized == 0) {
+            /* still pending */
+            mg_printf(conn,
+                "HTTP/1.1 428 Precondition Required\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: 40\r\n\r\n"
+                "{\"error\":\"authorization_pending\"}\n");
+            return 1;
+        }
+
+        if (srv->device_codes[i].authorized < 0) {
+            send_json(conn, 403, "{\"error\":\"access_denied\"}\n");
+            /* remove entry */
+            srv->device_codes[i] = srv->device_codes[--srv->device_code_count];
+            return 1;
+        }
+
+        /* authorized! issue JWT */
+        char *sub = srv->device_codes[i].subject;
+        char *groups = srv->device_codes[i].groups;
+
+        char *resolved = cookbook_policy_resolve(srv->db, sub);
+        char *token = NULL;
+        int token_version = 1;
+        if (resolved) {
+            token = cookbook_jwt_create_v2(sub, groups[0] ? groups : NULL,
+                                            resolved, srv->jwt_ttl_sec,
+                                            srv->registry_sk);
+            token_version = 2;
+            free(resolved);
+        } else {
+            token = cookbook_jwt_create(sub, groups, srv->jwt_ttl_sec,
+                                         srv->registry_sk);
+        }
+
+        /* remove entry */
+        srv->device_codes[i] = srv->device_codes[--srv->device_code_count];
+
+        if (!token) {
+            send_json(conn, 500, "{\"error\":\"Token creation failed\"}\n");
+            return 1;
+        }
+
+        audit_log(srv, "auth", sub, "device-code-token", "ok");
+        METRIC_INC(srv->metrics.responses_2xx);
+        METRIC_INC(srv->metrics.auth_tokens_issued);
+
+        char resp[8192];
+        snprintf(resp, sizeof(resp),
+            "{\"token\":\"%s\",\"expires_in\":%d,\"version\":%d}\n",
+            token, srv->jwt_ttl_sec, token_version);
+        send_json(conn, 200, resp);
+        free(token);
+        return 1;
+    }
+
+    send_json(conn, 400, "{\"error\":\"Invalid device_code\"}\n");
+    return 1;
+}
+
+/* POST /auth/device/verify — user submits user_code + credentials to authorize */
+static int handle_auth_device_verify(struct mg_connection *conn, void *cbdata) {
+    cookbook_server *srv = (cookbook_server *)cbdata;
+    const struct mg_request_info *ri = mg_get_request_info(conn);
+
+    METRIC_INC(srv->metrics.requests_total);
+
+    if (strcmp(ri->request_method, "POST") != 0) {
+        send_json(conn, 405, "{\"error\":\"Method not allowed\"}\n");
+        return 1;
+    }
+
+    /* read body: {"user_code":"ABCD-EFGH","subject":"alice","token":"secret"} */
+    size_t body_len = 0;
+    char *body = read_body(conn, ri, &body_len, 4096);
+    if (!body || body_len == 0) {
+        free(body);
+        send_json(conn, 400, "{\"error\":\"Body required\"}\n");
+        return 1;
+    }
+
+    char user_code[16] = {0}, subject[128] = {0}, token[512] = {0};
+
+    const char *p;
+    p = strstr(body, "\"user_code\":\"");
+    if (p) { p += 13; const char *e = strchr(p, '"');
+             if (e) { size_t l = (size_t)(e-p); if (l >= sizeof(user_code)) l = sizeof(user_code)-1;
+                       memcpy(user_code, p, l); } }
+
+    p = strstr(body, "\"subject\":\"");
+    if (!p) p = strstr(body, "\"sub\":\"");
+    if (p) { p = strchr(p, ':') + 1; while(*p==' '||*p=='\t') p++;
+             if (*p=='"') { p++; const char *e = strchr(p, '"');
+             if (e) { size_t l = (size_t)(e-p); if (l >= sizeof(subject)) l = sizeof(subject)-1;
+                       memcpy(subject, p, l); } } }
+
+    p = strstr(body, "\"token\":\"");
+    if (p) { p += 9; const char *e = strchr(p, '"');
+             if (e) { size_t l = (size_t)(e-p); if (l >= sizeof(token)) l = sizeof(token)-1;
+                       memcpy(token, p, l); } }
+    free(body);
+
+    if (!user_code[0] || !subject[0] || !token[0]) {
+        send_json(conn, 400,
+            "{\"error\":\"user_code, subject, and token required\"}\n");
+        return 1;
+    }
+
+    /* verify credentials */
+    cred_lookup_ctx clctx = { {0}, {0}, 0 };
+    cookbook_db_param cp[] = { COOKBOOK_P_TEXT(subject) };
+    srv->db->query_p(srv->db,
+        "SELECT token_hash, groups FROM credentials "
+        "WHERE subject = ?1 AND revoked_at IS NULL",
+        cp, 1, cred_lookup_cb, &clctx);
+
+    if (!clctx.found || cookbook_credential_verify(token, clctx.hash) != 0) {
+        audit_log(srv, "auth", subject, "device-verify", "bad-credentials");
+        send_json(conn, 401, "{\"error\":\"Invalid credentials\"}\n");
+        return 1;
+    }
+
+    /* find matching device code and authorize it */
+    int64_t now = (int64_t)time(NULL);
+    for (int i = 0; i < srv->device_code_count; i++) {
+        if (strcmp(srv->device_codes[i].user_code, user_code) != 0)
+            continue;
+        if (srv->device_codes[i].expires_at <= now) {
+            send_json(conn, 400, "{\"error\":\"Device code expired\"}\n");
+            return 1;
+        }
+
+        snprintf(srv->device_codes[i].subject,
+                  sizeof(srv->device_codes[i].subject), "%s", subject);
+        snprintf(srv->device_codes[i].groups,
+                  sizeof(srv->device_codes[i].groups), "%s", clctx.groups);
+        srv->device_codes[i].authorized = 1;
+
+        audit_log(srv, "auth", subject, "device-verify", "ok");
+        METRIC_INC(srv->metrics.responses_2xx);
+        send_json(conn, 200, "{\"status\":\"authorized\"}\n");
+        return 1;
+    }
+
+    send_json(conn, 404, "{\"error\":\"Unknown user_code\"}\n");
+    return 1;
+}
+
 /* ==== #12/#13: route: POST /keys, POST /keys/{id}/revoke ==== */
 
 static int handle_keys(struct mg_connection *conn, void *cbdata) {
@@ -4828,6 +5118,12 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
                            handle_registry_discovery, srv);
     mg_set_request_handler(srv->ctx, "/auth/token", handle_auth_token, srv);
     mg_set_request_handler(srv->ctx, "/auth/revoke", handle_auth_revoke, srv);
+    mg_set_request_handler(srv->ctx, "/auth/device/token",
+                           handle_auth_device_token, srv);
+    mg_set_request_handler(srv->ctx, "/auth/device/verify",
+                           handle_auth_device_verify, srv);
+    mg_set_request_handler(srv->ctx, "/auth/device",
+                           handle_auth_device, srv);
     mg_set_request_handler(srv->ctx, "/keys", handle_keys, srv);
     mg_set_request_handler(srv->ctx, "/metrics", handle_metrics, srv);
     mg_set_request_handler(srv->ctx, "/mirror/manifest", handle_mirror_manifest, srv);

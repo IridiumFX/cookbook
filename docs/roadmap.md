@@ -139,6 +139,71 @@ All 29 original gaps from the M1 spec are implemented and tested.
 - TTL eviction via `COOKBOOK_OBJECT_CACHE_TTL_SEC` — background thread prunes expired entries every 60s
 - Designed for now's remote compilation cache (`GET/PUT /objects/{sha256_hex}{.o|.obj}`)
 
+### LDAP authentication ✓
+
+- Zero-dep LDAP simple bind over TCP (BER encoding, RFC 4511)
+- `ldap://` (plain) and `ldaps://` (TLS) support
+- Config: `COOKBOOK_LDAP_URL`, `COOKBOOK_LDAP_BASE_DN`, `COOKBOOK_LDAP_USER_ATTR`
+- Wired into `POST /auth/token` via `"method":"ldap"` field
+
+### OIDC authentication ✓
+
+- Client credentials flow: `POST /auth/token` with `grant_type=client_credentials`
+- Device code flow: `POST /auth/device` → poll `/auth/device/token` → verify via `/auth/device/verify`
+- OIDC token exchange over HTTPS to configured issuer
+- Config: `COOKBOOK_OIDC_ISSUER`, `COOKBOOK_OIDC_CLIENT_ID`
+
+### Socket abstraction layer ✓
+
+- `cookbook_socket.h/.c` — platform-abstracted TCP + TLS
+- Single file to swap for Nova OS porting
+- All three consumers (grid, S3, LDAP) use shared API — zero raw socket calls
+
+### TLS 1.3 client ✓
+
+- Full handshake: ClientHello → ServerHello → key derivation → encrypted handshake → app data
+- Cipher suite: TLS_AES_128_GCM_SHA256 (mandatory)
+- Key exchange: X25519 ECDH
+- Certificate verification: expiry check, CertificateVerify (RSA-PSS, ECDSA P-256, Ed25519)
+- Server Finished: HMAC verify with constant-time comparison
+- PKI chain verification via apennines `pki_store_verify` + `COOKBOOK_CA_BUNDLE`
+- Wired into: LDAPS, HTTPS grid peers, HTTPS S3, OIDC
+
+### Reproducibility attestation ✓
+
+- `.repro` sidecar files validated on upload (ASCII, valid pasta, format + artifact_hash fields)
+- Format: `now-repro-v1` per now team spec
+
+### Gzip compression ✓
+
+- `cookbook_gzip_compress()` — deflate + RFC 1952 gzip framing
+- `send_response_gzip()` — auto-compresses responses >256 bytes for `Accept-Encoding: gzip`
+- Uses apennines `deflate_compress`
+
+### WAL-backed audit log ✓
+
+- Three WAL files alongside flat pasta files: `audit-{auth,access,admin}.wal`
+- CRC-32 integrity per entry, sequence numbers, crash recovery
+- Entries written to both flat file (human-readable) and WAL (durable)
+- Split by category: auth failures, access operations, admin changes
+
+### Vendored apennines crypto ✓
+
+18 modules (36 files) from the apennines project:
+- **T1**: buf, entropy
+- **T2**: cipher (AES-GCM, ChaCha20-Poly1305), ct, ec (Ed25519, X25519), ecdsa (P-256), hash (SHA-256/512, HMAC, HKDF), rsa (PKCS#1 v1.5, PSS), secret, x509, asn1_der, base, pem, bigint, compress (LZ4, Deflate)
+- **T3**: pki (chain verify, CRL, OCSP), http (request/response parse), wal (append-only log)
+
+### Documentation ✓
+
+Six guides under `docs/guides/`:
+- install.md — binary + source install
+- configuration.md — all env vars
+- admin.md — bootstrap, credentials, groups, policies, audit, backup
+- user.md — auth, publish, resolve, download, yank, object cache
+- integration.md — now client, remote cache, grid, LDAP, Prometheus
+- architecture.md — platform layers, module graph, Nova porting checklist
+
 ### Test suite
 
-555 unit tests + stress test driver (4 concurrent phases). All passing.
+571 unit tests + stress test driver (4 concurrent phases). All passing.

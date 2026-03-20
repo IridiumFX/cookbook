@@ -3480,6 +3480,62 @@ static void test_wal_basic(void) {
     remove(path);
 }
 
+/* ---- KV store tests ---- */
+
+#include <apennines/t3/db/kv.h>
+
+static void test_kv_basic(void) {
+    const char *path = "test_store.kv";
+    kv_store *store = NULL;
+    ASSERT(kv_open(&store, path) == 0, "kv: open");
+
+    /* put */
+    const char *k1 = "groups:com.example";
+    const char *v1 = "{ owner: \"alice\", created_at: \"2026-03-20\" }";
+    ASSERT(kv_put(store, (const u8 *)k1, (u64)strlen(k1),
+                   (const u8 *)v1, (u64)strlen(v1)) == 0, "kv: put");
+
+    /* get */
+    u8 *out = NULL;
+    u64 out_len = 0;
+    ASSERT(kv_get(&out, &out_len, store, (const u8 *)k1, (u64)strlen(k1)) == 0,
+           "kv: get");
+    ASSERT(out_len == (u64)strlen(v1), "kv: get len");
+    ASSERT(memcmp(out, v1, out_len) == 0, "kv: get data");
+    free(out);
+
+    /* put second key */
+    const char *k2 = "groups:org.acme";
+    const char *v2 = "{ owner: \"bob\" }";
+    ASSERT(kv_put(store, (const u8 *)k2, (u64)strlen(k2),
+                   (const u8 *)v2, (u64)strlen(v2)) == 0, "kv: put 2");
+
+    /* prefix iteration */
+    kv_iter *it = NULL;
+    ASSERT(kv_iter_create(&it, store,
+                           (const u8 *)"groups:", 7) == 0, "kv: iter create");
+    int count = 0;
+    const u8 *ik, *iv;
+    u64 ikl, ivl;
+    while (kv_iter_next(&ik, &ikl, &iv, &ivl, it) == 0)
+        count++;
+    ASSERT(count == 2, "kv: iter prefix count");
+    kv_iter_destroy(it);
+
+    /* delete */
+    ASSERT(kv_delete(store, (const u8 *)k1, (u64)strlen(k1)) == 0,
+           "kv: delete");
+    ASSERT(kv_get(&out, &out_len, store, (const u8 *)k1, (u64)strlen(k1)) != 0,
+           "kv: get after delete");
+
+    /* not found */
+    ASSERT(kv_get(&out, &out_len, store,
+                   (const u8 *)"nonexistent", 11) != 0, "kv: not found");
+
+    kv_close(store);
+    remove(path);
+}
+
 int main(void) {
     printf("cookbook test suite\n\n");
 
@@ -3584,6 +3640,7 @@ int main(void) {
     test_gzip_compress();
     test_ldap_config();
     test_wal_basic();
+    test_kv_basic();
 
     printf("\n%d/%d tests passed\n", tests_run - tests_failed, tests_run);
     return tests_failed ? 1 : 0;

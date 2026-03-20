@@ -12,58 +12,12 @@
  */
 
 #include "cookbook_oidc.h"
-#include "cookbook_socket.h"
 #include "cookbook_auth.h"  /* for cookbook_base64_decode */
+#include <apennines/t4/net/https_client.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* Parse host, port, path from an HTTPS URL */
-static int parse_url(const char *url, char *host, size_t host_sz,
-                      int *port, char *path, size_t path_sz) {
-    const char *p = url;
-    *port = 443;
-
-    if (strncmp(p, "https://", 8) == 0)
-        p += 8;
-    else if (strncmp(p, "http://", 7) == 0) {
-        p += 7;
-        *port = 80;
-    } else {
-        return -1;
-    }
-
-    const char *slash = strchr(p, '/');
-    const char *colon = strchr(p, ':');
-
-    if (colon && (!slash || colon < slash)) {
-        size_t hl = (size_t)(colon - p);
-        if (hl >= host_sz) hl = host_sz - 1;
-        memcpy(host, p, hl);
-        host[hl] = '\0';
-        *port = atoi(colon + 1);
-    } else if (slash) {
-        size_t hl = (size_t)(slash - p);
-        if (hl >= host_sz) hl = host_sz - 1;
-        memcpy(host, p, hl);
-        host[hl] = '\0';
-    } else {
-        snprintf(host, host_sz, "%s", p);
-        slash = NULL;
-    }
-
-    /* strip trailing slash from host */
-    size_t hlen = strlen(host);
-    while (hlen > 0 && host[hlen - 1] == '/') host[--hlen] = '\0';
-
-    if (slash)
-        snprintf(path, path_sz, "%s", slash);
-    else
-        snprintf(path, path_sz, "/");
-
-    return 0;
-}
 
 /* Simple JSON string extraction: find "key":"value" and copy value */
 static int json_get(const char *json, const char *key,
@@ -126,72 +80,51 @@ int cookbook_oidc_client_credentials(const cookbook_oidc_config *cfg,
     if (!cfg || !cfg->issuer || !client_id || !client_secret)
         return -1;
 
-    /* build token endpoint URL: {issuer}/oauth/token
-       (standard OIDC: {issuer}/token, but /oauth/token is also common) */
+    /* build token endpoint URL */
     char token_url[512];
     snprintf(token_url, sizeof(token_url), "%s/oauth/token", cfg->issuer);
 
-    char host[256], path[256];
-    int port;
-    if (parse_url(token_url, host, sizeof(host), &port,
-                   path, sizeof(path)) != 0)
-        return -1;
-
-    /* build POST body: grant_type=client_credentials&client_id=...&client_secret=... */
+    /* build POST body */
     char body[1024];
     int body_len = snprintf(body, sizeof(body),
         "grant_type=client_credentials&client_id=%s&client_secret=%s",
         client_id, client_secret);
 
-    /* build HTTP request */
-    char request[2048];
-    int req_len = snprintf(request, sizeof(request),
-        "POST %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Content-Type: application/x-www-form-urlencoded\r\n"
-        "Content-Length: %d\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "%s",
-        path, host, body_len, body);
+    /* POST via apennines HTTPS client */
+    https_client *hc = NULL;
+    if (https_client_create(&hc) != 0) return -1;
+    https_client_set_timeout(hc, 10000);
 
-    /* connect via TLS (OIDC issuers are always HTTPS) */
-    cookbook_tls_sock *ts = cookbook_sock_connect_tls(host, port, 10);
-    if (!ts) return -1;
-
-    /* send request */
-    if (cookbook_tls_sock_send(ts, request, (size_t)req_len) != 0) {
-        cookbook_tls_sock_close(ts);
+    https_response hr;
+    memset(&hr, 0, sizeof(hr));
+    unsigned long hrc = https_client_post(&hr, hc, token_url,
+                                            (const u8 *)body, (u64)body_len,
+                                            "application/x-www-form-urlencoded");
+    if (hrc != 0 || hr.status != 200) {
+        https_response_free(&hr);
+        https_client_destroy(hc);
         return -1;
     }
 
-    /* receive response */
-    char resp[8192];
-    size_t total = 0;
-    for (;;) {
-        int n = cookbook_tls_sock_recv(ts, resp + total,
-                                       sizeof(resp) - 1 - total);
-        if (n <= 0) break;
-        total += (size_t)n;
+    /* null-terminate body for string parsing */
+    char *resp_body = malloc(hr.body_len + 1);
+    if (!resp_body) {
+        https_response_free(&hr);
+        https_client_destroy(hc);
+        return -1;
     }
-    resp[total] = '\0';
-    cookbook_tls_sock_close(ts);
-
-    /* check HTTP status */
-    const char *sp = strchr(resp, ' ');
-    int status = sp ? atoi(sp + 1) : 0;
-    if (status != 200) return -1;
-
-    /* find response body (after \r\n\r\n) */
-    const char *resp_body = strstr(resp, "\r\n\r\n");
-    if (!resp_body) return -1;
-    resp_body += 4;
+    memcpy(resp_body, hr.body, hr.body_len);
+    resp_body[hr.body_len] = '\0';
+    https_response_free(&hr);
+    https_client_destroy(hc);
 
     /* extract access_token from JSON response */
     char access_token[4096] = {0};
     if (json_get(resp_body, "access_token", access_token,
-                  sizeof(access_token)) != 0)
+                  sizeof(access_token)) != 0) {
+        free(resp_body);
         return -1;
+    }
 
     /* decode JWT to extract sub */
     if (decode_jwt_sub(access_token, sub_out, sub_sz) != 0) {
@@ -203,5 +136,6 @@ int cookbook_oidc_client_credentials(const cookbook_oidc_config *cfg,
         }
     }
 
+    free(resp_body);
     return 0;
 }

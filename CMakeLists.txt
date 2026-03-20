@@ -89,6 +89,9 @@ target_include_directories(apennines
 )
 target_compile_definitions(apennines PUBLIC APENNINES_STATIC)
 target_compile_definitions(apennines PRIVATE APENNINES_BUILDING)
+if(WIN32)
+    target_link_libraries(apennines PUBLIC ws2_32)
+endif()
 
 # ---------- vendor: sqlite ----------
 

@@ -73,9 +73,41 @@ COOKBOOK_S3_SECRET_KEY=wJal...
 |----------|---------|-------------|
 | `COOKBOOK_LDAP_URL` | *(none)* | LDAP server URL (`ldap://host:389` or `ldaps://host:636`) |
 | `COOKBOOK_LDAP_BASE_DN` | *(none)* | Search base (`ou=users,dc=example,dc=com`) |
-| `COOKBOOK_LDAP_USER_ATTR` | `uid` | User attribute for DN construction |
+| `COOKBOOK_LDAP_USER_ATTR` | `uid` | User attribute for DN construction (`uid`, `cn`, `sAMAccountName`) |
+| `COOKBOOK_LDAP_GROUP_ATTR` | *(none)* | Group membership attribute (e.g., `memberOf`). When set, cookbook searches for group membership after successful bind. |
+| `COOKBOOK_LDAP_GROUP_BASE` | *(uses base_dn)* | Base DN for group search. Defaults to `COOKBOOK_LDAP_BASE_DN`. |
 
-When configured, clients can authenticate with `{"subject":"user","token":"pass","method":"ldap"}`. Cookbook performs a simple bind against the LDAP directory. LDAPS (TLS) is supported.
+When configured, clients authenticate with `{"subject":"user","token":"pass","method":"ldap"}`. Cookbook:
+
+1. Constructs DN: `{user_attr}={subject},{base_dn}`
+2. Performs a simple bind with the user's password
+3. If `COOKBOOK_LDAP_GROUP_ATTR` is set, searches for the user's entry and extracts group membership values (e.g., `memberOf` → `CN=developers,OU=Groups,DC=...` → `developers`)
+4. Issues a JWT with the extracted groups
+
+Groups from LDAP are used directly in JWT claims. CN is extracted from DN-style values automatically (`CN=group,OU=...` → `group`).
+
+LDAPS (TLS) is supported via `ldaps://` URLs. Fallback: if LDAP fails and the user has a local credential, local Argon2id verification is attempted.
+
+### OIDC backend
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `COOKBOOK_OIDC_ISSUER` | *(none)* | OIDC issuer URL (`https://idp.example.com`) |
+| `COOKBOOK_OIDC_CLIENT_ID` | *(none)* | Cookbook's client_id at the IdP |
+
+Two OIDC flows are supported:
+
+**Client credentials** (CI/non-interactive): `POST /auth/token` with `{"grant_type":"client_credentials","client_id":"x","client_secret":"y"}`. Cookbook validates against the IdP's token endpoint via HTTPS, then issues its own JWT.
+
+**Device code** (interactive): `POST /auth/device` → user authorizes → client polls `POST /auth/device/token`. When an OIDC issuer is configured, cookbook proxies the device authorization to the IdP. Falls back to standalone mode if the IdP is unreachable.
+
+### CA bundle (TLS certificate verification)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `COOKBOOK_CA_BUNDLE` | *(none)* | Path to PEM CA certificate bundle for TLS verification |
+
+When set, outbound TLS connections (LDAPS, HTTPS grid peers, S3, OIDC) verify the server's certificate chain against trusted CAs. Without this, certificate signatures are still verified but the chain of trust is not (equivalent to `curl -k`).
 
 ## Grid federation
 

@@ -151,11 +151,18 @@ Cookbook can authenticate users against an LDAP directory (Active Directory, Ope
 export COOKBOOK_LDAP_URL=ldap://ldap.example.com:389
 export COOKBOOK_LDAP_BASE_DN=ou=users,dc=example,dc=com
 export COOKBOOK_LDAP_USER_ATTR=uid
+export COOKBOOK_LDAP_GROUP_ATTR=memberOf
 ```
 
 For LDAPS (TLS):
 ```sh
 export COOKBOOK_LDAP_URL=ldaps://ldap.example.com:636
+```
+
+For Active Directory:
+```sh
+export COOKBOOK_LDAP_USER_ATTR=sAMAccountName
+export COOKBOOK_LDAP_GROUP_ATTR=memberOf
 ```
 
 ### Client usage
@@ -166,11 +173,35 @@ curl -X POST http://localhost:8080/auth/token \
   -d '{"subject":"alice","token":"ldap-password","method":"ldap"}'
 ```
 
-Cookbook constructs the DN as `{user_attr}={subject},{base_dn}` and performs a simple bind. On success, a JWT is issued.
+Cookbook:
+1. Constructs the DN as `{user_attr}={subject},{base_dn}` (e.g., `uid=alice,ou=users,dc=example,dc=com`)
+2. Performs a simple bind with the user's password
+3. If `COOKBOOK_LDAP_GROUP_ATTR` is set, searches for the user's entry and extracts group membership
+4. Issues a JWT with the user's LDAP groups as claims
 
 ### Groups
 
-LDAP group membership is not yet mapped automatically. Create policies via `/admin/policies` to assign permissions to LDAP-authenticated users.
+When `COOKBOOK_LDAP_GROUP_ATTR=memberOf` is configured, cookbook automatically maps LDAP group membership to JWT group claims after successful bind. DN-style values are reduced to their CN component:
+
+```
+memberOf: CN=developers,OU=Groups,DC=example,DC=com → "developers"
+memberOf: CN=publish-team,OU=Groups,DC=example,DC=com → "publish-team"
+```
+
+The resulting JWT contains `groups: "developers,publish-team"`. Combined with cookbook policies, this enables LDAP-driven access control:
+
+```sh
+# create a policy that grants publish rights to the "developers" group
+curl -X PUT http://localhost:8080/admin/policies/developers \
+  -H "Content-Type: application/x-pasta" \
+  -d '@identity { sub: "developers", kind: "team" } @grants { com.example: "crwd" }'
+```
+
+Users in the LDAP `developers` group automatically get `crwd` permissions on `com.example` artifacts.
+
+### Fallback
+
+If LDAP bind fails (server unreachable, wrong password), cookbook falls back to local credential verification (Argon2id). This enables migration: create local credentials first, configure LDAP, then phase out local credentials as users switch to LDAP auth.
 
 ---
 

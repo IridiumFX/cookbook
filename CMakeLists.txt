@@ -77,6 +77,11 @@ add_library(apennines STATIC
     vendor/apennines/sources/t3/db/wal.c
     vendor/apennines/sources/t3/net/http.c
     vendor/apennines/sources/t3/net/tcp.c
+    vendor/apennines/sources/t3/net/dns.c
+    vendor/apennines/sources/t3/net/h2.c
+    vendor/apennines/sources/t3/net/tls.c
+    vendor/apennines/sources/t4/net/http_client.c
+    vendor/apennines/sources/t4/net/https_client.c
     vendor/apennines/sources/t4/net/http_server.c
 )
 target_include_directories(apennines

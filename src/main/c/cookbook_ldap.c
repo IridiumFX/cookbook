@@ -258,11 +258,11 @@ int cookbook_ldap_bind(const cookbook_ldap_config *cfg,
     const char *host = cfg->url;
     int port = 389;
 
+    int use_tls = 0;
     if (strncmp(host, "ldaps://", 8) == 0) {
         host += 8;
         port = 636;
-        /* Note: LDAPS (TLS) not yet supported — requires TLS handshake */
-        return -1; /* TODO: TLS support */
+        use_tls = 1;
     } else if (strncmp(host, "ldap://", 7) == 0) {
         host += 7;
     }
@@ -284,29 +284,48 @@ int cookbook_ldap_bind(const cookbook_ldap_config *cfg,
     snprintf(user_dn, sizeof(user_dn), "%s=%s,%s",
              attr, subject, cfg->base_dn ? cfg->base_dn : "");
 
-    /* connect */
-    cookbook_sock_t s = cookbook_sock_connect(host_buf, port, 5);
-    if (s == COOKBOOK_SOCK_INVALID) return -1;
+    /* connect (plain or TLS) */
+    cookbook_sock_t raw_s = COOKBOOK_SOCK_INVALID;
+    cookbook_tls_sock *tls_s = NULL;
+
+    if (use_tls) {
+        tls_s = cookbook_sock_connect_tls(host_buf, port, 5);
+        if (!tls_s) return -1;
+    } else {
+        raw_s = cookbook_sock_connect(host_buf, port, 5);
+        if (raw_s == COOKBOOK_SOCK_INVALID) return -1;
+    }
+
+    /* helper macros for send/recv/close over plain or TLS */
+    #define LDAP_SEND(data, len) \
+        (use_tls ? cookbook_tls_sock_send(tls_s, data, len) \
+                 : cookbook_sock_send(raw_s, data, len))
+    #define LDAP_RECV(buf, len) \
+        (use_tls ? (cookbook_tls_sock_recv(tls_s, buf, len) == (int)(len) ? 0 : -1) \
+                 : cookbook_sock_recv(raw_s, buf, len))
+    #define LDAP_CLOSE() do { \
+        if (use_tls) cookbook_tls_sock_close(tls_s); \
+        else cookbook_sock_close(raw_s); \
+    } while(0)
 
     /* build and send BindRequest */
     unsigned char req[2048];
     size_t req_len = 0;
     if (build_bind_request(req, sizeof(req), &req_len, 1,
                             user_dn, password) != 0) {
-        cookbook_sock_close(s);
+        LDAP_CLOSE();
         return -1;
     }
 
-    if (cookbook_sock_send(s, req, req_len) != 0) {
-        cookbook_sock_close(s);
+    if (LDAP_SEND(req, req_len) != 0) {
+        LDAP_CLOSE();
         return -1;
     }
 
     /* receive BindResponse — read header first to get length */
     unsigned char resp[4096];
-    /* read first 2 bytes: tag + first length byte */
-    if (cookbook_sock_recv(s, resp, 2) != 0) {
-        cookbook_sock_close(s);
+    if (LDAP_RECV(resp, 2) != 0) {
+        LDAP_CLOSE();
         return -1;
     }
 
@@ -316,9 +335,9 @@ int cookbook_ldap_bind(const cookbook_ldap_config *cfg,
         total_len = (size_t)resp[1];
     } else {
         hdr_extra = (size_t)(resp[1] & 0x7F);
-        if (hdr_extra > 3 || hdr_extra == 0) { cookbook_sock_close(s); return -1; }
-        if (cookbook_sock_recv(s, resp + 2, hdr_extra) != 0) {
-            cookbook_sock_close(s);
+        if (hdr_extra > 3 || hdr_extra == 0) { LDAP_CLOSE(); return -1; }
+        if (LDAP_RECV(resp + 2, hdr_extra) != 0) {
+            LDAP_CLOSE();
             return -1;
         }
         total_len = 0;
@@ -328,18 +347,21 @@ int cookbook_ldap_bind(const cookbook_ldap_config *cfg,
 
     size_t hdr_size = 2 + hdr_extra;
     if (total_len + hdr_size > sizeof(resp)) {
-        cookbook_sock_close(s);
+        LDAP_CLOSE();
         return -1;
     }
 
     /* read the rest of the message */
-    if (total_len > 0 &&
-        cookbook_sock_recv(s, resp + hdr_size, total_len) != 0) {
-        cookbook_sock_close(s);
+    if (total_len > 0 && LDAP_RECV(resp + hdr_size, total_len) != 0) {
+        LDAP_CLOSE();
         return -1;
     }
 
-    cookbook_sock_close(s);
+    LDAP_CLOSE();
+
+    #undef LDAP_SEND
+    #undef LDAP_RECV
+    #undef LDAP_CLOSE
 
     /* parse response */
     int rc = parse_bind_response(resp, hdr_size + total_len);

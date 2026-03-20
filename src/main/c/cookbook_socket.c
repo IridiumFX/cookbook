@@ -129,3 +129,51 @@ void cookbook_sock_close(cookbook_sock_t s) {
     close(s);
 #endif
 }
+
+/* ---- TLS-wrapped socket ---- */
+
+#include "cookbook_tls.h"
+
+struct cookbook_tls_sock {
+    cookbook_sock_t  raw;
+    cookbook_tls    *tls;
+};
+
+cookbook_tls_sock *cookbook_sock_connect_tls(const char *host, int port,
+                                            int timeout_sec) {
+    cookbook_sock_t raw = cookbook_sock_connect(host, port, timeout_sec);
+    if (raw == COOKBOOK_SOCK_INVALID) return NULL;
+
+    cookbook_tls *tls = cookbook_tls_connect(raw, host);
+    if (!tls) {
+        cookbook_sock_close(raw);
+        return NULL;
+    }
+
+    cookbook_tls_sock *ts = malloc(sizeof(*ts));
+    if (!ts) {
+        cookbook_tls_close(tls);
+        cookbook_sock_close(raw);
+        return NULL;
+    }
+    ts->raw = raw;
+    ts->tls = tls;
+    return ts;
+}
+
+int cookbook_tls_sock_send(cookbook_tls_sock *ts, const void *data, size_t len) {
+    if (!ts || !ts->tls) return -1;
+    return cookbook_tls_send(ts->tls, data, len);
+}
+
+int cookbook_tls_sock_recv(cookbook_tls_sock *ts, void *buf, size_t len) {
+    if (!ts || !ts->tls) return -1;
+    return cookbook_tls_recv(ts->tls, buf, len);
+}
+
+void cookbook_tls_sock_close(cookbook_tls_sock *ts) {
+    if (!ts) return;
+    if (ts->tls) cookbook_tls_close(ts->tls);
+    cookbook_sock_close(ts->raw);
+    free(ts);
+}

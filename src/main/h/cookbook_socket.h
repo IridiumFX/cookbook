@@ -54,4 +54,26 @@ COOKBOOK_API int cookbook_sock_recv_partial(cookbook_sock_t s,
 /* Close the socket. */
 COOKBOOK_API void cookbook_sock_close(cookbook_sock_t s);
 
+/* ---- TLS-wrapped socket ---- */
+
+/* Opaque TLS-wrapped socket (uses cookbook_tls internally) */
+typedef struct cookbook_tls_sock cookbook_tls_sock;
+
+/* Connect with TLS. Returns NULL on failure.
+   Performs TCP connect + TLS 1.3 handshake. */
+COOKBOOK_API cookbook_tls_sock *cookbook_sock_connect_tls(const char *host,
+                                                        int port,
+                                                        int timeout_sec);
+
+/* Send over TLS. Returns 0 on success, -1 on failure. */
+COOKBOOK_API int cookbook_tls_sock_send(cookbook_tls_sock *ts,
+                                       const void *data, size_t len);
+
+/* Receive over TLS. Returns bytes received, 0 on EOF, -1 on error. */
+COOKBOOK_API int cookbook_tls_sock_recv(cookbook_tls_sock *ts,
+                                       void *buf, size_t len);
+
+/* Close TLS + underlying socket. */
+COOKBOOK_API void cookbook_tls_sock_close(cookbook_tls_sock *ts);
+
 #endif /* COOKBOOK_SOCKET_H */

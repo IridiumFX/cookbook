@@ -21,6 +21,17 @@
 #include <sodium.h>
 #include <time.h>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#else
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#endif
+
 static int tests_run    = 0;
 static int tests_failed = 0;
 
@@ -3431,11 +3442,164 @@ static void test_ldap_config(void) {
     cookbook_ldap_config cfg = {0};
     ASSERT(cookbook_ldap_bind(&cfg, "user", "pass", NULL) == -1,
            "ldap: null url");
+}
 
-    /* test with config but unreachable host (should fail fast) */
-    cfg.url = "ldap://192.0.2.1:9999"; /* TEST-NET, unreachable */
-    cfg.base_dn = "dc=test";
-    /* don't actually test this — it would block on connect timeout */
+/* ---- LDAP integration test with mock server ---- */
+
+/* Pre-built BER responses for the mock LDAP server */
+
+/* BindResponse: success (resultCode=0, matchedDN="", diagnosticMessage="") */
+static const unsigned char LDAP_BIND_RESP_OK[] = {
+    0x30, 0x0C,             /* SEQUENCE, length 12 */
+    0x02, 0x01, 0x01,       /* INTEGER messageID=1 */
+    0x61, 0x07,             /* BindResponse [APPLICATION 1], length 7 */
+    0x0A, 0x01, 0x00,       /* ENUMERATED resultCode=0 (success) */
+    0x04, 0x00,             /* OCTET STRING matchedDN="" */
+    0x04, 0x00              /* OCTET STRING diagnosticMessage="" */
+};
+
+/* SearchResultEntry with memberOf=CN=developers,OU=Groups,DC=test */
+static const unsigned char LDAP_SEARCH_ENTRY_GROUPS[] = {
+    0x30, 0x52,             /* SEQUENCE, length 82 */
+    0x02, 0x01, 0x02,       /* INTEGER messageID=2 */
+    0x64, 0x4D,             /* SearchResultEntry [APPLICATION 4], length 77 */
+    0x04, 0x12, 'u','i','d','=','t','e','s','t',',','d','c','=','t','e','s','t',',','o', /* objectName */
+    0x30, 0x37,             /* SEQUENCE (attributes), length 55 */
+    0x30, 0x35,             /* SEQUENCE (PartialAttribute), length 53 */
+    0x04, 0x08, 'm','e','m','b','e','r','O','f', /* type="memberOf" */
+    0x31, 0x29,             /* SET, length 41 */
+    0x04, 0x27, 'C','N','=','d','e','v','e','l','o','p','e','r','s',',',
+    'O','U','=','G','r','o','u','p','s',',','D','C','=','t','e','s','t',
+    ',','D','C','=','c','o','m' /* value */
+};
+
+/* SearchResultDone: success */
+static const unsigned char LDAP_SEARCH_DONE_OK[] = {
+    0x30, 0x0C,             /* SEQUENCE, length 12 */
+    0x02, 0x01, 0x02,       /* INTEGER messageID=2 */
+    0x65, 0x07,             /* SearchResultDone [APPLICATION 5], length 7 */
+    0x0A, 0x01, 0x00,       /* ENUMERATED resultCode=0 */
+    0x04, 0x00,             /* matchedDN="" */
+    0x04, 0x00              /* diagnosticMessage="" */
+};
+
+typedef struct {
+    int port;
+    int ready;
+    int served;
+} mock_ldap_ctx;
+
+#ifdef _WIN32
+static DWORD WINAPI mock_ldap_thread(LPVOID arg) {
+#else
+static void *mock_ldap_thread(void *arg) {
+#endif
+    mock_ldap_ctx *ctx = (mock_ldap_ctx *)arg;
+
+    /* create TCP listener */
+    cookbook_sock_t lsock = COOKBOOK_SOCK_INVALID;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((unsigned short)ctx->port);
+
+    lsock = socket(AF_INET, SOCK_STREAM, 0);
+    if (lsock == COOKBOOK_SOCK_INVALID) goto done;
+
+    int yes = 1;
+    setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
+
+    if (bind(lsock, (struct sockaddr *)&addr, sizeof(addr)) != 0) goto done;
+    if (listen(lsock, 1) != 0) goto done;
+
+    ctx->ready = 1;
+
+    /* accept one connection */
+    cookbook_sock_t cli = accept(lsock, NULL, NULL);
+    if (cli == COOKBOOK_SOCK_INVALID) goto done;
+
+    /* read BindRequest (just consume it) */
+    unsigned char rbuf[2048];
+    int n = recv(cli, (char *)rbuf, sizeof(rbuf), 0);
+    if (n <= 0) { cookbook_sock_close(cli); goto done; }
+
+    /* send BindResponse (success) */
+    send(cli, (const char *)LDAP_BIND_RESP_OK,
+         sizeof(LDAP_BIND_RESP_OK), 0);
+
+    /* read SearchRequest (just consume it) */
+    n = recv(cli, (char *)rbuf, sizeof(rbuf), 0);
+    if (n > 0) {
+        /* send SearchResultEntry with groups */
+        send(cli, (const char *)LDAP_SEARCH_ENTRY_GROUPS,
+             sizeof(LDAP_SEARCH_ENTRY_GROUPS), 0);
+        /* send SearchResultDone */
+        send(cli, (const char *)LDAP_SEARCH_DONE_OK,
+             sizeof(LDAP_SEARCH_DONE_OK), 0);
+    }
+
+    cookbook_sock_close(cli);
+    ctx->served = 1;
+
+done:
+    if (lsock != COOKBOOK_SOCK_INVALID) cookbook_sock_close(lsock);
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+static void test_ldap_integration(void) {
+    /* start mock LDAP server on a high port */
+    mock_ldap_ctx mctx = { .port = 19389, .ready = 0, .served = 0 };
+
+#ifdef _WIN32
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    HANDLE th = CreateThread(NULL, 0, mock_ldap_thread, &mctx, 0, NULL);
+#else
+    pthread_t th;
+    pthread_create(&th, NULL, mock_ldap_thread, &mctx);
+#endif
+
+    /* wait for server to be ready */
+    for (int i = 0; i < 100 && !mctx.ready; i++) {
+#ifdef _WIN32
+        Sleep(10);
+#else
+        usleep(10000);
+#endif
+    }
+    ASSERT(mctx.ready, "ldap mock: server ready");
+
+    /* connect and bind */
+    cookbook_ldap_config cfg = {
+        .url = "ldap://127.0.0.1:19389",
+        .base_dn = "dc=test,dc=com",
+        .user_attr = "uid",
+        .group_attr = "memberOf",
+        .group_base = NULL
+    };
+
+    char *groups = NULL;
+    int rc = cookbook_ldap_bind(&cfg, "test", "password", &groups);
+    ASSERT(rc == 0, "ldap mock: bind success");
+    ASSERT(groups != NULL, "ldap mock: groups returned");
+    ASSERT(strstr(groups, "developers") != NULL,
+           "ldap mock: developers group found");
+    free(groups);
+
+    /* wait for thread to finish */
+#ifdef _WIN32
+    WaitForSingleObject(th, 5000);
+    CloseHandle(th);
+#else
+    pthread_join(th, NULL);
+#endif
+
+    ASSERT(mctx.served, "ldap mock: request served");
 }
 
 /* ---- WAL tests ---- */
@@ -3639,6 +3803,7 @@ int main(void) {
     test_connpool_basic();
     test_gzip_compress();
     test_ldap_config();
+    test_ldap_integration();
     test_wal_basic();
     test_kv_basic();
 

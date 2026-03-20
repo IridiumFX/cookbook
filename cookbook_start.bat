@@ -17,6 +17,20 @@ set COOKBOOK_PENDING_TIMEOUT_SEC=3600
 set COOKBOOK_AUDIT_DIR=.\data\audit
 set COOKBOOK_OBJECT_CACHE_TTL_SEC=86400
 
+:: LDAP (uncomment and configure to enable)
+:: set COOKBOOK_LDAP_URL=ldap://ldap.example.com:389
+:: set COOKBOOK_LDAP_BASE_DN=ou=users,dc=example,dc=com
+:: set COOKBOOK_LDAP_USER_ATTR=uid
+:: set COOKBOOK_LDAP_GROUP_ATTR=memberOf
+:: set COOKBOOK_LDAP_GROUP_BASE=
+
+:: OIDC (uncomment and configure to enable)
+:: set COOKBOOK_OIDC_ISSUER=https://idp.example.com
+:: set COOKBOOK_OIDC_CLIENT_ID=cookbook
+
+:: TLS certificate verification (uncomment to enable)
+:: set COOKBOOK_CA_BUNDLE=.\ca-certificates.crt
+
 :: Runtime libraries
 set PATH=C:\Program Files\PostgreSQL\16\bin;C:\Program Files\JetBrains\CLion 2025.3.3\bin\mingw\bin;%PATH%
 

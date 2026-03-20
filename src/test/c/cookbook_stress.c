@@ -181,7 +181,7 @@ typedef struct {
     int           id;
     int           port;
     int           requests;
-    int           phase;       /* 0=publish, 1=resolve, 2=get, 3=conneg */
+    int           phase;       /* 0=publish, 1=resolve, 2=get, 3=conneg, 4=objects, 5=health */
     int           quiet;
     worker_stats  stats;
 } worker_ctx;
@@ -255,6 +255,32 @@ static void *worker_thread(void *arg) {
             };
             rc = http_request("127.0.0.1", w->port,
                 "GET", path, NULL, accepts[i % 4],
+                NULL, 0, &status, &lat);
+        } else if (w->phase == 4) {
+            /* OBJECTS: PUT + GET cached compilation objects */
+            char key[128];
+            snprintf(key, sizeof(key), "/objects/stress_%d_%d.o", w->id, i);
+            char fake_obj[64] = "fake compiled object data for stress test";
+            if (i % 2 == 0) {
+                /* PUT */
+                rc = http_request("127.0.0.1", w->port,
+                    "PUT", key, "application/octet-stream", NULL,
+                    fake_obj, strlen(fake_obj), &status, &lat);
+            } else {
+                /* GET (may 404 on odd iterations) */
+                char prev_key[128];
+                snprintf(prev_key, sizeof(prev_key),
+                    "/objects/stress_%d_%d.o", w->id, i - 1);
+                rc = http_request("127.0.0.1", w->port,
+                    "GET", prev_key, NULL, NULL,
+                    NULL, 0, &status, &lat);
+            }
+        } else if (w->phase == 5) {
+            /* HEALTH: rapid healthz + readyz checks */
+            const char *paths[] = { "/healthz", "/readyz", "/metrics",
+                                     "/.well-known/now-registry" };
+            rc = http_request("127.0.0.1", w->port,
+                "GET", paths[i % 4], NULL, NULL,
                 NULL, 0, &status, &lat);
         }
 
@@ -391,10 +417,12 @@ int main(int argc, char **argv) {
         "PUBLISH (PUT)",
         "RESOLVE (GET /resolve/)",
         "GET (artifact)",
-        "CONNEG (Accept header variants)"
+        "CONNEG (Accept header variants)",
+        "OBJECTS (PUT/GET cache)",
+        "HEALTH (healthz/readyz/metrics/discovery)"
     };
 
-    for (int phase = 0; phase < 4; phase++) {
+    for (int phase = 0; phase < 6; phase++) {
         if (!quiet) printf("--- Phase %d: %s ---\n", phase, phase_names[phase]);
 
         worker_ctx *workers = calloc((size_t)concurrency, sizeof(worker_ctx));

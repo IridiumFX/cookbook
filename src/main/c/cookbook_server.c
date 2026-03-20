@@ -5416,6 +5416,32 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
     const char *colon = strrchr(url, ':');
     if (colon) port = colon + 1;
 
+#ifdef COOKBOOK_USE_APENNINES_HTTP
+    /* ---- apennines HTTP server path ---- */
+    {
+        extern int cookbook_http_start(const char *, int,
+                                       const unsigned char *, size_t,
+                                       const unsigned char *, size_t);
+
+        int iport = atoi(port);
+        /* TODO: load TLS cert/key from COOKBOOK_KEY_DIR if needed */
+        if (cookbook_http_start("0.0.0.0", iport, NULL, 0, NULL, 0) != 0) {
+            fprintf(stderr, "cookbook: failed to start apennines HTTP server on port %s\n", port);
+            free(srv->registry_id);
+            free(srv);
+            return NULL;
+        }
+        srv->ctx = NULL; /* no civetweb context */
+
+        /* TODO: register routes on apennines http_server.
+           For now, this is a placeholder — the actual route registration
+           needs wrapper handlers that translate http_ctx to our handler
+           signatures. This will be done incrementally. */
+
+        fprintf(stdout, "cookbook: using apennines HTTP server (experimental)\n");
+    }
+#else
+    /* ---- civetweb path (default, battle-tested) ---- */
     const char *civetweb_opts[] = {
         "listening_ports", port,
         "num_threads", "4",
@@ -5479,6 +5505,7 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
     /* auth v2: policy admin endpoints */
     mg_set_request_handler(srv->ctx, "/admin/policies",
                            handle_admin_policies, srv);
+#endif /* !COOKBOOK_USE_APENNINES_HTTP */
 
     /* #20: start reconciliation thread */
     srv->reconcile_running = 1;
@@ -5532,7 +5559,14 @@ void cookbook_server_stop(cookbook_server *srv) {
     pthread_join(srv->reconcile_thread, NULL);
 #endif
 
+#ifdef COOKBOOK_USE_APENNINES_HTTP
+    {
+        extern void cookbook_http_stop(void);
+        cookbook_http_stop();
+    }
+#else
     if (srv->ctx) mg_stop(srv->ctx);
+#endif
 
     /* clean up revocation list */
     cookbook_revocation_free(&srv->revocations);

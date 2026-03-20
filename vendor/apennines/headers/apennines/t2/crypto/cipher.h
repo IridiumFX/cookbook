@@ -100,4 +100,24 @@ struct aes_ctr_ctx {
     u64      offset;      /* bytes consumed in current keystream block */
 };
 
+/* ---- ChaCha20-Poly1305 (AEAD, RFC 8439) ---- */
+
+APENNINES_API unsigned long chacha20_poly1305_encrypt(u8 *out, u8 *tag16,
+                                                       const u8 *key32,
+                                                       const u8 *nonce12,
+                                                       const u8 *aad, u64 aad_len,
+                                                       const u8 *in, u64 in_len);
+
+APENNINES_API unsigned long chacha20_poly1305_decrypt(u8 *out,
+                                                       const u8 *key32,
+                                                       const u8 *nonce12,
+                                                       const u8 *aad, u64 aad_len,
+                                                       const u8 *in, u64 in_len,
+                                                       const u8 *tag16);
+
+/* Raw ChaCha20 stream cipher (RFC 8439 Section 2.4) */
+APENNINES_API unsigned long chacha20_encrypt(u8 *out, const u8 *key32,
+                                              const u8 *nonce12, u32 counter,
+                                              const u8 *in, u64 in_len);
+
 #endif /* APENNINES_T2_CRYPTO_CIPHER_H */

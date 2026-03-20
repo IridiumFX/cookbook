@@ -47,8 +47,9 @@
 #define HS_CERT_VERIFY       15
 #define HS_FINISHED          20
 
-#define TLS_AES_128_GCM_SHA256 0x1301
-#define TLS_X25519              0x001D
+#define TLS_AES_128_GCM_SHA256       0x1301
+#define TLS_CHACHA20_POLY1305_SHA256 0x1303
+#define TLS_X25519                    0x001D
 
 /* TLS 1.3 uses legacy version 0x0303 in record layer */
 #define TLS_LEGACY_VERSION   0x0303
@@ -67,10 +68,13 @@ void cookbook_tls_set_ca_store(void *store) {
 
 struct cookbook_tls {
     cookbook_sock_t sock;
+    uint16_t    cipher_suite;  /* negotiated: 0x1301 or 0x1303 */
 
-    /* traffic keys */
-    aes_ctx     send_aes;
-    aes_ctx     recv_aes;
+    /* traffic keys — AES-GCM or ChaCha20-Poly1305 */
+    aes_ctx     send_aes;     /* used only for AES-GCM */
+    aes_ctx     recv_aes;     /* used only for AES-GCM */
+    u8          send_key[32]; /* raw key for ChaCha20 (32 bytes) or AES (16) */
+    u8          recv_key[32];
     u8          send_iv[12];
     u8          recv_iv[12];
     u64         send_seq;
@@ -153,8 +157,13 @@ static int tls_send_record(cookbook_tls *tls, u8 content_type,
     build_nonce(nonce, tls->send_iv, tls->send_seq);
     tls->send_seq++;
 
-    aes128_gcm_encrypt(ciphertext, tag, &tls->send_aes,
-                        nonce, aad, 5, plain, (u64)plain_len);
+    if (tls->cipher_suite == TLS_CHACHA20_POLY1305_SHA256) {
+        chacha20_poly1305_encrypt(ciphertext, tag, tls->send_key,
+                                   nonce, aad, 5, plain, (u64)plain_len);
+    } else {
+        aes128_gcm_encrypt(ciphertext, tag, &tls->send_aes,
+                            nonce, aad, 5, plain, (u64)plain_len);
+    }
     /* append tag to ciphertext */
     memcpy(ciphertext + plain_len, tag, 16);
 
@@ -208,9 +217,16 @@ static int tls_recv_record(cookbook_tls *tls, u8 *out_type,
     u8 *plain = malloc(cipher_body);
     if (!plain) { free(rec); return -1; }
 
-    unsigned long rc = aes128_gcm_decrypt(plain, &tls->recv_aes,
-                                           nonce, header, 5,
-                                           rec, (u64)cipher_body, tag);
+    unsigned long rc;
+    if (tls->cipher_suite == TLS_CHACHA20_POLY1305_SHA256) {
+        rc = chacha20_poly1305_decrypt(plain, tls->recv_key,
+                                        nonce, header, 5,
+                                        rec, (u64)cipher_body, tag);
+    } else {
+        rc = aes128_gcm_decrypt(plain, &tls->recv_aes,
+                                 nonce, header, 5,
+                                 rec, (u64)cipher_body, tag);
+    }
     free(rec);
     if (rc != 0) { free(plain); return -1; }
 
@@ -277,9 +293,10 @@ static size_t build_client_hello(u8 *buf, size_t buf_sz,
     body[pos++] = 32;
     memcpy(body + pos, session_id, 32); pos += 32;
 
-    /* cipher suites: TLS_AES_128_GCM_SHA256 only */
-    put_u16(body + pos, 2); pos += 2; /* length */
+    /* cipher suites: AES-128-GCM + ChaCha20-Poly1305 */
+    put_u16(body + pos, 4); pos += 2; /* length = 2 suites * 2 bytes */
     put_u16(body + pos, TLS_AES_128_GCM_SHA256); pos += 2;
+    put_u16(body + pos, TLS_CHACHA20_POLY1305_SHA256); pos += 2;
 
     /* compression methods: null only */
     body[pos++] = 1;
@@ -398,6 +415,13 @@ cookbook_tls *cookbook_tls_connect(cookbook_sock_t sock, const char *hostname) {
     if (sp >= sh_body_len) { free(sh_rec); free(tls); return NULL; }
     u8 sid_len = sh[sp++];
     sp += sid_len;
+    /* extract selected cipher suite */
+    tls->cipher_suite = get_u16(sh + sp);
+    if (tls->cipher_suite != TLS_AES_128_GCM_SHA256 &&
+        tls->cipher_suite != TLS_CHACHA20_POLY1305_SHA256) {
+        free(sh_rec); free(tls);
+        return NULL; /* unsupported cipher suite */
+    }
     sp += 2; /* cipher suite */
     sp += 1; /* compression */
 
@@ -469,23 +493,27 @@ cookbook_tls *cookbook_tls_connect(cookbook_sock_t sock, const char *hostname) {
     tls13_derive_secret(s_hs_secret, HKDF_HASH_LEN, hs_secret,
                          "s hs traffic", 12, sh_hash, 32);
 
-    /* derive handshake keys */
-    u8 s_hs_key[16], s_hs_iv[12];
-    tls13_derive_secret(s_hs_key, 16, s_hs_secret, "key", 3, NULL, 0);
+    /* derive handshake keys — key size depends on cipher suite */
+    int key_len = (tls->cipher_suite == TLS_CHACHA20_POLY1305_SHA256) ? 32 : 16;
+
+    u8 s_hs_key[32], s_hs_iv[12];
+    tls13_derive_secret(s_hs_key, (size_t)key_len, s_hs_secret, "key", 3, NULL, 0);
     tls13_derive_secret(s_hs_iv, 12, s_hs_secret, "iv", 2, NULL, 0);
 
-    u8 c_hs_key[16], c_hs_iv[12];
-    tls13_derive_secret(c_hs_key, 16, c_hs_secret, "key", 3, NULL, 0);
+    u8 c_hs_key[32], c_hs_iv[12];
+    tls13_derive_secret(c_hs_key, (size_t)key_len, c_hs_secret, "key", 3, NULL, 0);
     tls13_derive_secret(c_hs_iv, 12, c_hs_secret, "iv", 2, NULL, 0);
 
     /* set up handshake decryption */
-    aes_ctx hs_recv_aes, hs_send_aes;
-    aes128_init(&hs_recv_aes, s_hs_key);
-    aes128_init(&hs_send_aes, c_hs_key);
+    if (tls->cipher_suite == TLS_CHACHA20_POLY1305_SHA256) {
+        memcpy(tls->recv_key, s_hs_key, 32);
+        memcpy(tls->send_key, c_hs_key, 32);
+    } else {
+        aes128_init(&tls->recv_aes, s_hs_key);
+        aes128_init(&tls->send_aes, c_hs_key);
+    }
     memcpy(tls->recv_iv, s_hs_iv, 12);
     memcpy(tls->send_iv, c_hs_iv, 12);
-    tls->recv_aes = hs_recv_aes;
-    tls->send_aes = hs_send_aes;
     tls->recv_seq = 0;
     tls->send_seq = 0;
 
@@ -858,17 +886,22 @@ cookbook_tls *cookbook_tls_connect(cookbook_sock_t sock, const char *hostname) {
                          "s ap traffic", 12, app_hash, 32);
 
     /* derive application keys */
-    u8 s_app_key[16], s_app_iv[12];
-    tls13_derive_secret(s_app_key, 16, s_app_secret, "key", 3, NULL, 0);
+    u8 s_app_key[32], s_app_iv[12];
+    tls13_derive_secret(s_app_key, (size_t)key_len, s_app_secret, "key", 3, NULL, 0);
     tls13_derive_secret(s_app_iv, 12, s_app_secret, "iv", 2, NULL, 0);
 
-    u8 c_app_key[16], c_app_iv[12];
-    tls13_derive_secret(c_app_key, 16, c_app_secret, "key", 3, NULL, 0);
+    u8 c_app_key[32], c_app_iv[12];
+    tls13_derive_secret(c_app_key, (size_t)key_len, c_app_secret, "key", 3, NULL, 0);
     tls13_derive_secret(c_app_iv, 12, c_app_secret, "iv", 2, NULL, 0);
 
     /* install application traffic keys */
-    aes128_init(&tls->recv_aes, s_app_key);
-    aes128_init(&tls->send_aes, c_app_key);
+    if (tls->cipher_suite == TLS_CHACHA20_POLY1305_SHA256) {
+        memcpy(tls->recv_key, s_app_key, 32);
+        memcpy(tls->send_key, c_app_key, 32);
+    } else {
+        aes128_init(&tls->recv_aes, s_app_key);
+        aes128_init(&tls->send_aes, c_app_key);
+    }
     memcpy(tls->recv_iv, s_app_iv, 12);
     memcpy(tls->send_iv, c_app_iv, 12);
     tls->recv_seq = 0;

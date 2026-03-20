@@ -803,3 +803,342 @@ unsigned long aes256_gcm_decrypt(u8 *out,
     return aes_gcm_decrypt_impl(out, ctx->enc_rk, 14,
                                 nonce12, aad, aad_len, in, in_len, tag16);
 }
+
+/* ================================================================
+ *  ChaCha20 (RFC 8439)
+ * ================================================================ */
+
+#define ROTL32(v, n) (((v) << (n)) | ((v) >> (32 - (n))))
+
+#define QR(a, b, c, d) do { \
+    a += b; d ^= a; d = ROTL32(d, 16); \
+    c += d; b ^= c; b = ROTL32(b, 12); \
+    a += b; d ^= a; d = ROTL32(d, 8);  \
+    c += d; b ^= c; b = ROTL32(b, 7);  \
+} while(0)
+
+static u32 load32_le(const u8 *p) {
+    return (u32)p[0]
+         | ((u32)p[1] << 8)
+         | ((u32)p[2] << 16)
+         | ((u32)p[3] << 24);
+}
+
+static void store32_le(u8 *p, u32 v) {
+    p[0] = (u8)(v);
+    p[1] = (u8)(v >> 8);
+    p[2] = (u8)(v >> 16);
+    p[3] = (u8)(v >> 24);
+}
+
+static void store64_le(u8 *p, u64 v) {
+    store32_le(p, (u32)v);
+    store32_le(p + 4, (u32)(v >> 32));
+}
+
+static void chacha20_block(u8 out[64], const u8 key[32],
+                            const u8 nonce[12], u32 counter) {
+    u32 s[16];
+    /* "expand 32-byte k" */
+    s[0]  = 0x61707865u;
+    s[1]  = 0x3320646eu;
+    s[2]  = 0x79622d32u;
+    s[3]  = 0x6b206574u;
+    /* key */
+    for (int i = 0; i < 8; i++)
+        s[4 + i] = load32_le(key + 4 * i);
+    /* counter */
+    s[12] = counter;
+    /* nonce */
+    for (int i = 0; i < 3; i++)
+        s[13 + i] = load32_le(nonce + 4 * i);
+
+    u32 w[16];
+    memcpy(w, s, sizeof(w));
+
+    /* 20 rounds = 10 double-rounds */
+    for (int i = 0; i < 10; i++) {
+        /* column rounds */
+        QR(w[0], w[4], w[ 8], w[12]);
+        QR(w[1], w[5], w[ 9], w[13]);
+        QR(w[2], w[6], w[10], w[14]);
+        QR(w[3], w[7], w[11], w[15]);
+        /* diagonal rounds */
+        QR(w[0], w[5], w[10], w[15]);
+        QR(w[1], w[6], w[11], w[12]);
+        QR(w[2], w[7], w[ 8], w[13]);
+        QR(w[3], w[4], w[ 9], w[14]);
+    }
+
+    for (int i = 0; i < 16; i++)
+        store32_le(out + 4 * i, w[i] + s[i]);
+}
+
+static void chacha20_xor_stream(u8 *out, const u8 *in, u64 len,
+                                 const u8 key[32], const u8 nonce[12],
+                                 u32 counter) {
+    u8 block[64];
+    u64 off = 0;
+    while (off < len) {
+        chacha20_block(block, key, nonce, counter);
+        counter++;
+        u64 take = len - off;
+        if (take > 64) take = 64;
+        for (u64 j = 0; j < take; j++)
+            out[off + j] = in[off + j] ^ block[j];
+        off += take;
+    }
+    memset(block, 0, sizeof(block));
+}
+
+unsigned long chacha20_encrypt(u8 *out, const u8 *key32,
+                                const u8 *nonce12, u32 counter,
+                                const u8 *in, u64 in_len) {
+    if (!out)     return 1;
+    if (!key32)   return 2;
+    if (!nonce12) return 3;
+    if (in_len > 0 && !in) return 1;
+    chacha20_xor_stream(out, in, in_len, key32, nonce12, counter);
+    return 0;
+}
+
+/* ================================================================
+ *  Poly1305 MAC (RFC 8439 Section 2.5)
+ *  Five 26-bit limbs (donna-style)
+ * ================================================================ */
+
+typedef struct {
+    u32 r[5];   /* clamped r in 26-bit limbs */
+    u32 s[4];   /* s = key[16..31] as four 32-bit words */
+    u32 h[5];   /* accumulator in 26-bit limbs */
+} poly1305_ctx;
+
+static void poly1305_init(poly1305_ctx *st, const u8 key[32]) {
+    /* r with clamping */
+    u32 t0 = load32_le(key +  0);
+    u32 t1 = load32_le(key +  4);
+    u32 t2 = load32_le(key +  8);
+    u32 t3 = load32_le(key + 12);
+
+    st->r[0] =  t0                         & 0x3ffffff;
+    st->r[1] = ((t0 >> 26) | (t1 <<  6))   & 0x3ffff03;
+    st->r[2] = ((t1 >> 20) | (t2 << 12))   & 0x3ffc0ff;
+    st->r[3] = ((t2 >> 14) | (t3 << 18))   & 0x3f03fff;
+    st->r[4] =  (t3 >>  8)                 & 0x00fffff;
+
+    /* s */
+    st->s[0] = load32_le(key + 16);
+    st->s[1] = load32_le(key + 20);
+    st->s[2] = load32_le(key + 24);
+    st->s[3] = load32_le(key + 28);
+
+    /* accumulator = 0 */
+    st->h[0] = st->h[1] = st->h[2] = st->h[3] = st->h[4] = 0;
+}
+
+static void poly1305_block(poly1305_ctx *st, const u8 *msg, u32 hibit) {
+    u32 t0 = load32_le(msg +  0);
+    u32 t1 = load32_le(msg +  4);
+    u32 t2 = load32_le(msg +  8);
+    u32 t3 = load32_le(msg + 12);
+
+    u32 h0 = st->h[0] + ( t0                        & 0x3ffffff);
+    u32 h1 = st->h[1] + (((t0 >> 26) | (t1 <<  6)) & 0x3ffffff);
+    u32 h2 = st->h[2] + (((t1 >> 20) | (t2 << 12)) & 0x3ffffff);
+    u32 h3 = st->h[3] + (((t2 >> 14) | (t3 << 18)) & 0x3ffffff);
+    u32 h4 = st->h[4] + ( (t3 >>  8)                | hibit);
+
+    /* multiply: h = h * r mod p */
+    u32 r0 = st->r[0], r1 = st->r[1], r2 = st->r[2];
+    u32 r3 = st->r[3], r4 = st->r[4];
+    u32 s1 = r1 * 5, s2 = r2 * 5, s3 = r3 * 5, s4 = r4 * 5;
+
+    u64 d0 = (u64)h0*r0 + (u64)h1*s4 + (u64)h2*s3 + (u64)h3*s2 + (u64)h4*s1;
+    u64 d1 = (u64)h0*r1 + (u64)h1*r0 + (u64)h2*s4 + (u64)h3*s3 + (u64)h4*s2;
+    u64 d2 = (u64)h0*r2 + (u64)h1*r1 + (u64)h2*r0 + (u64)h3*s4 + (u64)h4*s3;
+    u64 d3 = (u64)h0*r3 + (u64)h1*r2 + (u64)h2*r1 + (u64)h3*r0 + (u64)h4*s4;
+    u64 d4 = (u64)h0*r4 + (u64)h1*r3 + (u64)h2*r2 + (u64)h3*r1 + (u64)h4*r0;
+
+    /* carry propagation */
+    u32 c;
+    c = (u32)(d0 >> 26); h0 = (u32)d0 & 0x3ffffff; d1 += c;
+    c = (u32)(d1 >> 26); h1 = (u32)d1 & 0x3ffffff; d2 += c;
+    c = (u32)(d2 >> 26); h2 = (u32)d2 & 0x3ffffff; d3 += c;
+    c = (u32)(d3 >> 26); h3 = (u32)d3 & 0x3ffffff; d4 += c;
+    c = (u32)(d4 >> 26); h4 = (u32)d4 & 0x3ffffff; h0 += c * 5;
+    c = h0 >> 26;        h0 &= 0x3ffffff;           h1 += c;
+
+    st->h[0] = h0; st->h[1] = h1; st->h[2] = h2;
+    st->h[3] = h3; st->h[4] = h4;
+}
+
+static void poly1305_update(poly1305_ctx *st, const u8 *data, u64 len) {
+    u64 off = 0;
+    while (off + 16 <= len) {
+        poly1305_block(st, data + off, 1u << 24); /* hibit = 2^128 in limb 4 */
+        off += 16;
+    }
+    if (off < len) {
+        u8 pad[16];
+        u64 rem = len - off;
+        memcpy(pad, data + off, (size_t)rem);
+        memset(pad + rem, 0, 16 - (size_t)rem);
+        /* hibit: partial block gets 1 << (8 * rem) in the 130-bit representation.
+           In our limb layout limb4 gets the high bits; but the standard approach
+           for partial blocks is to append 0x01 byte and set hibit=0 in limb4.
+           We follow the donna convention: pad[rem] = 1, hibit = 0. */
+        pad[rem] = 1;
+        poly1305_block(st, pad, 0);
+    }
+}
+
+static void poly1305_finish(poly1305_ctx *st, u8 tag[16]) {
+    /* full carry */
+    u32 h0 = st->h[0], h1 = st->h[1], h2 = st->h[2];
+    u32 h3 = st->h[3], h4 = st->h[4];
+    u32 c;
+
+    c = h1 >> 26; h1 &= 0x3ffffff; h2 += c;
+    c = h2 >> 26; h2 &= 0x3ffffff; h3 += c;
+    c = h3 >> 26; h3 &= 0x3ffffff; h4 += c;
+    c = h4 >> 26; h4 &= 0x3ffffff; h0 += c * 5;
+    c = h0 >> 26; h0 &= 0x3ffffff; h1 += c;
+
+    /* compute h + -(2^130 - 5) = h - p */
+    u32 g0 = h0 + 5; c = g0 >> 26; g0 &= 0x3ffffff;
+    u32 g1 = h1 + c; c = g1 >> 26; g1 &= 0x3ffffff;
+    u32 g2 = h2 + c; c = g2 >> 26; g2 &= 0x3ffffff;
+    u32 g3 = h3 + c; c = g3 >> 26; g3 &= 0x3ffffff;
+    u32 g4 = h4 + c - (1u << 26);
+
+    /* select h or g based on carry (if g4 top bit is 0, use g) */
+    u32 mask = (g4 >> 31) - 1; /* 0xffffffff if g4 >= 0 (use g), 0 if g4 < 0 (use h) */
+    /* g4 bit 31 is set if borrow occurred (h < p) => mask=0 => keep h.
+       If h >= p, no underflow => g4 bit 31 is 0 => mask=0xffffffff => select g. */
+    h0 = (h0 & ~mask) | (g0 & mask);
+    h1 = (h1 & ~mask) | (g1 & mask);
+    h2 = (h2 & ~mask) | (g2 & mask);
+    h3 = (h3 & ~mask) | (g3 & mask);
+    h4 = (h4 & ~mask) | (g4 & mask);
+
+    /* assemble h into 4 x 32-bit words */
+    u64 f;
+    f = (u64)h0 | ((u64)h1 << 26); u32 w0 = (u32)f; f >>= 32;
+    f += (u64)h1 >> 6 | ((u64)h2 << 20); u32 w1 = (u32)f; f >>= 32;
+    f += (u64)h2 >> 12 | ((u64)h3 << 14); u32 w2 = (u32)f; f >>= 32;
+    f += (u64)h3 >> 18 | ((u64)h4 << 8); u32 w3 = (u32)f;
+
+    /* add s */
+    f = (u64)w0 + st->s[0]; w0 = (u32)f;
+    f = (u64)w1 + st->s[1] + (f >> 32); w1 = (u32)f;
+    f = (u64)w2 + st->s[2] + (f >> 32); w2 = (u32)f;
+    f = (u64)w3 + st->s[3] + (f >> 32); w3 = (u32)f;
+
+    store32_le(tag +  0, w0);
+    store32_le(tag +  4, w1);
+    store32_le(tag +  8, w2);
+    store32_le(tag + 12, w3);
+
+    /* wipe state */
+    memset(st, 0, sizeof(*st));
+}
+
+/* ================================================================
+ *  ChaCha20-Poly1305 AEAD (RFC 8439 Section 2.8)
+ * ================================================================ */
+
+static void pad16(poly1305_ctx *st, u64 len) {
+    u64 rem = len & 0xf;
+    if (rem) {
+        u8 z[16] = {0};
+        poly1305_update(st, z, 16 - rem);
+    }
+}
+
+unsigned long chacha20_poly1305_encrypt(u8 *out, u8 *tag16,
+                                         const u8 *key32,
+                                         const u8 *nonce12,
+                                         const u8 *aad, u64 aad_len,
+                                         const u8 *in, u64 in_len) {
+    if (!out)     return 1;
+    if (!key32)   return 2;
+    if (!nonce12) return 3;
+    if (!tag16)   return 4;
+
+    /* 1. Generate Poly1305 one-time key (counter=0, first 32 bytes) */
+    u8 poly_key[64];
+    chacha20_block(poly_key, key32, nonce12, 0);
+
+    /* 2. Encrypt with ChaCha20 starting at counter=1 */
+    chacha20_xor_stream(out, in, in_len, key32, nonce12, 1);
+
+    /* 3. Compute Poly1305 tag */
+    poly1305_ctx pctx;
+    poly1305_init(&pctx, poly_key);
+    memset(poly_key, 0, sizeof(poly_key));
+
+    if (aad && aad_len > 0)
+        poly1305_update(&pctx, aad, aad_len);
+    pad16(&pctx, aad_len);
+
+    if (in_len > 0)
+        poly1305_update(&pctx, out, in_len);
+    pad16(&pctx, in_len);
+
+    u8 lens[16];
+    store64_le(lens, aad_len);
+    store64_le(lens + 8, in_len);
+    poly1305_update(&pctx, lens, 16);
+
+    poly1305_finish(&pctx, tag16);
+    return 0;
+}
+
+unsigned long chacha20_poly1305_decrypt(u8 *out,
+                                         const u8 *key32,
+                                         const u8 *nonce12,
+                                         const u8 *aad, u64 aad_len,
+                                         const u8 *in, u64 in_len,
+                                         const u8 *tag16) {
+    if (!out)     return 1;
+    if (!key32)   return 2;
+    if (!nonce12) return 3;
+    if (!tag16)   return 4;
+
+    /* 1. Generate Poly1305 one-time key */
+    u8 poly_key[64];
+    chacha20_block(poly_key, key32, nonce12, 0);
+
+    /* 2. Verify tag (constant-time) over ciphertext */
+    poly1305_ctx pctx;
+    poly1305_init(&pctx, poly_key);
+    memset(poly_key, 0, sizeof(poly_key));
+
+    if (aad && aad_len > 0)
+        poly1305_update(&pctx, aad, aad_len);
+    pad16(&pctx, aad_len);
+
+    if (in_len > 0)
+        poly1305_update(&pctx, in, in_len);
+    pad16(&pctx, in_len);
+
+    u8 lens[16];
+    store64_le(lens, aad_len);
+    store64_le(lens + 8, in_len);
+    poly1305_update(&pctx, lens, 16);
+
+    u8 computed_tag[16];
+    poly1305_finish(&pctx, computed_tag);
+
+    unsigned long eq;
+    ct_memcmp_16(&eq, computed_tag, tag16);
+    memset(computed_tag, 0, sizeof(computed_tag));
+    if (eq != 0) {
+        memset(out, 0, (size_t)in_len);
+        return 4;
+    }
+
+    /* 3. Decrypt */
+    chacha20_xor_stream(out, in, in_len, key32, nonce12, 1);
+    return 0;
+}

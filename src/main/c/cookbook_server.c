@@ -2721,29 +2721,34 @@ static int handle_auth_token(struct mg_connection *conn, void *cbdata) {
             goto issue_jwt;
         }
 
-        /* verify credentials based on method */
+        /* verify credentials with fallback chain:
+           method=ldap → try LDAP, fall back to local
+           method=token → try local, fall back to LDAP if configured
+           This supports migration: orgs transitioning to LDAP keep
+           local credentials working as backup. */
         if (sub[0] && body_token[0]) {
-            if (strcmp(method, "ldap") == 0 && srv->ldap_cfg.url) {
-                /* LDAP bind verification */
+            int try_ldap = (srv->ldap_cfg.url != NULL);
+            int try_local = 1;
+            int ldap_first = (strcmp(method, "ldap") == 0);
+
+            /* first attempt */
+            if (ldap_first && try_ldap) {
                 char *ldap_groups = NULL;
                 if (cookbook_ldap_bind(&srv->ldap_cfg, sub,
-                                       body_token, &ldap_groups) != 0) {
-                    free(body);
-                    METRIC_INC(srv->metrics.responses_4xx);
-                    METRIC_INC(srv->metrics.auth_failures);
-                    audit_log(srv, "auth", sub,
-                              "token-issue", "ldap-bind-failed");
-                    send_json(conn, 401,
-                        "{\"error\":\"LDAP authentication failed\"}\n");
-                    return 1;
+                                       body_token, &ldap_groups) == 0) {
+                    if (ldap_groups && ldap_groups[0])
+                        snprintf(groups, sizeof(groups), "%s", ldap_groups);
+                    free(ldap_groups);
+                    cred_verified = 1;
+                    audit_log(srv, "auth", sub, "token-issue", "ldap-ok");
+                } else {
+                    free(ldap_groups);
+                    /* LDAP failed — fall back to local */
                 }
-                if (ldap_groups && ldap_groups[0]) {
-                    snprintf(groups, sizeof(groups), "%s", ldap_groups);
-                }
-                free(ldap_groups);
-                cred_verified = 1;
-            } else {
-                /* local credential store (Argon2id) */
+            }
+
+            /* try local if not yet verified */
+            if (!cred_verified && try_local) {
                 cred_lookup_ctx clctx = { {0}, {0}, 0 };
                 cookbook_db_param cp[] = { COOKBOOK_P_TEXT(sub) };
                 srv->db->query_p(srv->db,
@@ -2755,19 +2760,38 @@ static int handle_auth_token(struct mg_connection *conn, void *cbdata) {
 
                 if (clctx.found) {
                     if (cookbook_credential_verify(
-                            body_token, clctx.hash) != 0) {
-                        free(body);
-                        METRIC_INC(srv->metrics.responses_4xx);
-                        METRIC_INC(srv->metrics.auth_failures);
-                        audit_log(srv, "auth", sub,
-                                  "token-issue", "bad-credentials");
-                        send_json(conn, 401,
-                            "{\"error\":\"Invalid credentials\"}\n");
-                        return 1;
+                            body_token, clctx.hash) == 0) {
+                        memcpy(groups, clctx.groups, sizeof(groups));
+                        cred_verified = 1;
                     }
-                    memcpy(groups, clctx.groups, sizeof(groups));
-                    cred_verified = 1;
                 }
+            }
+
+            /* try LDAP as fallback if local-first and not yet verified */
+            if (!cred_verified && !ldap_first && try_ldap) {
+                char *ldap_groups = NULL;
+                if (cookbook_ldap_bind(&srv->ldap_cfg, sub,
+                                       body_token, &ldap_groups) == 0) {
+                    if (ldap_groups && ldap_groups[0])
+                        snprintf(groups, sizeof(groups), "%s", ldap_groups);
+                    free(ldap_groups);
+                    cred_verified = 1;
+                    audit_log(srv, "auth", sub, "token-issue", "ldap-fallback-ok");
+                } else {
+                    free(ldap_groups);
+                }
+            }
+
+            /* all methods exhausted */
+            if (!cred_verified && sub[0] && body_token[0]) {
+                free(body);
+                METRIC_INC(srv->metrics.responses_4xx);
+                METRIC_INC(srv->metrics.auth_failures);
+                audit_log(srv, "auth", sub, "token-issue",
+                          ldap_first ? "ldap+local-failed" : "local+ldap-failed");
+                send_json(conn, 401,
+                    "{\"error\":\"Invalid credentials\"}\n");
+                return 1;
             }
         }
         free(body);

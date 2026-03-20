@@ -196,6 +196,13 @@ endif()
 add_executable(cookbook_server src/main/c/main.c)
 target_link_libraries(cookbook_server PRIVATE cookbook)
 
+# Fully static build option — eliminates MinGW DLL dependencies.
+# Enable with: cmake --preset default -DCOOKBOOK_STATIC_LINK=ON
+option(COOKBOOK_STATIC_LINK "Link executables fully static (no DLLs)" OFF)
+if(COOKBOOK_STATIC_LINK AND WIN32)
+    target_link_options(cookbook_server PRIVATE -static)
+endif()
+
 # ---------- import tool (§A.4) ----------
 
 add_executable(cookbook_import src/main/c/cookbook_import.c)

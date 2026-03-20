@@ -1396,7 +1396,7 @@ static int handle_registry_discovery(struct mg_connection *conn, void *cbdata) {
     /* content types */
     n += snprintf(resp + n, sizeof(resp) - (size_t)n,
         ", content_types: ["
-        "\"application/x-pasta\", \"application/json\""
+        "\"application/x-pasta\", \"application/pasta\", \"application/json\""
         "]");
 
     n += snprintf(resp + n, sizeof(resp) - (size_t)n, " }\n");
@@ -1654,13 +1654,9 @@ static int handle_resolve(struct mg_connection *conn, void *cbdata) {
                 pasta_free(root);
                 if (pasta_out) {
                     size_t plen = strlen(pasta_out);
-                    mg_printf(conn,
-                        "HTTP/1.1 200 OK\r\n"
-                        "Content-Type: application/x-pasta; charset=US-ASCII\r\n"
-                        "Content-Length: %zu\r\n"
-                        "\r\n",
-                        plen);
-                    mg_write(conn, pasta_out, plen);
+                    send_response_gzip(conn, ri, 200,
+                        "application/x-pasta; charset=US-ASCII",
+                        pasta_out, plen);
                     free(pasta_out);
                     cookbook_jwt_claims_free(&claims);
                     free(path); free(group); free(artifact);
@@ -5138,12 +5134,9 @@ static int handle_admin_policies(struct mg_connection *conn, void *cbdata) {
             }
             /* return as application/x-pasta */
             size_t plen = strlen(pastlet);
-            mg_printf(conn,
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: application/x-pasta; charset=US-ASCII\r\n"
-                "Content-Length: %zu\r\n"
-                "\r\n"
-                "%s", plen, pastlet);
+            send_response_gzip(conn, ri, 200,
+                "application/x-pasta; charset=US-ASCII",
+                pastlet, plen);
             free(pastlet);
             return 1;
         }

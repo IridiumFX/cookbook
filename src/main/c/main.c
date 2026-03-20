@@ -100,6 +100,8 @@ int main(int argc, char **argv) {
     const char *ldap_url     = env_or("COOKBOOK_LDAP_URL", NULL);
     const char *ldap_base    = env_or("COOKBOOK_LDAP_BASE_DN", NULL);
     const char *ldap_attr    = env_or("COOKBOOK_LDAP_USER_ATTR", "uid");
+    const char *ldap_grp     = env_or("COOKBOOK_LDAP_GROUP_ATTR", NULL);
+    const char *ldap_grp_base = env_or("COOKBOOK_LDAP_GROUP_BASE", NULL);
     const char *oidc_issuer  = env_or("COOKBOOK_OIDC_ISSUER", NULL);
     const char *oidc_cid     = env_or("COOKBOOK_OIDC_CLIENT_ID", NULL);
     const char *ca_bundle    = env_or("COOKBOOK_CA_BUNDLE", NULL);
@@ -209,6 +211,8 @@ int main(int argc, char **argv) {
         .ldap_url            = ldap_url,
         .ldap_base_dn        = ldap_base,
         .ldap_user_attr      = ldap_attr,
+        .ldap_group_attr     = ldap_grp,
+        .ldap_group_base     = ldap_grp_base,
         .oidc_issuer         = oidc_issuer,
         .oidc_client_id      = oidc_cid,
         .ca_bundle_path      = ca_bundle

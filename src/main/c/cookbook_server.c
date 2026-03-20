@@ -5286,9 +5286,12 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
         srv->ldap_cfg.url       = opts->ldap_url;
         srv->ldap_cfg.base_dn   = opts->ldap_base_dn;
         srv->ldap_cfg.user_attr = opts->ldap_user_attr;
-        fprintf(stdout, "cookbook: LDAP backend: %s (base: %s)\n",
+        srv->ldap_cfg.group_attr = opts->ldap_group_attr;
+        srv->ldap_cfg.group_base = opts->ldap_group_base;
+        fprintf(stdout, "cookbook: LDAP backend: %s (base: %s, groups: %s)\n",
                 opts->ldap_url,
-                opts->ldap_base_dn ? opts->ldap_base_dn : "(none)");
+                opts->ldap_base_dn ? opts->ldap_base_dn : "(none)",
+                opts->ldap_group_attr ? opts->ldap_group_attr : "disabled");
     }
 
     /* OIDC backend config */

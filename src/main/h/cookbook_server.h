@@ -26,6 +26,8 @@ typedef struct {
     const char     *ldap_url;            /* NULL = LDAP disabled; e.g. "ldap://ldap.example.com:389" */
     const char     *ldap_base_dn;        /* e.g. "ou=users,dc=example,dc=com" */
     const char     *ldap_user_attr;      /* e.g. "uid" (default) or "sAMAccountName" */
+    const char     *ldap_group_attr;     /* e.g. "memberOf" — NULL to skip group lookup */
+    const char     *ldap_group_base;     /* base DN for group search — NULL to use base_dn */
     const char     *oidc_issuer;         /* NULL = OIDC disabled; e.g. "https://idp.example.com" */
     const char     *oidc_client_id;      /* cookbook's client_id at the IdP */
     const char     *ca_bundle_path;      /* NULL = skip CA verify; path to PEM CA bundle */

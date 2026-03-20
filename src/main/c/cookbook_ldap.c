@@ -69,15 +69,26 @@ static size_t ber_tlv_size(size_t vlen) {
 }
 
 /* BER tag constants */
+#define BER_BOOLEAN    0x01
 #define BER_INTEGER    0x02
 #define BER_OCTET_STR  0x04
+#define BER_ENUM       0x0A
 #define BER_SEQUENCE   0x30
+#define BER_SET        0x31
 /* LDAP BindRequest: APPLICATION 0 CONSTRUCTED = 0x60 */
 #define LDAP_BIND_REQ  0x60
 /* LDAP BindResponse: APPLICATION 1 CONSTRUCTED = 0x61 */
 #define LDAP_BIND_RESP 0x61
+/* LDAP SearchRequest: APPLICATION 3 CONSTRUCTED = 0x63 */
+#define LDAP_SEARCH_REQ  0x63
+/* LDAP SearchResultEntry: APPLICATION 4 CONSTRUCTED = 0x64 */
+#define LDAP_SEARCH_ENTRY 0x64
+/* LDAP SearchResultDone: APPLICATION 5 CONSTRUCTED = 0x65 */
+#define LDAP_SEARCH_DONE  0x65
 /* context-specific primitive 0 (simple auth) = 0x80 */
 #define LDAP_AUTH_SIMPLE 0x80
+/* equalityMatch filter: context 3 constructed = 0xA3 */
+#define LDAP_FILTER_EQUALITY 0xA3
 
 /* Write a BER INTEGER with value v (must be >= 0, fits in 4 bytes) */
 static size_t ber_write_int(unsigned char *buf, int v) {
@@ -245,6 +256,244 @@ static int parse_bind_response(const unsigned char *buf, size_t buf_len) {
     return (result_code == 0) ? 0 : -1;
 }
 
+/* ---- LDAP SearchRequest (RFC 4511 §4.5) ---- */
+
+/*
+ * SearchRequest ::= [APPLICATION 3] SEQUENCE {
+ *     baseObject      LDAPDN,
+ *     scope           ENUMERATED (wholeSubtree=2),
+ *     derefAliases    ENUMERATED (neverDerefAliases=0),
+ *     sizeLimit       INTEGER (0=no limit),
+ *     timeLimit       INTEGER (10 seconds),
+ *     typesOnly       BOOLEAN (FALSE),
+ *     filter          equalityMatch [3] { attr, value },
+ *     attributes      SEQUENCE OF attributeDescription
+ * }
+ */
+static int build_search_request(unsigned char *buf, size_t buf_sz,
+                                  size_t *out_len, int msg_id,
+                                  const char *base_dn,
+                                  const char *attr, const char *value,
+                                  const char *want_attr) {
+    unsigned char body[1024];
+    size_t pos = 0;
+
+    /* baseObject */
+    size_t base_len = strlen(base_dn);
+    pos += ber_write_tlv(body + pos, BER_OCTET_STR,
+                          (const unsigned char *)base_dn, base_len);
+
+    /* scope: wholeSubtree (2) */
+    unsigned char scope_val = 2;
+    pos += ber_write_tlv(body + pos, BER_ENUM, &scope_val, 1);
+
+    /* derefAliases: neverDerefAliases (0) */
+    unsigned char deref_val = 0;
+    pos += ber_write_tlv(body + pos, BER_ENUM, &deref_val, 1);
+
+    /* sizeLimit: 1 (only need one entry) */
+    pos += ber_write_int(body + pos, 1);
+
+    /* timeLimit: 10 seconds */
+    pos += ber_write_int(body + pos, 10);
+
+    /* typesOnly: FALSE */
+    unsigned char false_val = 0;
+    pos += ber_write_tlv(body + pos, BER_BOOLEAN, &false_val, 1);
+
+    /* filter: equalityMatch [3] { attributeDesc, assertionValue } */
+    {
+        size_t attr_len = strlen(attr);
+        size_t val_len = strlen(value);
+        size_t eq_body = ber_tlv_size(attr_len) + ber_tlv_size(val_len);
+
+        body[pos++] = LDAP_FILTER_EQUALITY;
+        pos += ber_write_length(body + pos, eq_body);
+        pos += ber_write_tlv(body + pos, BER_OCTET_STR,
+                              (const unsigned char *)attr, attr_len);
+        pos += ber_write_tlv(body + pos, BER_OCTET_STR,
+                              (const unsigned char *)value, val_len);
+    }
+
+    /* attributes: SEQUENCE { want_attr } */
+    {
+        size_t wa_len = strlen(want_attr);
+        size_t inner = ber_tlv_size(wa_len);
+        body[pos++] = BER_SEQUENCE;
+        pos += ber_write_length(body + pos, inner);
+        pos += ber_write_tlv(body + pos, BER_OCTET_STR,
+                              (const unsigned char *)want_attr, wa_len);
+    }
+
+    /* wrap in SearchRequest [APPLICATION 3] */
+    size_t search_body = pos;
+    size_t msgid_size = ber_tlv_size(1);
+    size_t search_size = ber_tlv_size(search_body);
+    size_t msg_body = msgid_size + search_size;
+    size_t total = ber_tlv_size(msg_body);
+    if (total > buf_sz) return -1;
+
+    size_t off = 0;
+    buf[off++] = BER_SEQUENCE;
+    off += ber_write_length(buf + off, msg_body);
+    off += ber_write_int(buf + off, msg_id);
+    buf[off++] = LDAP_SEARCH_REQ;
+    off += ber_write_length(buf + off, search_body);
+    memcpy(buf + off, body, search_body);
+    off += search_body;
+
+    *out_len = off;
+    return 0;
+}
+
+/*
+ * Parse SearchResultEntry to extract attribute values.
+ * Looks for the specified attribute and concatenates values as comma-separated.
+ * Returns malloc'd string or NULL.
+ */
+static char *parse_search_entry_attr(const unsigned char *buf, size_t buf_len,
+                                       const char *want_attr) {
+    size_t pos = 0;
+
+    /* outer SEQUENCE */
+    if (pos >= buf_len || buf[pos] != BER_SEQUENCE) return NULL;
+    pos++;
+    ber_read_length(buf, buf_len, &pos);
+
+    /* messageID (skip) */
+    ber_read_int(buf, buf_len, &pos);
+
+    /* check for SearchResultEntry (0x64) */
+    if (pos >= buf_len || buf[pos] != LDAP_SEARCH_ENTRY) return NULL;
+    pos++;
+    size_t entry_len = ber_read_length(buf, buf_len, &pos);
+    size_t entry_end = pos + entry_len;
+    if (entry_end > buf_len) return NULL;
+
+    /* objectName (OCTET STRING — skip) */
+    if (pos >= entry_end || buf[pos] != BER_OCTET_STR) return NULL;
+    pos++;
+    size_t dn_len = ber_read_length(buf, buf_len, &pos);
+    pos += dn_len;
+
+    /* attributes: SEQUENCE OF PartialAttribute */
+    if (pos >= entry_end || buf[pos] != BER_SEQUENCE) return NULL;
+    pos++;
+    size_t attrs_len = ber_read_length(buf, buf_len, &pos);
+    size_t attrs_end = pos + attrs_len;
+    if (attrs_end > buf_len) attrs_end = buf_len;
+
+    size_t want_len = strlen(want_attr);
+    char *result = NULL;
+    size_t result_len = 0;
+    size_t result_cap = 0;
+
+    /* iterate PartialAttribute entries */
+    while (pos < attrs_end) {
+        /* PartialAttribute ::= SEQUENCE { type, SET OF values } */
+        if (buf[pos] != BER_SEQUENCE) break;
+        pos++;
+        size_t pa_len = ber_read_length(buf, buf_len, &pos);
+        size_t pa_end = pos + pa_len;
+        if (pa_end > attrs_end) break;
+
+        /* type (OCTET STRING) */
+        if (buf[pos] != BER_OCTET_STR) { pos = pa_end; continue; }
+        pos++;
+        size_t type_len = ber_read_length(buf, buf_len, &pos);
+        const unsigned char *type_val = buf + pos;
+        pos += type_len;
+
+        /* check if this is the attribute we want */
+        int match = (type_len == want_len &&
+                      memcmp(type_val, want_attr, want_len) == 0);
+        /* case-insensitive fallback */
+        if (!match && type_len == want_len) {
+            match = 1;
+            for (size_t ci = 0; ci < want_len; ci++) {
+                char a = (char)type_val[ci], b = want_attr[ci];
+                if (a >= 'A' && a <= 'Z') a += 32;
+                if (b >= 'A' && b <= 'Z') b += 32;
+                if (a != b) { match = 0; break; }
+            }
+        }
+
+        if (!match) { pos = pa_end; continue; }
+
+        /* SET OF values */
+        if (pos >= pa_end || buf[pos] != BER_SET) { pos = pa_end; continue; }
+        pos++;
+        size_t set_len = ber_read_length(buf, buf_len, &pos);
+        size_t set_end = pos + set_len;
+        if (set_end > pa_end) set_end = pa_end;
+
+        while (pos < set_end) {
+            if (buf[pos] != BER_OCTET_STR) break;
+            pos++;
+            size_t vlen = ber_read_length(buf, buf_len, &pos);
+            const char *val = (const char *)(buf + pos);
+            pos += vlen;
+
+            /* extract CN from DN-style values like "CN=group,OU=..." */
+            const char *cn = val;
+            size_t cn_len = vlen;
+            if (vlen > 3 && (val[0] == 'C' || val[0] == 'c') &&
+                (val[1] == 'N' || val[1] == 'n') && val[2] == '=') {
+                cn = val + 3;
+                cn_len = vlen - 3;
+                const char *comma = memchr(cn, ',', cn_len);
+                if (comma) cn_len = (size_t)(comma - cn);
+            }
+
+            /* append to result */
+            size_t needed = result_len + cn_len + 2; /* +comma+null */
+            if (needed > result_cap) {
+                result_cap = needed + 256;
+                char *tmp = realloc(result, result_cap);
+                if (!tmp) { free(result); return NULL; }
+                result = tmp;
+            }
+            if (result_len > 0) result[result_len++] = ',';
+            memcpy(result + result_len, cn, cn_len);
+            result_len += cn_len;
+            result[result_len] = '\0';
+        }
+        pos = pa_end;
+    }
+
+    return result;
+}
+
+/* Read a complete LDAP message from the connection. Returns bytes read. */
+static int ldap_recv_message(unsigned char *buf, size_t buf_sz,
+                               int use_tls, cookbook_sock_t raw_s,
+                               cookbook_tls_sock *tls_s) {
+    #define LRECV(b, n) \
+        (use_tls ? (cookbook_tls_sock_recv(tls_s, b, n) == (int)(n) ? 0 : -1) \
+                 : cookbook_sock_recv(raw_s, b, n))
+
+    if (LRECV(buf, 2) != 0) return -1;
+
+    size_t total_len, hdr_extra = 0;
+    if (buf[1] < 0x80) {
+        total_len = (size_t)buf[1];
+    } else {
+        hdr_extra = (size_t)(buf[1] & 0x7F);
+        if (hdr_extra > 3 || hdr_extra == 0) return -1;
+        if (LRECV(buf + 2, hdr_extra) != 0) return -1;
+        total_len = 0;
+        for (size_t i = 0; i < hdr_extra; i++)
+            total_len = (total_len << 8) | buf[2 + i];
+    }
+
+    size_t hdr_size = 2 + hdr_extra;
+    if (total_len + hdr_size > buf_sz) return -1;
+    if (total_len > 0 && LRECV(buf + hdr_size, total_len) != 0) return -1;
+
+    #undef LRECV
+    return (int)(hdr_size + total_len);
+}
+
 /* ---- Public API ---- */
 
 int cookbook_ldap_bind(const cookbook_ldap_config *cfg,
@@ -357,18 +606,68 @@ int cookbook_ldap_bind(const cookbook_ldap_config *cfg,
         return -1;
     }
 
+    /* parse bind response */
+    int rc = parse_bind_response(resp, hdr_size + total_len);
+
+    if (rc != 0) {
+        LDAP_CLOSE();
+        rc = -1;
+        goto ldap_cleanup;
+    }
+    rc = 0; /* bind succeeded */
+
+    /* bind succeeded — search for group membership if requested */
+    if (groups_out && cfg->group_attr) {
+        const char *search_base = cfg->group_base ? cfg->group_base : cfg->base_dn;
+        if (!search_base) search_base = "";
+
+        unsigned char sreq[2048];
+        size_t sreq_len = 0;
+        if (build_search_request(sreq, sizeof(sreq), &sreq_len, 2,
+                                   search_base, attr, subject,
+                                   cfg->group_attr) == 0) {
+            if (LDAP_SEND(sreq, sreq_len) == 0) {
+                /* read SearchResultEntry (may be multiple, or SearchResultDone) */
+                unsigned char sbuf[8192];
+                int msg_sz = ldap_recv_message(sbuf, sizeof(sbuf),
+                                                use_tls, raw_s, tls_s);
+                if (msg_sz > 0) {
+                    /* check if it's a SearchResultEntry (0x64) */
+                    /* find the tag after messageID */
+                    size_t sp2 = 0;
+                    if (sbuf[sp2] == BER_SEQUENCE) {
+                        sp2++; ber_read_length(sbuf, (size_t)msg_sz, &sp2);
+                        ber_read_int(sbuf, (size_t)msg_sz, &sp2);
+                        if (sp2 < (size_t)msg_sz && sbuf[sp2] == LDAP_SEARCH_ENTRY) {
+                            *groups_out = parse_search_entry_attr(
+                                sbuf, (size_t)msg_sz, cfg->group_attr);
+                        }
+                    }
+
+                    /* consume remaining messages until SearchResultDone */
+                    while (msg_sz > 0) {
+                        sp2 = 0;
+                        if (sbuf[sp2] == BER_SEQUENCE) {
+                            sp2++; ber_read_length(sbuf, (size_t)msg_sz, &sp2);
+                            ber_read_int(sbuf, (size_t)msg_sz, &sp2);
+                            if (sp2 < (size_t)msg_sz &&
+                                sbuf[sp2] == LDAP_SEARCH_DONE)
+                                break;
+                        }
+                        msg_sz = ldap_recv_message(sbuf, sizeof(sbuf),
+                                                    use_tls, raw_s, tls_s);
+                    }
+                }
+            }
+        }
+    }
+
     LDAP_CLOSE();
 
+ldap_cleanup:
     #undef LDAP_SEND
     #undef LDAP_RECV
     #undef LDAP_CLOSE
-
-    /* parse response */
-    int rc = parse_bind_response(resp, hdr_size + total_len);
-
-    /* Note: group lookup via LDAP search is not yet implemented.
-       For now, groups come from the cookbook credentials/policies table.
-       A future enhancement can add SearchRequest after successful bind. */
 
     return rc;
 }

@@ -10,6 +10,9 @@
 #include "cookbook_grid.h"
 #include "cookbook_policy.h"
 #include "cookbook_ed25519.h"
+#include "cookbook_connpool.h"
+#include "cookbook_ldap.h"
+#include <apennines/t3/db/wal.h>
 #include "alforno.h"
 #include "pasta.h"
 #ifdef COOKBOOK_HAS_BASTA
@@ -3369,6 +3372,114 @@ static void test_group_admin_lifecycle(void) {
     db->close(db);
 }
 
+/* ---- connection pool tests ---- */
+
+static void test_connpool_basic(void) {
+    cookbook_connpool *pool = cookbook_connpool_create(2, 60);
+    ASSERT(pool != NULL, "connpool: create");
+
+    /* get from empty pool returns INVALID */
+    cookbook_sock_t s = cookbook_connpool_get(pool, "localhost", 9999, 0);
+    ASSERT(s == COOKBOOK_SOCK_INVALID, "connpool: empty get");
+
+    /* TLS always returns INVALID (not poolable) */
+    s = cookbook_connpool_get(pool, "localhost", 443, 1);
+    ASSERT(s == COOKBOOK_SOCK_INVALID, "connpool: tls not pooled");
+
+    cookbook_connpool_destroy(pool);
+}
+
+/* ---- gzip compression tests ---- */
+
+extern void *cookbook_gzip_compress(const void *data, size_t len, size_t *out_len);
+
+static void test_gzip_compress(void) {
+    const char *input = "Hello, cookbook! This is a test of gzip compression. "
+                        "Repeating data compresses well: aaaaaaaaaaaaaaaaaaa"
+                        "bbbbbbbbbbbbbbbbbbbbccccccccccccccccccccdddddddddd";
+    size_t in_len = strlen(input);
+    size_t gz_len = 0;
+    void *gz = cookbook_gzip_compress(input, in_len, &gz_len);
+    ASSERT(gz != NULL, "gzip: compress ok");
+    ASSERT(gz_len > 0, "gzip: output non-empty");
+    ASSERT(gz_len < in_len, "gzip: compressed smaller");
+
+    /* verify gzip magic bytes */
+    unsigned char *p = (unsigned char *)gz;
+    ASSERT(p[0] == 0x1F && p[1] == 0x8B, "gzip: magic bytes");
+    ASSERT(p[2] == 0x08, "gzip: deflate method");
+
+    free(gz);
+
+    /* empty input */
+    gz = cookbook_gzip_compress("", 0, &gz_len);
+    ASSERT(gz == NULL, "gzip: empty returns NULL");
+
+    /* NULL input */
+    gz = cookbook_gzip_compress(NULL, 100, &gz_len);
+    ASSERT(gz == NULL, "gzip: null returns NULL");
+}
+
+/* ---- LDAP BER encoding tests ---- */
+
+static void test_ldap_config(void) {
+    /* test that LDAP bind with NULL config returns -1 */
+    ASSERT(cookbook_ldap_bind(NULL, "user", "pass", NULL) == -1,
+           "ldap: null config");
+
+    /* test with config but no URL */
+    cookbook_ldap_config cfg = {0};
+    ASSERT(cookbook_ldap_bind(&cfg, "user", "pass", NULL) == -1,
+           "ldap: null url");
+
+    /* test with config but unreachable host (should fail fast) */
+    cfg.url = "ldap://192.0.2.1:9999"; /* TEST-NET, unreachable */
+    cfg.base_dn = "dc=test";
+    /* don't actually test this — it would block on connect timeout */
+}
+
+/* ---- WAL tests ---- */
+
+static void test_wal_basic(void) {
+    /* create a WAL in a temp path */
+    const char *path = "test_audit.wal";
+    wal *w = NULL;
+    unsigned long rc = wal_create(&w, path);
+    ASSERT(rc == 0 && w != NULL, "wal: create");
+
+    /* append entries */
+    u64 seq1 = 0, seq2 = 0;
+    const char *e1 = "{ event: \"test\", seq: 1 }";
+    const char *e2 = "{ event: \"test\", seq: 2 }";
+    ASSERT(wal_append(&seq1, w, (const u8 *)e1, (u64)strlen(e1)) == 0,
+           "wal: append 1");
+    ASSERT(wal_append(&seq2, w, (const u8 *)e2, (u64)strlen(e2)) == 0,
+           "wal: append 2");
+    ASSERT(seq2 > seq1, "wal: seq monotonic");
+
+    /* read back */
+    wal_entry re;
+    ASSERT(wal_read(&re, w, seq1) == 0, "wal: read 1");
+    ASSERT(re.len == (u64)strlen(e1), "wal: read 1 len");
+    ASSERT(memcmp(re.data, e1, re.len) == 0, "wal: read 1 data");
+    free(re.data);
+
+    /* iterate */
+    wal_iter *it = NULL;
+    ASSERT(wal_iter_create(&it, w, 0) == 0, "wal: iter create");
+    wal_entry ie;
+    int count = 0;
+    while (wal_iter_next(&ie, it) == 0) {
+        free(ie.data);
+        count++;
+    }
+    ASSERT(count == 2, "wal: iter count");
+    wal_iter_destroy(it);
+
+    wal_close(w);
+    remove(path);
+}
+
 int main(void) {
     printf("cookbook test suite\n\n");
 
@@ -3469,6 +3580,10 @@ int main(void) {
     test_ed25519_rfc8032_vector2();
     test_ed25519_rfc8032_vector3();
     test_ed25519_cross_validation();
+    test_connpool_basic();
+    test_gzip_compress();
+    test_ldap_config();
+    test_wal_basic();
 
     printf("\n%d/%d tests passed\n", tests_run - tests_failed, tests_run);
     return tests_failed ? 1 : 0;

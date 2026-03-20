@@ -70,9 +70,14 @@ add_library(apennines STATIC
     vendor/apennines/sources/t2/encoding/pem.c
     vendor/apennines/sources/t2/math/bigint/bigint.c
     vendor/apennines/sources/t2/compress/compress.c
+    vendor/apennines/sources/t2/net/addr.c
+    vendor/apennines/sources/t3/async/threadpool.c
     vendor/apennines/sources/t3/crypto/pki.c
+    vendor/apennines/sources/t3/db/kv.c
     vendor/apennines/sources/t3/db/wal.c
     vendor/apennines/sources/t3/net/http.c
+    vendor/apennines/sources/t3/net/tcp.c
+    vendor/apennines/sources/t4/net/http_server.c
 )
 target_include_directories(apennines
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/vendor/apennines/headers>
@@ -199,6 +204,10 @@ target_link_libraries(cookbook_server PRIVATE cookbook)
 # Fully static build option — eliminates MinGW DLL dependencies.
 # Enable with: cmake --preset default -DCOOKBOOK_STATIC_LINK=ON
 option(COOKBOOK_STATIC_LINK "Link executables fully static (no DLLs)" OFF)
+option(COOKBOOK_USE_APENNINES_HTTP "Use apennines HTTP server instead of civetweb" OFF)
+if(COOKBOOK_USE_APENNINES_HTTP)
+    target_compile_definitions(cookbook PRIVATE COOKBOOK_USE_APENNINES_HTTP)
+endif()
 if(COOKBOOK_STATIC_LINK AND WIN32)
     target_link_options(cookbook_server PRIVATE -static)
 endif()

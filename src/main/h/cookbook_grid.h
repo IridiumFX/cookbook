@@ -142,4 +142,8 @@ COOKBOOK_API int cookbook_grid_is_loop(const char *origin_id,
 /* Default max hops. */
 #define COOKBOOK_GRID_MAX_HOPS_DEFAULT 3
 
+/* Connection pool for grid peer connections. */
+COOKBOOK_API void cookbook_grid_init_pool(void);
+COOKBOOK_API void cookbook_grid_destroy_pool(void);
+
 #endif /* COOKBOOK_GRID_H */

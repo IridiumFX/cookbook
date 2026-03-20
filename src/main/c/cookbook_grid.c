@@ -4,6 +4,7 @@
 
 #include "cookbook_grid.h"
 #include "cookbook_socket.h"
+#include "cookbook_connpool.h"
 #include "cookbook_ed25519.h"
 #include "cookbook_auth.h"  /* for cookbook_base64url_encode */
 #include <stdio.h>
@@ -14,6 +15,21 @@
 typedef cookbook_sock_t sock_t;
 #define SOCK_INVALID COOKBOOK_SOCK_INVALID
 #define sock_close cookbook_sock_close
+
+/* global connection pool for grid peer connections (plain TCP only) */
+static cookbook_connpool *g_grid_pool = NULL;
+
+void cookbook_grid_init_pool(void) {
+    if (!g_grid_pool)
+        g_grid_pool = cookbook_connpool_create(4, 30); /* 4 per host, 30s idle */
+}
+
+void cookbook_grid_destroy_pool(void) {
+    if (g_grid_pool) {
+        cookbook_connpool_destroy(g_grid_pool);
+        g_grid_pool = NULL;
+    }
+}
 
 /* ---- Peer loading ---- */
 
@@ -227,16 +243,23 @@ static int grid_request_ex(const cookbook_peer *peer,
     WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
 
-    /* connect (plain or TLS) */
+    /* connect (plain or TLS), with connection pool for plain TCP */
     sock_t fd = SOCK_INVALID;
     cookbook_tls_sock *tls_s = NULL;
     int iport = atoi(port);
+    int from_pool = 0;
 
     if (use_tls) {
         tls_s = cookbook_sock_connect_tls(host, iport, 5);
         if (!tls_s) { free(host); free(port); return -1; }
     } else {
-        fd = grid_connect(host, port);
+        /* try connection pool first */
+        if (g_grid_pool) {
+            fd = cookbook_connpool_get(g_grid_pool, host, iport, 0);
+            if (fd != SOCK_INVALID) from_pool = 1;
+        }
+        if (fd == SOCK_INVALID)
+            fd = grid_connect(host, port);
         if (fd == SOCK_INVALID) { free(host); free(port); return -1; }
     }
 
@@ -303,7 +326,13 @@ static int grid_request_ex(const cookbook_peer *peer,
         cookbook_tls_sock_close(tls_s);
     } else {
         body = grid_recv_response(fd, &body_len, &status);
-        sock_close(fd);
+        /* return to pool if Connection: keep-alive, otherwise close */
+        if (g_grid_pool && !use_tls && status > 0 &&
+            body && !strstr(body, "Connection: close")) {
+            cookbook_connpool_put(g_grid_pool, fd, host, iport, 0);
+        } else {
+            sock_close(fd);
+        }
     }
     free(host); free(port);
 

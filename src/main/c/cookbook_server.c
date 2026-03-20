@@ -5276,6 +5276,9 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
         ? opts->grid_max_hops
         : COOKBOOK_GRID_MAX_HOPS_DEFAULT;
     srv->grid_peer_auth = opts->grid_peer_auth;
+
+    if (srv->grid_enabled)
+        cookbook_grid_init_pool();
     srv->object_cache_ttl_sec = opts->object_cache_ttl_sec;
 
     /* LDAP backend config */
@@ -5558,6 +5561,8 @@ void cookbook_server_stop(cookbook_server *srv) {
 #else
     pthread_join(srv->reconcile_thread, NULL);
 #endif
+
+    cookbook_grid_destroy_pool();
 
 #ifdef COOKBOOK_USE_APENNINES_HTTP
     {

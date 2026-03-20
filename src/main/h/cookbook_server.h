@@ -28,6 +28,7 @@ typedef struct {
     const char     *ldap_user_attr;      /* e.g. "uid" (default) or "sAMAccountName" */
     const char     *oidc_issuer;         /* NULL = OIDC disabled; e.g. "https://idp.example.com" */
     const char     *oidc_client_id;      /* cookbook's client_id at the IdP */
+    const char     *ca_bundle_path;      /* NULL = skip CA verify; path to PEM CA bundle */
 } cookbook_server_opts;
 
 /* Create and start the server. Returns NULL on failure. */

@@ -31,6 +31,11 @@
 /* Opaque TLS connection context */
 typedef struct cookbook_tls cookbook_tls;
 
+/* Set the global CA trust store for certificate chain verification.
+   If not set, certificate chains are not verified (signatures still are).
+   The store must remain valid for the lifetime of the process. */
+COOKBOOK_API void cookbook_tls_set_ca_store(void *pki_store);
+
 /* Perform TLS 1.3 handshake over an existing TCP socket.
    hostname is used for SNI and certificate verification.
    Returns NULL on handshake failure. */

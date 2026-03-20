@@ -102,6 +102,7 @@ int main(int argc, char **argv) {
     const char *ldap_attr    = env_or("COOKBOOK_LDAP_USER_ATTR", "uid");
     const char *oidc_issuer  = env_or("COOKBOOK_OIDC_ISSUER", NULL);
     const char *oidc_cid     = env_or("COOKBOOK_OIDC_CLIENT_ID", NULL);
+    const char *ca_bundle    = env_or("COOKBOOK_CA_BUNDLE", NULL);
 
     /* registry Ed25519 key pair */
     unsigned char registry_pk[32], registry_sk[64];
@@ -209,7 +210,8 @@ int main(int argc, char **argv) {
         .ldap_base_dn        = ldap_base,
         .ldap_user_attr      = ldap_attr,
         .oidc_issuer         = oidc_issuer,
-        .oidc_client_id      = oidc_cid
+        .oidc_client_id      = oidc_cid,
+        .ca_bundle_path      = ca_bundle
     };
 
     cookbook_server *srv = cookbook_server_start(&opts);

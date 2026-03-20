@@ -7,7 +7,9 @@
 #include "cookbook_policy.h"
 #include "cookbook_ldap.h"
 #include "cookbook_oidc.h"
+#include "cookbook_tls.h"
 #include <apennines/t1/random/entropy.h>
+#include <apennines/t3/crypto/pki.h>
 #include "civetweb.h"
 #include "pasta.h"
 #include <sodium.h>
@@ -5026,6 +5028,51 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
         srv->oidc_cfg.issuer    = opts->oidc_issuer;
         srv->oidc_cfg.client_id = opts->oidc_client_id;
         fprintf(stdout, "cookbook: OIDC backend: %s\n", opts->oidc_issuer);
+    }
+
+    /* load CA bundle for TLS certificate verification */
+    if (opts->ca_bundle_path) {
+        FILE *ca_f = fopen(opts->ca_bundle_path, "rb");
+        if (ca_f) {
+            fseek(ca_f, 0, SEEK_END);
+            long ca_sz = ftell(ca_f);
+            fseek(ca_f, 0, SEEK_SET);
+            if (ca_sz > 0) {
+                u8 *ca_data = malloc((size_t)ca_sz);
+                if (ca_data) {
+                    fread(ca_data, 1, (size_t)ca_sz, ca_f);
+                    pki_store *store = NULL;
+                    if (pki_store_create(&store) == 0) {
+                        /* parse PEM bundle: split on -----BEGIN CERTIFICATE----- markers
+                           and add each cert individually */
+                        const char *p = (const char *)ca_data;
+                        int certs_loaded = 0;
+                        while ((p = strstr(p, "-----BEGIN CERTIFICATE-----")) != NULL) {
+                            const char *end = strstr(p, "-----END CERTIFICATE-----");
+                            if (!end) break;
+                            end += 25; /* skip the END marker */
+                            size_t pem_len = (size_t)(end - p);
+                            pki_cert cert = { .data = (u8 *)p, .len = (u64)pem_len };
+                            if (pki_store_add_cert(store, &cert) == 0)
+                                certs_loaded++;
+                            p = end;
+                        }
+                        if (certs_loaded > 0) {
+                            cookbook_tls_set_ca_store(store);
+                            fprintf(stdout, "cookbook: CA bundle: %s (%d certs)\n",
+                                    opts->ca_bundle_path, certs_loaded);
+                        } else {
+                            pki_store_destroy(store);
+                        }
+                    }
+                    free(ca_data);
+                }
+            }
+            fclose(ca_f);
+        } else {
+            fprintf(stderr, "cookbook: warning: cannot open CA bundle: %s\n",
+                    opts->ca_bundle_path);
+        }
     }
 
     /* initialize token revocation list (max 4096 entries) */

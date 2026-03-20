@@ -21,6 +21,7 @@
 #include <apennines/t2/crypto/x509.h>
 #include <apennines/t2/crypto/rsa.h>
 #include <apennines/t2/crypto/ecdsa.h>
+#include <apennines/t3/crypto/pki.h>
 #include <apennines/t1/random/entropy.h>
 
 /* cookbook's own Ed25519 for Ed25519 cert verify */
@@ -54,6 +55,13 @@
 #define TLS_VERSION_13       0x0304
 
 #define HKDF_HASH_LEN 32  /* SHA-256 output length */
+
+/* global CA trust store (set once at startup, read-only after) */
+static pki_store *g_ca_store = NULL;
+
+void cookbook_tls_set_ca_store(void *store) {
+    g_ca_store = (pki_store *)store;
+}
 
 /* ---- TLS connection state ---- */
 
@@ -571,6 +579,24 @@ cookbook_tls *cookbook_tls_connect(cookbook_sock_t sock, const char *hostname) {
                     free(msg);
                     free(tls);
                     return NULL;
+                }
+
+                /* verify certificate chain against CA store */
+                if (g_ca_store) {
+                    /* collect all certs from the message */
+                    /* for now, verify just the leaf cert */
+                    pki_cert leaf = { .data = (u8 *)p, .len = (u64)cert_len };
+                    pki_verify_result vr;
+                    if (pki_store_verify(&vr, g_ca_store, &leaf, 1,
+                                          (u64)time(NULL)) == 0) {
+                        if (!vr.valid) {
+                            x509_destroy(&server_cert);
+                            have_cert = 0;
+                            free(msg);
+                            free(tls);
+                            return NULL;
+                        }
+                    }
                 }
             }
             break;

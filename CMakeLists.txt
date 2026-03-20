@@ -69,7 +69,10 @@ add_library(apennines STATIC
     vendor/apennines/sources/t2/encoding/base.c
     vendor/apennines/sources/t2/encoding/pem.c
     vendor/apennines/sources/t2/math/bigint/bigint.c
+    vendor/apennines/sources/t2/compress/compress.c
     vendor/apennines/sources/t3/crypto/pki.c
+    vendor/apennines/sources/t3/db/wal.c
+    vendor/apennines/sources/t3/net/http.c
 )
 target_include_directories(apennines
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/vendor/apennines/headers>

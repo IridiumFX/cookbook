@@ -26,6 +26,8 @@ typedef struct {
     const char     *ldap_url;            /* NULL = LDAP disabled; e.g. "ldap://ldap.example.com:389" */
     const char     *ldap_base_dn;        /* e.g. "ou=users,dc=example,dc=com" */
     const char     *ldap_user_attr;      /* e.g. "uid" (default) or "sAMAccountName" */
+    const char     *oidc_issuer;         /* NULL = OIDC disabled; e.g. "https://idp.example.com" */
+    const char     *oidc_client_id;      /* cookbook's client_id at the IdP */
 } cookbook_server_opts;
 
 /* Create and start the server. Returns NULL on failure. */

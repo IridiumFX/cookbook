@@ -100,6 +100,8 @@ int main(int argc, char **argv) {
     const char *ldap_url     = env_or("COOKBOOK_LDAP_URL", NULL);
     const char *ldap_base    = env_or("COOKBOOK_LDAP_BASE_DN", NULL);
     const char *ldap_attr    = env_or("COOKBOOK_LDAP_USER_ATTR", "uid");
+    const char *oidc_issuer  = env_or("COOKBOOK_OIDC_ISSUER", NULL);
+    const char *oidc_cid     = env_or("COOKBOOK_OIDC_CLIENT_ID", NULL);
 
     /* registry Ed25519 key pair */
     unsigned char registry_pk[32], registry_sk[64];
@@ -205,7 +207,9 @@ int main(int argc, char **argv) {
         .object_cache_ttl_sec = obj_cache_ttl,
         .ldap_url            = ldap_url,
         .ldap_base_dn        = ldap_base,
-        .ldap_user_attr      = ldap_attr
+        .ldap_user_attr      = ldap_attr,
+        .oidc_issuer         = oidc_issuer,
+        .oidc_client_id      = oidc_cid
     };
 
     cookbook_server *srv = cookbook_server_start(&opts);

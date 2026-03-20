@@ -6,6 +6,7 @@
 #include "cookbook_ed25519.h"
 #include "cookbook_policy.h"
 #include "cookbook_ldap.h"
+#include "cookbook_oidc.h"
 #include "civetweb.h"
 #include "pasta.h"
 #include <sodium.h>
@@ -72,6 +73,7 @@ struct cookbook_server {
     FILE               *audit_admin;
     int                 object_cache_ttl_sec;
     cookbook_ldap_config ldap_cfg;
+    cookbook_oidc_config oidc_cfg;
     volatile int        reconcile_running;
 #ifdef _WIN32
     HANDLE              reconcile_thread;
@@ -1285,9 +1287,10 @@ static int handle_registry_discovery(struct mg_connection *conn, void *cbdata) {
     if (srv->has_registry_key) {
         n += snprintf(resp + n, sizeof(resp) - (size_t)n,
             ", auth: { enabled: true"
-            ", methods: [\"token\"%s]"
+            ", methods: [\"token\"%s%s]"
             ", algorithm: \"ed25519\"",
-            srv->ldap_cfg.url ? ", \"ldap\"" : "");
+            srv->ldap_cfg.url ? ", \"ldap\"" : "",
+            srv->oidc_cfg.issuer ? ", \"oidc\"" : "");
         char pk_hex[65];
         for (int i = 0; i < 32; i++)
             snprintf(pk_hex + i * 2, 3, "%02x", srv->registry_pk[i]);
@@ -2501,8 +2504,10 @@ static int handle_auth_token(struct mg_connection *conn, void *cbdata) {
             }
         }
 
-        /* parse method field (optional: "token", "ldap") */
+        /* parse method and grant_type fields */
         char method[32] = "token";
+        char grant_type[64] = {0};
+        char client_secret[512] = {0};
         {
             const char *mp = strstr(body, "\"method\":");
             if (mp) {
@@ -2518,6 +2523,73 @@ static int handle_auth_token(struct mg_connection *conn, void *cbdata) {
                             if (ml >= sizeof(method)) ml = sizeof(method) - 1;
                             memcpy(method, mp, ml);
                             method[ml] = '\0';
+                        }
+                    }
+                }
+            }
+        }
+
+        /* parse grant_type */
+        {
+            const char *gp = strstr(body, "\"grant_type\":");
+            if (gp) {
+                gp = strchr(gp, ':');
+                if (gp) {
+                    gp++;
+                    while (*gp == ' ' || *gp == '\t') gp++;
+                    if (*gp == '"') {
+                        gp++;
+                        const char *ge = strchr(gp, '"');
+                        if (ge) {
+                            size_t gl = (size_t)(ge - gp);
+                            if (gl >= sizeof(grant_type)) gl = sizeof(grant_type) - 1;
+                            memcpy(grant_type, gp, gl);
+                            grant_type[gl] = '\0';
+                        }
+                    }
+                }
+            }
+        }
+
+        /* parse client_secret */
+        {
+            const char *cp = strstr(body, "\"client_secret\":");
+            if (cp) {
+                cp = strchr(cp, ':');
+                if (cp) {
+                    cp++;
+                    while (*cp == ' ' || *cp == '\t') cp++;
+                    if (*cp == '"') {
+                        cp++;
+                        const char *ce = strchr(cp, '"');
+                        if (ce) {
+                            size_t cl = (size_t)(ce - cp);
+                            if (cl >= sizeof(client_secret))
+                                cl = sizeof(client_secret) - 1;
+                            memcpy(client_secret, cp, cl);
+                            client_secret[cl] = '\0';
+                        }
+                    }
+                }
+            }
+        }
+
+        /* parse client_id from body (may override sub for OIDC) */
+        {
+            const char *cip = strstr(body, "\"client_id\":");
+            if (cip && !sub[0]) {
+                cip = strchr(cip, ':');
+                if (cip) {
+                    cip++;
+                    while (*cip == ' ' || *cip == '\t') cip++;
+                    if (*cip == '"') {
+                        cip++;
+                        const char *cie = strchr(cip, '"');
+                        if (cie) {
+                            size_t cil = (size_t)(cie - cip);
+                            if (cil >= sizeof(sub)) cil = sizeof(sub) - 1;
+                            memcpy(sub, cip, cil);
+                            sub[cil] = '\0';
                         }
                     }
                 }
@@ -2545,6 +2617,31 @@ static int handle_auth_token(struct mg_connection *conn, void *cbdata) {
                     }
                 }
             }
+        }
+
+        /* OIDC client_credentials flow (separate from method-based auth) */
+        if (strcmp(grant_type, "client_credentials") == 0 &&
+            srv->oidc_cfg.issuer && client_secret[0]) {
+            char oidc_sub[128] = {0};
+            const char *cid = sub[0] ? sub : (srv->oidc_cfg.client_id ? srv->oidc_cfg.client_id : "");
+            if (cookbook_oidc_client_credentials(&srv->oidc_cfg, cid,
+                                                  client_secret,
+                                                  oidc_sub, sizeof(oidc_sub)) != 0) {
+                free(body);
+                METRIC_INC(srv->metrics.responses_4xx);
+                METRIC_INC(srv->metrics.auth_failures);
+                audit_log(srv, "auth", cid, "token-issue", "oidc-failed");
+                send_json(conn, 401,
+                    "{\"error\":\"OIDC client credentials failed\"}\n");
+                return 1;
+            }
+            if (oidc_sub[0]) snprintf(sub, sizeof(sub), "%s", oidc_sub);
+            else if (!sub[0]) snprintf(sub, sizeof(sub), "%s", cid);
+            cred_verified = 1;
+            free(body);
+            body = NULL;
+            /* fall through to JWT issuance */
+            goto issue_jwt;
         }
 
         /* verify credentials based on method */
@@ -2605,6 +2702,7 @@ static int handle_auth_token(struct mg_connection *conn, void *cbdata) {
         }
     }
 
+issue_jwt:
     /* Phase 2: try policy-based JWT v2 — resolve via alforno */
     char *resolved = cookbook_policy_resolve(srv->db, sub);
     char *token = NULL;
@@ -4631,6 +4729,13 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
         fprintf(stdout, "cookbook: LDAP backend: %s (base: %s)\n",
                 opts->ldap_url,
                 opts->ldap_base_dn ? opts->ldap_base_dn : "(none)");
+    }
+
+    /* OIDC backend config */
+    if (opts->oidc_issuer) {
+        srv->oidc_cfg.issuer    = opts->oidc_issuer;
+        srv->oidc_cfg.client_id = opts->oidc_client_id;
+        fprintf(stdout, "cookbook: OIDC backend: %s\n", opts->oidc_issuer);
     }
 
     /* initialize token revocation list (max 4096 entries) */

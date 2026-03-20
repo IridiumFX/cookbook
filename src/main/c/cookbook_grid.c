@@ -98,14 +98,17 @@ static char *grid_strndup(const char *s, size_t n) {
    Returns 0 on success. host_out and port_out must be freed by caller. */
 static int parse_peer_url(const char *url,
                            char **host_out, char **port_out,
-                           const char **path_prefix) {
+                           const char **path_prefix, int *use_tls) {
     const char *p = url;
-    if (strncmp(p, "http://", 7) == 0)
-        p += 7;
-    else if (strncmp(p, "https://", 8) == 0)
+    *use_tls = 0;
+    if (strncmp(p, "https://", 8) == 0) {
         p += 8;
-    else
+        *use_tls = 1;
+    } else if (strncmp(p, "http://", 7) == 0) {
+        p += 7;
+    } else {
         return -1;
+    }
 
     /* find host:port boundary */
     const char *slash = strchr(p, '/');
@@ -122,7 +125,7 @@ static int parse_peer_url(const char *url,
             *host_out = grid_strndup(p, (size_t)(slash - p));
         else
             *host_out = strdup(p);
-        *port_out = strdup("80");
+        *port_out = strdup(*use_tls ? "443" : "80");
     }
 
     *path_prefix = slash ? slash : "";
@@ -212,10 +215,11 @@ static int grid_request_ex(const cookbook_peer *peer,
                             cookbook_grid_response *response) {
     char *host = NULL, *port = NULL;
     const char *prefix = NULL;
+    int use_tls = 0;
 
     memset(response, 0, sizeof(*response));
 
-    if (parse_peer_url(peer->url, &host, &port, &prefix) != 0)
+    if (parse_peer_url(peer->url, &host, &port, &prefix, &use_tls) != 0)
         return -1;
 
 #ifdef _WIN32
@@ -223,10 +227,17 @@ static int grid_request_ex(const cookbook_peer *peer,
     WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
 
-    sock_t fd = grid_connect(host, port);
-    if (fd == SOCK_INVALID) {
-        free(host); free(port);
-        return -1;
+    /* connect (plain or TLS) */
+    sock_t fd = SOCK_INVALID;
+    cookbook_tls_sock *tls_s = NULL;
+    int iport = atoi(port);
+
+    if (use_tls) {
+        tls_s = cookbook_sock_connect_tls(host, iport, 5);
+        if (!tls_s) { free(host); free(port); return -1; }
+    } else {
+        fd = grid_connect(host, port);
+        if (fd == SOCK_INVALID) { free(host); free(port); return -1; }
     }
 
     /* build new via chain */
@@ -252,17 +263,48 @@ static int grid_request_ex(const cookbook_peer *peer,
         hop_count + 1,
         extra_headers ? extra_headers : "");
 
-    int rc = grid_send_all(fd, request, (size_t)rlen);
+    int rc;
+    if (use_tls)
+        rc = cookbook_tls_sock_send(tls_s, request, (size_t)rlen);
+    else
+        rc = grid_send_all(fd, request, (size_t)rlen);
+
     if (rc != 0) {
-        sock_close(fd);
+        if (use_tls) cookbook_tls_sock_close(tls_s);
+        else sock_close(fd);
         free(host); free(port);
         return -1;
     }
 
     size_t body_len = 0;
     int status = 0;
-    char *body = grid_recv_response(fd, &body_len, &status);
-    sock_close(fd);
+    char *body;
+    if (use_tls) {
+        /* for TLS, read response into buffer */
+        size_t cap = 8192, total = 0;
+        body = malloc(cap);
+        if (body) {
+            for (;;) {
+                if (total >= cap - 1) {
+                    cap *= 2;
+                    char *tmp = realloc(body, cap);
+                    if (!tmp) break;
+                    body = tmp;
+                }
+                int n = cookbook_tls_sock_recv(tls_s, body + total, cap - 1 - total);
+                if (n <= 0) break;
+                total += (size_t)n;
+            }
+            body[total] = '\0';
+            body_len = total;
+            const char *sp = strchr(body, ' ');
+            status = sp ? atoi(sp + 1) : 0;
+        }
+        cookbook_tls_sock_close(tls_s);
+    } else {
+        body = grid_recv_response(fd, &body_len, &status);
+        sock_close(fd);
+    }
     free(host); free(port);
 
     response->status = status;

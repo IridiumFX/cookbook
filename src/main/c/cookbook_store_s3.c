@@ -25,6 +25,7 @@ typedef struct {
     char          *endpoint_host;
     char          *endpoint_port;
     int            path_style;  /* 1 = path-style (MinIO), 0 = virtual-hosted */
+    int            use_tls;     /* 1 = HTTPS (default for port 443) */
 } cookbook_store_s3;
 
 /* ---- AWS Signature V4 helpers ---- */
@@ -211,10 +212,34 @@ static char *s3_sign_request(cookbook_store_s3 *self,
 
 /* ---- socket helpers ---- */
 
-static sock_t s3_connect(cookbook_store_s3 *self) {
+/* S3 connection — returns plain socket OR sets *tls_out for TLS.
+   Caller checks self->use_tls to decide which to use. */
+static sock_t s3_connect_plain(cookbook_store_s3 *self) {
     int p = atoi(self->endpoint_port);
     return cookbook_sock_connect(self->endpoint_host, p, 10);
 }
+
+static cookbook_tls_sock *s3_connect_tls(cookbook_store_s3 *self) {
+    int p = atoi(self->endpoint_port);
+    return cookbook_sock_connect_tls(self->endpoint_host, p, 10);
+}
+
+/* macros for S3 operations — route through plain or TLS */
+#define S3_CONNECT(self, fd, ts) do { \
+    if ((self)->use_tls) { (ts) = s3_connect_tls(self); (fd) = SOCK_INVALID; } \
+    else { (fd) = s3_connect_plain(self); (ts) = NULL; } \
+} while(0)
+
+#define S3_CONNECTED(fd, ts, self) ((self)->use_tls ? ((ts) != NULL) : ((fd) != SOCK_INVALID))
+
+#define S3_SEND(fd, ts, self, data, len) \
+    ((self)->use_tls ? cookbook_tls_sock_send((ts), (data), (len)) \
+                     : sock_send_all((fd), (data), (len)))
+
+#define S3_CLOSE(fd, ts, self) do { \
+    if ((self)->use_tls) cookbook_tls_sock_close(ts); \
+    else sock_close(fd); \
+} while(0)
 
 /* Send data over socket, handling partial sends. */
 static int sock_send_all(sock_t fd, const void *data, size_t len) {
@@ -293,6 +318,65 @@ static const char *response_body(const char *resp, size_t resp_len,
 
 /* ---- vtable implementation ---- */
 
+/* Common S3 request: connect → send headers [+ body] → recv response → close.
+   Returns malloc'd response, sets *status. Handles plain + TLS. */
+static char *s3_do_request(cookbook_store_s3 *self, const char *headers,
+                             const void *body, size_t body_len,
+                             size_t *resp_len, int *status) {
+    if (self->use_tls) {
+        cookbook_tls_sock *ts = s3_connect_tls(self);
+        if (!ts) { *status = -1; return NULL; }
+
+        if (cookbook_tls_sock_send(ts, headers, strlen(headers)) != 0) {
+            cookbook_tls_sock_close(ts); *status = -1; return NULL;
+        }
+        if (body && body_len > 0) {
+            if (cookbook_tls_sock_send(ts, body, body_len) != 0) {
+                cookbook_tls_sock_close(ts); *status = -1; return NULL;
+            }
+        }
+
+        /* read response */
+        size_t cap = 65536, total = 0;
+        char *buf = malloc(cap);
+        if (!buf) { cookbook_tls_sock_close(ts); *status = -1; return NULL; }
+        for (;;) {
+            if (total >= cap - 1) {
+                cap *= 2;
+                char *tmp = realloc(buf, cap);
+                if (!tmp) break;
+                buf = tmp;
+            }
+            int n = cookbook_tls_sock_recv(ts, buf + total, cap - 1 - total);
+            if (n <= 0) break;
+            total += (size_t)n;
+        }
+        buf[total] = '\0';
+        cookbook_tls_sock_close(ts);
+
+        const char *sp = strchr(buf, ' ');
+        *status = sp ? atoi(sp + 1) : -1;
+        *resp_len = total;
+        return buf;
+    } else {
+        sock_t fd = s3_connect_plain(self);
+        if (fd == SOCK_INVALID) { *status = -1; return NULL; }
+
+        if (sock_send_all(fd, headers, strlen(headers)) != 0) {
+            sock_close(fd); *status = -1; return NULL;
+        }
+        if (body && body_len > 0) {
+            if (sock_send_all(fd, body, body_len) != 0) {
+                sock_close(fd); *status = -1; return NULL;
+            }
+        }
+
+        char *resp = sock_recv_response(fd, resp_len, status);
+        sock_close(fd);
+        return resp;
+    }
+}
+
 static cookbook_store_status s3_put(cookbook_store *store, const char *key,
                                     const void *data, size_t len) {
     cookbook_store_s3 *self = (cookbook_store_s3 *)store;
@@ -305,27 +389,10 @@ static cookbook_store_status s3_put(cookbook_store *store, const char *key,
                                      len, NULL, 0);
     if (!headers) return COOKBOOK_STORE_ERROR;
 
-    sock_t fd = s3_connect(self);
-    if (fd == SOCK_INVALID) {
-        free(headers);
-        return COOKBOOK_STORE_ERROR;
-    }
-
-    /* send headers then body */
-    int rc = sock_send_all(fd, headers, strlen(headers));
-    free(headers);
-    if (rc != 0) { sock_close(fd); return COOKBOOK_STORE_ERROR; }
-
-    if (len > 0) {
-        rc = sock_send_all(fd, data, len);
-        if (rc != 0) { sock_close(fd); return COOKBOOK_STORE_ERROR; }
-    }
-
-    /* read response */
     size_t resp_len;
     int status;
-    char *resp = sock_recv_response(fd, &resp_len, &status);
-    sock_close(fd);
+    char *resp = s3_do_request(self, headers, data, len, &resp_len, &status);
+    free(headers);
     free(resp);
 
     return (status == 200) ? COOKBOOK_STORE_OK : COOKBOOK_STORE_ERROR;
@@ -343,20 +410,10 @@ static cookbook_store_status s3_get(cookbook_store *store, const char *key,
                                      0, NULL, 0);
     if (!headers) return COOKBOOK_STORE_ERROR;
 
-    sock_t fd = s3_connect(self);
-    if (fd == SOCK_INVALID) {
-        free(headers);
-        return COOKBOOK_STORE_ERROR;
-    }
-
-    int rc = sock_send_all(fd, headers, strlen(headers));
-    free(headers);
-    if (rc != 0) { sock_close(fd); return COOKBOOK_STORE_ERROR; }
-
     size_t resp_len;
     int status;
-    char *resp = sock_recv_response(fd, &resp_len, &status);
-    sock_close(fd);
+    char *resp = s3_do_request(self, headers, NULL, 0, &resp_len, &status);
+    free(headers);
 
     if (!resp) return COOKBOOK_STORE_ERROR;
     if (status == 404) { free(resp); return COOKBOOK_STORE_NOT_FOUND; }
@@ -391,20 +448,10 @@ static cookbook_store_status s3_exists(cookbook_store *store, const char *key) {
                                      0, NULL, 0);
     if (!headers) return COOKBOOK_STORE_ERROR;
 
-    sock_t fd = s3_connect(self);
-    if (fd == SOCK_INVALID) {
-        free(headers);
-        return COOKBOOK_STORE_ERROR;
-    }
-
-    int rc = sock_send_all(fd, headers, strlen(headers));
-    free(headers);
-    if (rc != 0) { sock_close(fd); return COOKBOOK_STORE_ERROR; }
-
     size_t resp_len;
     int status;
-    char *resp = sock_recv_response(fd, &resp_len, &status);
-    sock_close(fd);
+    char *resp = s3_do_request(self, headers, NULL, 0, &resp_len, &status);
+    free(headers);
     free(resp);
 
     if (status == 200) return COOKBOOK_STORE_OK;
@@ -422,20 +469,10 @@ static cookbook_store_status s3_del(cookbook_store *store, const char *key) {
                                      0, NULL, 0);
     if (!headers) return COOKBOOK_STORE_ERROR;
 
-    sock_t fd = s3_connect(self);
-    if (fd == SOCK_INVALID) {
-        free(headers);
-        return COOKBOOK_STORE_ERROR;
-    }
-
-    int rc = sock_send_all(fd, headers, strlen(headers));
-    free(headers);
-    if (rc != 0) { sock_close(fd); return COOKBOOK_STORE_ERROR; }
-
     size_t resp_len;
     int status;
-    char *resp = sock_recv_response(fd, &resp_len, &status);
-    sock_close(fd);
+    char *resp = s3_do_request(self, headers, NULL, 0, &resp_len, &status);
+    free(headers);
     free(resp);
 
     /* S3 returns 204 on successful delete */
@@ -501,6 +538,9 @@ cookbook_store *cookbook_store_open_s3(const char *bucket,
         self->endpoint_port = strdup("443");
         self->path_style = 0;
     }
+
+    /* enable TLS for port 443 (AWS default) or explicit HTTPS */
+    self->use_tls = (strcmp(self->endpoint_port, "443") == 0) ? 1 : 0;
 
     self->base.put      = s3_put;
     self->base.get      = s3_get;

@@ -2983,6 +2983,70 @@ static int handle_auth_device(struct mg_connection *conn, void *cbdata) {
         return 1;
     }
 
+    /* OIDC proxy mode: forward to external IdP's device authorization endpoint */
+    if (srv->oidc_cfg.issuer) {
+        /* POST to {issuer}/oauth/device with client_id */
+        char url[512];
+        snprintf(url, sizeof(url), "%s/oauth/device", srv->oidc_cfg.issuer);
+
+        char host[256], path[256];
+        int port;
+        /* reuse the URL parser from cookbook_oidc.c (same pattern) */
+        const char *hp = srv->oidc_cfg.issuer;
+        port = 443;
+        if (strncmp(hp, "https://", 8) == 0) hp += 8;
+        else if (strncmp(hp, "http://", 7) == 0) { hp += 7; port = 80; }
+        snprintf(host, sizeof(host), "%s", hp);
+        char *colon = strchr(host, ':');
+        if (colon) { *colon = '\0'; port = atoi(colon + 1); }
+        size_t hlen = strlen(host);
+        if (hlen > 0 && host[hlen-1] == '/') host[hlen-1] = '\0';
+
+        const char *cid = srv->oidc_cfg.client_id ? srv->oidc_cfg.client_id : "cookbook";
+        char post_body[256];
+        int post_len = snprintf(post_body, sizeof(post_body),
+            "client_id=%s&scope=openid", cid);
+
+        char request[1024];
+        int req_len = snprintf(request, sizeof(request),
+            "POST /oauth/device HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "Content-Type: application/x-www-form-urlencoded\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n\r\n%s",
+            host, post_len, post_body);
+
+        cookbook_tls_sock *ts = cookbook_sock_connect_tls(host, port, 10);
+        if (ts) {
+            cookbook_tls_sock_send(ts, request, (size_t)req_len);
+            char idp_resp[4096] = {0};
+            size_t total = 0;
+            for (;;) {
+                int n = cookbook_tls_sock_recv(ts, idp_resp + total,
+                                               sizeof(idp_resp) - 1 - total);
+                if (n <= 0) break;
+                total += (size_t)n;
+            }
+            idp_resp[total] = '\0';
+            cookbook_tls_sock_close(ts);
+
+            /* check status */
+            const char *sp = strchr(idp_resp, ' ');
+            int idp_status = sp ? atoi(sp + 1) : 0;
+            const char *idp_body = strstr(idp_resp, "\r\n\r\n");
+            if (idp_status == 200 && idp_body) {
+                idp_body += 4;
+                /* forward the IdP's response directly — it contains
+                   device_code, user_code, verification_uri, interval, expires_in */
+                audit_log(srv, "auth", "unknown", "device-code-proxy", "ok");
+                METRIC_INC(srv->metrics.responses_2xx);
+                send_json(conn, 200, idp_body);
+                return 1;
+            }
+        }
+        /* IdP unreachable — fall through to standalone mode */
+    }
+
     /* prune expired device codes */
     int64_t now = (int64_t)time(NULL);
     int write = 0;
@@ -3068,6 +3132,128 @@ static int handle_auth_device_token(struct mg_connection *conn, void *cbdata) {
     if (!dc[0]) {
         send_json(conn, 400, "{\"error\":\"Missing device_code\"}\n");
         return 1;
+    }
+
+    /* OIDC proxy mode: forward poll to IdP's token endpoint */
+    if (srv->oidc_cfg.issuer) {
+        const char *hp = srv->oidc_cfg.issuer;
+        char host[256];
+        int port = 443;
+        if (strncmp(hp, "https://", 8) == 0) hp += 8;
+        else if (strncmp(hp, "http://", 7) == 0) { hp += 7; port = 80; }
+        snprintf(host, sizeof(host), "%s", hp);
+        char *col = strchr(host, ':');
+        if (col) { *col = '\0'; port = atoi(col + 1); }
+        size_t hl = strlen(host);
+        if (hl > 0 && host[hl-1] == '/') host[hl-1] = '\0';
+
+        const char *cid = srv->oidc_cfg.client_id ? srv->oidc_cfg.client_id : "cookbook";
+        char post_body[512];
+        int post_len = snprintf(post_body, sizeof(post_body),
+            "grant_type=urn%%3Aietf%%3Aparams%%3Aoauth%%3Agrant-type%%3Adevice_code"
+            "&device_code=%s&client_id=%s", dc, cid);
+
+        char request[1024];
+        int req_len = snprintf(request, sizeof(request),
+            "POST /oauth/token HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "Content-Type: application/x-www-form-urlencoded\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n\r\n%s",
+            host, post_len, post_body);
+
+        cookbook_tls_sock *ts = cookbook_sock_connect_tls(host, port, 10);
+        if (ts) {
+            cookbook_tls_sock_send(ts, request, (size_t)req_len);
+            char idp_resp[8192] = {0};
+            size_t total = 0;
+            for (;;) {
+                int n = cookbook_tls_sock_recv(ts, idp_resp + total,
+                                               sizeof(idp_resp) - 1 - total);
+                if (n <= 0) break;
+                total += (size_t)n;
+            }
+            idp_resp[total] = '\0';
+            cookbook_tls_sock_close(ts);
+
+            const char *sp = strchr(idp_resp, ' ');
+            int idp_status = sp ? atoi(sp + 1) : 0;
+            const char *idp_body = strstr(idp_resp, "\r\n\r\n");
+
+            if (idp_body) {
+                idp_body += 4;
+
+                if (idp_status == 200) {
+                    /* IdP authorized — extract access_token, get sub, issue cookbook JWT */
+                    char access_token[4096] = {0};
+                    const char *atp = strstr(idp_body, "\"access_token\":\"");
+                    if (atp) {
+                        atp += 16;
+                        const char *ate = strchr(atp, '"');
+                        if (ate) {
+                            size_t atl = (size_t)(ate - atp);
+                            if (atl >= sizeof(access_token)) atl = sizeof(access_token) - 1;
+                            memcpy(access_token, atp, atl);
+                        }
+                    }
+
+                    /* extract sub from the IdP response or JWT */
+                    char oidc_sub[128] = {0};
+                    const char *subp = strstr(idp_body, "\"sub\":\"");
+                    if (subp) {
+                        subp += 7;
+                        const char *sube = strchr(subp, '"');
+                        if (sube) {
+                            size_t sl = (size_t)(sube - subp);
+                            if (sl >= sizeof(oidc_sub)) sl = sizeof(oidc_sub) - 1;
+                            memcpy(oidc_sub, subp, sl);
+                        }
+                    }
+                    if (!oidc_sub[0]) snprintf(oidc_sub, sizeof(oidc_sub), "%s", cid);
+
+                    /* issue cookbook JWT */
+                    char *resolved = cookbook_policy_resolve(srv->db, oidc_sub);
+                    char *token = NULL;
+                    int tv = 1;
+                    if (resolved) {
+                        token = cookbook_jwt_create_v2(oidc_sub, NULL, resolved,
+                                                       srv->jwt_ttl_sec, srv->registry_sk);
+                        tv = 2;
+                        free(resolved);
+                    } else {
+                        token = cookbook_jwt_create(oidc_sub, "", srv->jwt_ttl_sec,
+                                                     srv->registry_sk);
+                    }
+                    if (token) {
+                        audit_log(srv, "auth", oidc_sub, "device-code-proxy-token", "ok");
+                        METRIC_INC(srv->metrics.responses_2xx);
+                        METRIC_INC(srv->metrics.auth_tokens_issued);
+                        char resp[8192];
+                        snprintf(resp, sizeof(resp),
+                            "{\"token\":\"%s\",\"expires_in\":%d,\"version\":%d}\n",
+                            token, srv->jwt_ttl_sec, tv);
+                        send_json(conn, 200, resp);
+                        free(token);
+                        return 1;
+                    }
+                } else if (idp_status == 428 || idp_status == 400) {
+                    /* still pending or slow_down */
+                    if (strstr(idp_body, "authorization_pending") ||
+                        strstr(idp_body, "slow_down")) {
+                        mg_printf(conn,
+                            "HTTP/1.1 428 Precondition Required\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Content-Length: 40\r\n\r\n"
+                            "{\"error\":\"authorization_pending\"}\n");
+                        return 1;
+                    }
+                    /* other 400 error — forward */
+                    send_json(conn, idp_status, idp_body);
+                    return 1;
+                }
+            }
+        }
+        /* IdP unreachable — fall through to local device code check */
     }
 
     /* find the device code entry */

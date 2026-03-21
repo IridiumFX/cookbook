@@ -204,6 +204,27 @@ Six guides under `docs/guides/`:
 - integration.md — now client, remote cache, grid, LDAP, Prometheus
 - architecture.md — platform layers, module graph, Nova porting checklist
 
+### Connection pool ✓
+
+- `cookbook_connpool.h/.c` — bounded pool (128 entries, per-host limit, idle timeout)
+- Wired into grid federation for plain TCP peer connections
+- Thread-safe (mutex-protected), auto-prunes expired connections
+
+### KV store DB backend ✓
+
+- `cookbook_db_kv.c` — third DB backend alongside SQLite and PostgreSQL
+- `COOKBOOK_DB_URL=cookbook.kv` selects KV backend (detected by `.kv` extension)
+- INSERT, SELECT (by PK + prefix iterate), DELETE, OR IGNORE, CONSTRAINT detection
+- Designed for Nova OS where SQLite is overkill
+
+### Crash diagnostics ✓
+
+- Unix signal handler: SIGSEGV, SIGABRT, SIGFPE, SIGBUS → `crash.log`
+- Windows SEH handler: ACCESS_VIOLATION, STACK_OVERFLOW → `crash.log`
+- Startup sentinel: `startup.log` written as first action in main()
+
 ### Test suite
 
-571 unit tests + stress test driver (4 concurrent phases). All passing.
+619 unit tests + stress test driver (6 concurrent phases). All passing.
+
+Server verified stable by now team: token auth, LDAP fallback, CLI flow, audit logging all confirmed working end-to-end.

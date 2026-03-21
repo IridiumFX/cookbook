@@ -45,8 +45,8 @@ static int tests_failed = 0;
 } while (0)
 
 static void test_version(void) {
-    ASSERT(cookbook_version_major() == 0, "major == 0");
-    ASSERT(cookbook_version_minor() == 1, "minor == 1");
+    ASSERT(cookbook_version_major() == 1, "major == 1");
+    ASSERT(cookbook_version_minor() == 0, "minor == 0");
     ASSERT(cookbook_version_patch() == 0, "patch == 0");
 }
 

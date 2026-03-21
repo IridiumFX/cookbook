@@ -1,6 +1,7 @@
-# cookbook — M1 Roadmap
+# cookbook — Roadmap
 
-**Status as of**: 2026-03-19
+**Version**: 1.0-rc1
+**Status as of**: 2026-03-21
 **Spec reference**: cookbook-architecture-M1.docx (d3 final)
 
 ---
@@ -223,8 +224,45 @@ Six guides under `docs/guides/`:
 - Windows SEH handler: ACCESS_VIOLATION, STACK_OVERFLOW → `crash.log`
 - Startup sentinel: `startup.log` written as first action in main()
 
+### HTTP server migration ✓
+
+- Dual-path architecture: civetweb (default) + apennines HTTP server (Nova)
+- `cookbook_http_shim.h` — macro redirect layer, all 24 handlers work unchanged with both servers
+- Route dispatch table with longest-prefix matching
+- `COOKBOOK_USE_APENNINES_HTTP=ON` cmake flag to switch
+
+### HTTPS client migration ✓
+
+- OIDC: migrated to apennines `https_client` (net -63 lines)
+- Grid federation: TLS peers migrated to `https_client`
+- S3: stays raw (AWS Sig V4 signing coupled to HTTP request format — by design)
+
+### Crash diagnostics ✓
+
+- Unix signals: SIGSEGV, SIGABRT, SIGFPE, SIGBUS → `crash.log`
+- Windows SEH: ACCESS_VIOLATION, STACK_OVERFLOW → `crash.log`
+- Startup sentinel: `startup.log` confirms exe launched
+
 ### Test suite
 
 619 unit tests + stress test driver (6 concurrent phases). All passing.
 
-Server verified stable by now team: token auth, LDAP fallback, CLI flow, audit logging all confirmed working end-to-end.
+Server verified stable by now team: token auth, LDAP fallback, CLI flow, audit logging, object cache, build graph cache all confirmed working end-to-end.
+
+---
+
+## 1.0-rc1 Summary
+
+All M1 spec gaps resolved. All enterprise features implemented. All known bugs fixed. Backlog empty.
+
+**58 commits this milestone.** Feature highlights:
+- 4 auth methods (token, LDAP with group search, OIDC client credentials, OIDC device code)
+- TLS 1.3 with AES-GCM + ChaCha20-Poly1305 + PKI chain verification
+- 3 database backends (SQLite, PostgreSQL, KV store)
+- Gzip compression, connection pooling, WAL-backed audit
+- Build graph cache, reproducibility attestation, object cache with TTL
+- Dual HTTP server architecture (civetweb + apennines, shim layer)
+- 28 vendored apennines modules (crypto, TLS, HTTP, KV, WAL, compress)
+- 4.2MB fully static single-exe deployment
+- 6 documentation guides (install, config, admin, user, integration, architecture)
+- Nova OS porting: 5 of 8 checklist items already done at compile time

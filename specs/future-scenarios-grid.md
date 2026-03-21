@@ -337,7 +337,7 @@ Full client-server integration path is now unblocked. Remaining: `dep:updates` a
 4. **G1–G4** — Grid federation (peers table, raw HTTP client, loop detection, internal endpoints, fan-out on resolve + artifact) ✓
 5. **G5** — Grid-aware mirror manifest (`?grid=true` aggregation across peers) ✓
 
-512 unit tests. All passing. Native Ed25519 (no libsodium for signing). Basta replaces libpasta.
+619 unit tests. All passing. Native Ed25519 (no libsodium for signing). Basta replaces libpasta.
 
 ### Completed (now team, Now #0003)
 
@@ -365,13 +365,33 @@ Full client-server integration path is now unblocked. Remaining: `dep:updates` a
 21. **Auth v2.5** — wildcard grants, JWT jti, token revocation, credential CRUD ✓ (492 tests)
 22. **Basta migration** — libpasta removed, basta sole format lib, compat headers ✓ (512 tests)
 
-### Waiting on other teams (nice-to-have)
+### 1.0-rc1 — Enterprise features complete
 
-23. `now dep:updates` — client UI for `?include_yanked=true` and `*` range
-24. `now cache:mirror` — client for `/mirror/manifest?grid=true`
+23. **Group management** — CRUD `/admin/groups` with auth enforcement ✓
+24. **Persistent revocation** — DB-backed, survives restarts ✓
+25. **Object cache + TTL** — `/objects/` with background eviction ✓
+26. **Build graph cache** — `/graphs/` with gzip, auth on `_graphs` ✓
+27. **Reproducibility attestation** — `.repro` validation + `?repro` shortcut ✓
+28. **LDAP auth** — simple bind + SearchRequest + memberOf group extraction ✓
+29. **OIDC auth** — client credentials + device code flow + IdP proxy ✓
+30. **TLS 1.3** — AES-GCM + ChaCha20-Poly1305 + X25519 + PKI chain verify ✓
+31. **Socket abstraction** — Nova-portable TCP + TLS ✓
+32. **Gzip compression** — deflate + RFC 1952 on pasta responses ✓
+33. **WAL audit** — CRC-32 integrity, thread-safe (apennines fix) ✓
+34. **Audit split** — auth/access/admin files + failure logging ✓
+35. **Connection pool** — grid peer TCP reuse ✓
+36. **KV DB backend** — Nova alternative to SQLite ✓
+37. **Dual HTTP server** — civetweb + apennines shim (24 routes) ✓
+38. **HTTPS client migration** — OIDC + grid via apennines ✓
+39. **Crash diagnostics** — signals + Windows SEH + startup sentinel ✓
+40. **Static build** — 4.2MB single exe, zero MinGW DLLs ✓
+41. **28 apennines modules** — crypto, TLS, HTTP, KV, WAL, compress ✓
+42. **6 documentation guides** — install, config, admin, user, integration, architecture ✓
 
-### Can defer
+619 unit tests + 6-phase stress test. All passing. Server stable in production.
 
-25. IANA `application/pasta` registration — coordination across all three projects
-26. Build graph / CAC (#25, #26) — separate infrastructure
-27. Reproducibility metadata (#30) — needs design on both sides
+### Waiting on external (nice-to-have)
+
+43. `now dep:updates` — client UI for `?include_yanked=true` and `*` range
+44. `now cache:mirror` — client for `/mirror/manifest?grid=true`
+45. IANA `application/pasta` registration — pasta team handling

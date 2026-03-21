@@ -7,6 +7,7 @@
 #include "cookbook_connpool.h"
 #include "cookbook_ed25519.h"
 #include "cookbook_auth.h"  /* for cookbook_base64url_encode */
+#include <apennines/t4/net/https_client.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -243,16 +244,12 @@ static int grid_request_ex(const cookbook_peer *peer,
     WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
 
-    /* connect (plain or TLS), with connection pool for plain TCP */
+    /* connect for plain TCP (TLS uses apennines HTTPS client directly) */
     sock_t fd = SOCK_INVALID;
-    cookbook_tls_sock *tls_s = NULL;
     int iport = atoi(port);
     int from_pool = 0;
 
-    if (use_tls) {
-        tls_s = cookbook_sock_connect_tls(host, iport, 5);
-        if (!tls_s) { free(host); free(port); return -1; }
-    } else {
+    if (!use_tls) {
         /* try connection pool first */
         if (g_grid_pool) {
             fd = cookbook_connpool_get(g_grid_pool, host, iport, 0);
@@ -286,45 +283,82 @@ static int grid_request_ex(const cookbook_peer *peer,
         hop_count + 1,
         extra_headers ? extra_headers : "");
 
-    int rc;
-    if (use_tls)
-        rc = cookbook_tls_sock_send(tls_s, request, (size_t)rlen);
-    else
-        rc = grid_send_all(fd, request, (size_t)rlen);
-
-    if (rc != 0) {
-        if (use_tls) cookbook_tls_sock_close(tls_s);
-        else sock_close(fd);
-        free(host); free(port);
-        return -1;
-    }
-
     size_t body_len = 0;
     int status = 0;
-    char *body;
+    char *body = NULL;
+
     if (use_tls) {
-        /* for TLS, read response into buffer */
-        size_t cap = 8192, total = 0;
-        body = malloc(cap);
-        if (body) {
-            for (;;) {
-                if (total >= cap - 1) {
-                    cap *= 2;
-                    char *tmp = realloc(body, cap);
-                    if (!tmp) break;
-                    body = tmp;
+        /* TLS path: use apennines HTTPS client */
+        char full_url[4096];
+        snprintf(full_url, sizeof(full_url), "https://%s:%s%s%s",
+                 host, port, prefix, path);
+
+        https_client *hc = NULL;
+        if (https_client_create(&hc) == 0) {
+            https_client_set_timeout(hc, 5000);
+            https_client_set_header(hc, "X-Cookbook-Via", via);
+            char hop_str[16];
+            snprintf(hop_str, sizeof(hop_str), "%d", hop_count + 1);
+            https_client_set_header(hc, "X-Cookbook-Hop-Count", hop_str);
+            /* parse extra_headers and set them */
+            if (extra_headers && extra_headers[0]) {
+                char *eh = strdup(extra_headers);
+                if (eh) {
+                    char *line = eh;
+                    while (line && *line) {
+                        char *colon = strchr(line, ':');
+                        char *eol = strstr(line, "\r\n");
+                        if (colon && (!eol || colon < eol)) {
+                            *colon = '\0';
+                            const char *val = colon + 1;
+                            while (*val == ' ') val++;
+                            char vbuf[512] = {0};
+                            if (eol) {
+                                size_t vl = (size_t)(eol - val);
+                                if (vl >= sizeof(vbuf)) vl = sizeof(vbuf) - 1;
+                                memcpy(vbuf, val, vl);
+                            } else {
+                                snprintf(vbuf, sizeof(vbuf), "%s", val);
+                            }
+                            https_client_set_header(hc, line, vbuf);
+                        }
+                        line = eol ? eol + 2 : NULL;
+                    }
+                    free(eh);
                 }
-                int n = cookbook_tls_sock_recv(tls_s, body + total, cap - 1 - total);
-                if (n <= 0) break;
-                total += (size_t)n;
             }
-            body[total] = '\0';
-            body_len = total;
-            const char *sp = strchr(body, ' ');
-            status = sp ? atoi(sp + 1) : 0;
+
+            int http_method = HTTP_GET;
+            if (strcmp(method, "POST") == 0) http_method = HTTP_POST;
+            else if (strcmp(method, "PUT") == 0) http_method = HTTP_PUT;
+            else if (strcmp(method, "DELETE") == 0) http_method = HTTP_DELETE;
+            else if (strcmp(method, "HEAD") == 0) http_method = HTTP_HEAD;
+
+            https_response hr;
+            memset(&hr, 0, sizeof(hr));
+            if (https_client_request(&hr, hc, http_method, full_url,
+                                       NULL, NULL, 0) == 0) {
+                status = hr.status;
+                if (hr.body && hr.body_len > 0) {
+                    body = malloc(hr.body_len + 1);
+                    if (body) {
+                        memcpy(body, hr.body, hr.body_len);
+                        body[hr.body_len] = '\0';
+                        body_len = (size_t)hr.body_len;
+                    }
+                }
+                https_response_free(&hr);
+            }
+            https_client_destroy(hc);
         }
-        cookbook_tls_sock_close(tls_s);
     } else {
+        /* plain TCP path with connection pool */
+        int rc = grid_send_all(fd, request, (size_t)rlen);
+        if (rc != 0) {
+            sock_close(fd);
+            free(host); free(port);
+            return -1;
+        }
         body = grid_recv_response(fd, &body_len, &status);
         /* return to pool if Connection: keep-alive, otherwise close */
         if (g_grid_pool && !use_tls && status > 0 &&

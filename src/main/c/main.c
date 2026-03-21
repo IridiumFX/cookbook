@@ -8,12 +8,44 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static volatile int s_running = 1;
 
 static void signal_handler(int sig) {
     (void)sig;
     s_running = 0;
+}
+
+/* Crash handler — writes minimal info before dying */
+static void crash_handler(int sig) {
+    /* use raw write to avoid malloc/stdio in signal context */
+    const char *name = "unknown";
+    if (sig == SIGSEGV) name = "SIGSEGV (segmentation fault)";
+    else if (sig == SIGABRT) name = "SIGABRT (abort)";
+    else if (sig == SIGFPE)  name = "SIGFPE (arithmetic error)";
+#ifdef SIGBUS
+    else if (sig == SIGBUS)  name = "SIGBUS (bus error)";
+#endif
+
+    FILE *f = fopen("crash.log", "a");
+    if (f) {
+        time_t now = time(NULL);
+        fprintf(f, "--- CRASH at %s", ctime(&now));
+        fprintf(f, "Signal: %d (%s)\n", sig, name);
+        fprintf(f, "This usually indicates a bug in cookbook or a corrupt request.\n");
+        fprintf(f, "Check the audit logs for the last request before this crash.\n\n");
+        fflush(f);
+        fclose(f);
+    }
+
+    /* also print to stderr */
+    fprintf(stderr, "\ncookbook: FATAL: %s (signal %d)\n", name, sig);
+    fprintf(stderr, "cookbook: crash log written to crash.log\n");
+
+    /* re-raise to get default behavior (core dump if enabled) */
+    signal(sig, SIG_DFL);
+    raise(sig);
 }
 
 static const char *env_or(const char *name, const char *fallback) {
@@ -227,6 +259,14 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+
+    /* crash handlers — write crash.log before dying */
+    signal(SIGSEGV, crash_handler);
+    signal(SIGABRT, crash_handler);
+    signal(SIGFPE, crash_handler);
+#ifdef SIGBUS
+    signal(SIGBUS, crash_handler);
+#endif
 
     while (s_running) {
         cookbook_server_poll(srv, 100);

@@ -86,9 +86,11 @@ cookbook_server
 | libbasta | 4 .c + 2 .h | MIT | Yes (pure C) |
 | alforno | 5 .c + 2 .h | MIT | Yes (pure C) |
 | SQLite | 1 .c + 1 .h | Public domain | Yes (pure C) |
-| civetweb | 1 .c + 1 .h + .inl | MIT | Needs socket adapter |
+| civetweb | 1 .c + 1 .h + .inl | MIT | Replaced by apennines HTTP server on Nova |
 | libsodium | ~100 .c | ISC | Mostly pure C, some asm |
-| apennines | 14 .c + 14 .h | — | Yes (pure C, swap entropy) |
+| apennines | 28 modules (56 .c + .h) | — | Yes (pure C, swap entropy + socket) |
+
+Apennines modules: T1 (buf, entropy), T2 (cipher, ct, ec, ecdsa, hash, rsa, secret, x509, asn1_der, base, pem, bigint, compress, addr), T3 (pki, http, wal, tcp, threadpool, kv, tls, h2, dns), T4 (http_client, https_client, http_server)
 
 ## Database abstraction
 
@@ -138,10 +140,12 @@ All protocol code is pure C11 — no system library dependencies:
 |----------|------|-------|-------|
 | Ed25519 (RFC 8032) | `cookbook_ed25519.c` | ~2800 | Full keygen/sign/verify |
 | SHA-256 | `cookbook_sha256.c` | ~300 | NIST test vectors |
-| TLS 1.3 (RFC 8446) | `cookbook_tls.c` | ~500 | Client handshake + record layer |
-| LDAP bind (RFC 4511) | `cookbook_ldap.c` | ~350 | BER encoding, simple bind |
-| HTTP client | `cookbook_grid.c` | ~300 | Raw HTTP/1.1 for grid federation |
-| AWS Sig V4 | `cookbook_store_s3.c` | ~250 | S3 request signing |
+| TLS 1.3 (RFC 8446) | `cookbook_tls.c` | ~770 | Client handshake + record layer, AES-GCM + ChaCha20, cert verify |
+| LDAP bind+search (RFC 4511) | `cookbook_ldap.c` | ~600 | BER encoding, simple bind, SearchRequest, memberOf extraction |
+| OIDC (RFC 6749) | `cookbook_oidc.c` | ~190 | Client credentials via apennines HTTPS client |
+| HTTP client | `cookbook_grid.c` | ~300 | Plain TCP + apennines HTTPS client for TLS peers |
+| AWS Sig V4 | `cookbook_store_s3.c` | ~250 | S3 request signing (raw sockets, not migrated) |
+| Gzip (RFC 1952) | `cookbook_gzip.c` | ~80 | Deflate + gzip framing for HTTP responses |
 
 ## Binary deployment (DLLs on Windows)
 
@@ -153,10 +157,33 @@ On Windows, cookbook links statically against all vendored libraries. However, G
 | `libwinpthread-1.dll` | MinGW pthreads | Yes (unless fully static) |
 | `libpq.dll` | PostgreSQL | Only if using PostgreSQL backend |
 
-To eliminate DLL dependencies entirely, add to CMake:
-```cmake
-target_link_options(cookbook_server PRIVATE -static)
+To eliminate DLL dependencies entirely:
+```sh
+cmake --preset default -DCOOKBOOK_STATIC_LINK=ON
 ```
+
+This produces a 4.2MB self-contained executable with zero MinGW DLLs.
+
+## Dual HTTP server architecture
+
+Cookbook supports two HTTP server backends, selectable at compile time:
+
+**civetweb** (default, battle-tested):
+- `#include "civetweb.h"` — standard civetweb API
+- Worker thread model, prefix-based URI matching
+- Used for all production deployments today
+
+**apennines HTTP server** (Nova-forward, experimental):
+- Enable: `cmake -DCOOKBOOK_USE_APENNINES_HTTP=ON`
+- `cookbook_http_shim.h` redirects civetweb API to apennines `http_ctx`:
+  ```c
+  #define mg_connection       shim_connection
+  #define mg_get_request_info shim_get_request_info
+  #define mg_printf           shim_printf
+  ```
+- All 24 handlers work unchanged with both servers
+- Route dispatch via static table with longest-prefix matching
+- Zero code duplication — one handler codebase, two server backends
 
 This produces a single self-contained executable. Test thoroughly — some MinGW versions have issues with fully static builds.
 
@@ -165,7 +192,10 @@ This produces a single self-contained executable. Test thoroughly — some MinGW
 1. **Swap `cookbook_socket.c`** — replace winsock2/BSD with Nova networking
 2. **Swap `entropy.c`** (apennines) — replace BCryptGenRandom/urandom with Nova CSPRNG
 3. **Swap CSPRNG in `cookbook_ed25519.c`** — same as above
-4. **Adapt or replace civetweb** — Nova HTTP server or port civetweb's socket layer
-5. **Thread primitives** — replace `CreateThread`/`pthread_create` in `cookbook_server.c` (reconciliation thread) and `CRITICAL_SECTION`/`pthread_mutex` (audit lock, rate lock)
-6. **File I/O** — `fopen`/`fwrite`/`fclose` in audit log; `cookbook_store_fs.c` uses standard C file I/O
-7. **Everything else compiles as-is** — pure C11
+4. **Build with `-DCOOKBOOK_USE_APENNINES_HTTP=ON`** — uses apennines HTTP server instead of civetweb (Nova-native, all handlers work via shim)
+5. **Use KV backend** — `COOKBOOK_DB_URL=cookbook.kv` instead of SQLite
+6. **Thread primitives** — replace `CreateThread`/`pthread_create` in `cookbook_server.c` (reconciliation thread) and `CRITICAL_SECTION`/`pthread_mutex` (audit lock, rate lock, WAL lock)
+7. **File I/O** — `fopen`/`fwrite`/`fclose` in audit log and WAL; `cookbook_store_fs.c` uses standard C file I/O
+8. **Everything else compiles as-is** — pure C11
+
+Steps 1-3 are single-file swaps. Step 4 is already done (flag-gated). Step 5 is already done (auto-detected by `.kv` extension). Steps 6-7 are standard C library calls that Nova's libc should provide.

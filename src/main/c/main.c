@@ -173,6 +173,13 @@ int main(int argc, char **argv) {
             return 1;
         }
         printf("cookbook: database: PostgreSQL\n");
+    } else if (db_url && (strstr(db_url, ".kv") != NULL)) {
+        db = cookbook_db_open_kv(db_url);
+        if (!db) {
+            fprintf(stderr, "cookbook: failed to open KV store: %s\n", db_url);
+            return 1;
+        }
+        printf("cookbook: database: KV store (%s)\n", db_url);
     } else {
         const char *sqlite_path = db_url ? db_url : "cookbook.db";
         db = cookbook_db_open_sqlite(sqlite_path);

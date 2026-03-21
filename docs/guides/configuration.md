@@ -14,7 +14,7 @@ All configuration is via environment variables. No config files needed (set in t
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `COOKBOOK_DB_URL` | `cookbook.db` | SQLite file path, or a PostgreSQL connection URL |
+| `COOKBOOK_DB_URL` | `cookbook.db` | SQLite path, PostgreSQL URL, or KV store path |
 
 ### SQLite (default)
 
@@ -31,6 +31,14 @@ COOKBOOK_DB_URL=postgres://user:password@localhost:5432/cookbook
 ```
 
 Requires PostgreSQL 12+ and libpq at runtime. Schema migrations run automatically on startup.
+
+### KV store (Nova OS)
+
+```
+COOKBOOK_DB_URL=cookbook.kv
+```
+
+Lightweight alternative to SQLite using apennines KV (append-only log + hash index). No SQL engine — data stored as key-value pairs. Detected by `.kv` file extension. Best for Nova OS or minimal deployments where SQLite is overkill. Limitations: no JOINs, no complex queries, no ORDER BY.
 
 ## Object storage
 

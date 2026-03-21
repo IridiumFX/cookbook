@@ -17,6 +17,35 @@ static void signal_handler(int sig) {
     s_running = 0;
 }
 
+/* Windows unhandled exception filter — catches SEH exceptions that
+   bypass Unix signal handlers (access violations, stack overflows, etc.) */
+#ifdef _WIN32
+#include <windows.h>
+static LONG WINAPI win_exception_handler(EXCEPTION_POINTERS *ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    const char *name = "unknown";
+    if (code == EXCEPTION_ACCESS_VIOLATION) name = "ACCESS_VIOLATION";
+    else if (code == EXCEPTION_STACK_OVERFLOW) name = "STACK_OVERFLOW";
+    else if (code == EXCEPTION_INT_DIVIDE_BY_ZERO) name = "INT_DIVIDE_BY_ZERO";
+    else if (code == EXCEPTION_ILLEGAL_INSTRUCTION) name = "ILLEGAL_INSTRUCTION";
+
+    FILE *f = fopen("crash.log", "a");
+    if (f) {
+        time_t now = time(NULL);
+        fprintf(f, "--- CRASH (Windows SEH) at %s", ctime(&now));
+        fprintf(f, "Exception: 0x%08lX (%s)\n", (unsigned long)code, name);
+        fprintf(f, "Address: 0x%p\n", ep->ExceptionRecord->ExceptionAddress);
+        fprintf(f, "Check the audit logs for the last request before this crash.\n\n");
+        fflush(f);
+        fclose(f);
+    }
+    fprintf(stderr, "\ncookbook: FATAL: Windows exception 0x%08lX (%s)\n",
+            (unsigned long)code, name);
+    fprintf(stderr, "cookbook: crash log written to crash.log\n");
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
 /* Crash handler — writes minimal info before dying */
 static void crash_handler(int sig) {
     /* use raw write to avoid malloc/stdio in signal context */
@@ -268,6 +297,9 @@ int main(int argc, char **argv) {
     signal(SIGTERM, signal_handler);
 
     /* crash handlers — write crash.log before dying */
+#ifdef _WIN32
+    SetUnhandledExceptionFilter(win_exception_handler);
+#endif
     signal(SIGSEGV, crash_handler);
     signal(SIGABRT, crash_handler);
     signal(SIGFPE, crash_handler);

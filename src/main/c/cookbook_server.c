@@ -5389,13 +5389,17 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
         snprintf(path, sizeof(path), "%s/audit-admin.pasta", opts->audit_log_dir);
         srv->audit_admin = fopen(path, "a");
 
-        /* WAL logs (durable, CRC-32 integrity) */
+        /* WAL logs disabled for now — apennines WAL triggers
+           STATUS_INVALID_HANDLE on Windows. Flat files are sufficient.
+           TODO: debug WAL on Windows or wait for apennines fix. */
+        #if 0
         snprintf(path, sizeof(path), "%s/audit-auth.wal", opts->audit_log_dir);
-        wal_create(&srv->wal_auth, path);
+        if (wal_create(&srv->wal_auth, path) != 0) srv->wal_auth = NULL;
         snprintf(path, sizeof(path), "%s/audit-access.wal", opts->audit_log_dir);
-        wal_create(&srv->wal_access, path);
+        if (wal_create(&srv->wal_access, path) != 0) srv->wal_access = NULL;
         snprintf(path, sizeof(path), "%s/audit-admin.wal", opts->audit_log_dir);
-        wal_create(&srv->wal_admin, path);
+        if (wal_create(&srv->wal_admin, path) != 0) srv->wal_admin = NULL;
+        #endif
 
         if (srv->audit_auth && srv->audit_access && srv->audit_admin)
             fprintf(stdout, "cookbook: audit logs: %s/audit-{auth,access,admin}.{pasta,wal}\n",

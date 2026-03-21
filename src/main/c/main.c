@@ -124,6 +124,22 @@ static int save_hex_file(const char *path, const unsigned char *data,
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
 
+    /* write startup log for crash diagnosis */
+    {
+        FILE *sl = fopen("startup.log", "w");
+        if (sl) {
+            time_t now = time(NULL);
+            fprintf(sl, "cookbook starting at %s", ctime(&now));
+            fprintf(sl, "exe: %s\n", argv[0] ? argv[0] : "(unknown)");
+            fflush(sl);
+            fclose(sl);
+        }
+    }
+
+#ifdef _WIN32
+    SetUnhandledExceptionFilter(win_exception_handler);
+#endif
+
     printf("cookbook %d.%d.%d\n",
            cookbook_version_major(),
            cookbook_version_minor(),
@@ -297,9 +313,6 @@ int main(int argc, char **argv) {
     signal(SIGTERM, signal_handler);
 
     /* crash handlers — write crash.log before dying */
-#ifdef _WIN32
-    SetUnhandledExceptionFilter(win_exception_handler);
-#endif
     signal(SIGSEGV, crash_handler);
     signal(SIGABRT, crash_handler);
     signal(SIGFPE, crash_handler);

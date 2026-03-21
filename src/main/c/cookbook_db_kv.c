@@ -290,27 +290,97 @@ static cookbook_db_status kv_exec_p(cookbook_db *db, const char *sql,
     }
 
     if (strstr(sql, "UPDATE") || strstr(sql, "update")) {
-        /* UPDATE table SET col = ?1 WHERE pk = ?2 */
-        /* For simplicity: read existing row, modify, write back */
+        /* UPDATE table SET col = ?1 WHERE pk = ?N
+           Pattern: params[0..N-2] are SET values, params[N-1] is WHERE pk.
+           Extract column names from "SET col1 = ?1, col2 = ?2" */
         if (nparams < 2) return COOKBOOK_DB_ERROR;
-        /* last param is the WHERE pk value */
         const char *pk = params[nparams - 1].text;
         if (!pk) return COOKBOOK_DB_ERROR;
 
         char key[256];
         kv_key(key, sizeof(key), table, pk);
 
+        /* read existing row */
         u8 *existing = NULL;
         u64 elen = 0;
         if (kv_get(&existing, &elen, self->store,
                     (const u8 *)key, (u64)strlen(key)) != 0)
             return COOKBOOK_DB_NOT_FOUND;
 
-        /* for now, just overwrite with the same data
-           (full UPDATE parsing would require extracting SET clause) */
-        /* TODO: proper SET clause parsing */
+        /* decode existing row into a mutable buffer */
+        char *row = malloc(elen + 1);
+        if (!row) { free(existing); return COOKBOOK_DB_ERROR; }
+        memcpy(row, existing, elen);
+        row[elen] = '\0';
         free(existing);
-        return COOKBOOK_DB_OK;
+
+        /* parse SET clause: "SET col1 = ?1, col2 = ?2" */
+        const char *set = strstr(sql, " SET ");
+        if (!set) set = strstr(sql, " set ");
+        if (set) {
+            set += 5;
+            /* for each SET assignment, find the column name and param index */
+            int pidx = 0;
+            const char *p = set;
+            while (*p && pidx < nparams - 1) {
+                while (*p == ' ') p++;
+                /* column name */
+                const char *col_start = p;
+                while (*p && *p != ' ' && *p != '=') p++;
+                size_t col_len = (size_t)(p - col_start);
+                char colname[128] = {0};
+                if (col_len >= sizeof(colname)) col_len = sizeof(colname) - 1;
+                memcpy(colname, col_start, col_len);
+
+                /* skip " = ?N" */
+                while (*p && *p != '?') p++;
+                if (*p == '?') p++;
+                while (*p >= '0' && *p <= '9') p++;
+                if (*p == ',') p++;
+
+                /* get the new value */
+                const char *newval = "";
+                char intbuf[32];
+                if (params[pidx].type == COOKBOOK_DB_PARAM_TEXT)
+                    newval = params[pidx].text ? params[pidx].text : "";
+                else if (params[pidx].type == COOKBOOK_DB_PARAM_INT) {
+                    snprintf(intbuf, sizeof(intbuf), "%d", (int)params[pidx].integer);
+                    newval = intbuf;
+                }
+
+                /* find and replace "colname=oldval" in row */
+                char search[136];
+                snprintf(search, sizeof(search), "%s=", colname);
+                char *found = strstr(row, search);
+                if (found) {
+                    /* rebuild row with new value */
+                    size_t prefix_len = (size_t)(found - row);
+                    char *tab = strchr(found, '\t');
+                    size_t suffix_start = tab ? (size_t)(tab - row) : strlen(row);
+                    size_t new_entry_len = strlen(colname) + 1 + strlen(newval);
+                    size_t new_row_len = prefix_len + new_entry_len + (strlen(row) - suffix_start);
+                    char *newrow = malloc(new_row_len + 1);
+                    if (newrow) {
+                        memcpy(newrow, row, prefix_len);
+                        size_t off = prefix_len;
+                        off += (size_t)sprintf(newrow + off, "%s=%s", colname, newval);
+                        memcpy(newrow + off, row + suffix_start, strlen(row) - suffix_start);
+                        newrow[off + strlen(row) - suffix_start] = '\0';
+                        free(row);
+                        row = newrow;
+                    }
+                }
+                pidx++;
+                /* skip to WHERE */
+                if (strstr(p, "WHERE") || strstr(p, "where")) break;
+            }
+        }
+
+        /* write back */
+        unsigned long rc = kv_put(self->store, (const u8 *)key, (u64)strlen(key),
+                                    (const u8 *)row, (u64)strlen(row));
+        free(row);
+        return rc == 0 ? COOKBOOK_DB_OK : COOKBOOK_DB_ERROR;
     }
 
     return COOKBOOK_DB_OK;

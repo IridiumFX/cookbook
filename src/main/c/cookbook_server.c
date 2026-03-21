@@ -11,7 +11,20 @@
 #include <apennines/t1/random/entropy.h>
 #include <apennines/t3/crypto/pki.h>
 #include <apennines/t3/db/wal.h>
+#ifdef COOKBOOK_USE_APENNINES_HTTP
+#include "cookbook_http_shim.h"
+/* Redirect civetweb API to shim — makes all handlers work with both servers */
+#define mg_connection       shim_connection
+#define mg_request_info     shim_request_info
+#define mg_get_request_info shim_get_request_info
+#define mg_printf           shim_printf
+#define mg_write            shim_write
+#define mg_read             shim_read
+#define mg_send_http_ok     shim_send_http_ok
+/* mg_start/mg_stop/mg_set_request_handler handled in #ifdef blocks */
+#else
 #include "civetweb.h"
+#endif
 #include "pasta.h"
 #include <sodium.h>
 

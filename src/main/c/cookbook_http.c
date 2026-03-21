@@ -13,6 +13,7 @@
 #ifdef COOKBOOK_USE_APENNINES_HTTP
 
 #include "cookbook_http_shim.h"
+#include <apennines/t3/net/http.h>
 #include <apennines/t4/net/http_server.h>
 #include <apennines/t3/net/tcp.h>
 
@@ -230,20 +231,79 @@ http_server *cookbook_http_get_server(void) {
  * will provide via cookbook_http_register_routes().
  */
 
-typedef int (*cookbook_handler_fn)(void *conn, void *cbdata);
+/* ---- Route dispatch table ---- */
 
-static void *g_server_ptr = NULL;  /* cookbook_server* */
+/* civetweb handler signature (with shim types via #define) */
+typedef int (*cw_handler_fn)(shim_connection *conn, void *cbdata);
+
+typedef struct {
+    const char    *pattern;
+    int            method;    /* -1 = all methods */
+    cw_handler_fn  handler;
+} route_entry;
+
+#define MAX_ROUTES 64
+static route_entry g_routes[MAX_ROUTES];
+static int         g_route_count = 0;
+static void       *g_server_ptr = NULL;
+
+/* Generic apennines handler — dispatches through the shim */
+static unsigned long generic_handler(http_ctx *ctx) {
+    const char *path = NULL;
+    http_ctx_path(&path, ctx);
+    if (!path) path = "/";
+
+    /* find matching route (longest prefix match, like civetweb) */
+    route_entry *best = NULL;
+    size_t best_len = 0;
+    for (int i = 0; i < g_route_count; i++) {
+        size_t plen = strlen(g_routes[i].pattern);
+        if (strncmp(path, g_routes[i].pattern, plen) == 0 && plen > best_len) {
+            best = &g_routes[i];
+            best_len = plen;
+        }
+    }
+
+    if (!best) {
+        http_ctx_respond_json(ctx, 404, "{\"error\":\"Not Found\"}\n");
+        return 0;
+    }
+
+    /* create shim and dispatch */
+    shim_connection sc;
+    shim_init(&sc, ctx);
+    best->handler(&sc, g_server_ptr);
+    return 0;
+}
 
 void cookbook_http_set_server(void *srv) {
     g_server_ptr = srv;
 }
 
-/* Register all routes — called from cookbook_server_start */
+/* Add a route (called from cookbook_server_start) */
+void cookbook_http_add_route(const char *pattern, void *handler) {
+    if (g_route_count >= MAX_ROUTES) return;
+    g_routes[g_route_count].pattern = pattern;
+    g_routes[g_route_count].method = -1;
+    g_routes[g_route_count].handler = (cw_handler_fn)handler;
+    g_route_count++;
+}
+
+/* Register the generic handler on the http_server — catches all requests */
 void cookbook_http_register_routes(void *srv) {
     g_server_ptr = srv;
-    /* Routes will be registered as the shim matures.
-       Each handler wrapper calls the existing handler through the shim. */
-    fprintf(stdout, "cookbook: apennines HTTP routes registered (shim layer)\n");
+    if (!g_http) return;
+
+    /* register a catch-all route that dispatches through our route table */
+    http_server_route(g_http, HTTP_GET, "/", generic_handler);
+    http_server_route(g_http, HTTP_POST, "/", generic_handler);
+    http_server_route(g_http, HTTP_PUT, "/", generic_handler);
+    http_server_route(g_http, HTTP_DELETE, "/", generic_handler);
+    http_server_route(g_http, HTTP_HEAD, "/", generic_handler);
+    http_server_route(g_http, HTTP_PATCH, "/", generic_handler);
+
+    fprintf(stdout, "cookbook: apennines HTTP routes registered (%d routes via shim)\n",
+            g_route_count);
 }
 
 #endif /* COOKBOOK_USE_APENNINES_HTTP */

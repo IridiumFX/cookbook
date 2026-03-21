@@ -5632,12 +5632,38 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
         }
         srv->ctx = NULL; /* no civetweb context */
 
-        /* TODO: register routes on apennines http_server.
-           For now, this is a placeholder — the actual route registration
-           needs wrapper handlers that translate http_ctx to our handler
-           signatures. This will be done incrementally. */
+        /* register all routes via shim dispatch table */
+        extern void cookbook_http_add_route(const char *pattern, void *handler);
+        extern void cookbook_http_register_routes(void *srv);
 
-        fprintf(stdout, "cookbook: using apennines HTTP server (experimental)\n");
+        cookbook_http_add_route("/healthz", handle_healthz);
+        cookbook_http_add_route("/readyz", handle_readyz);
+        cookbook_http_add_route("/.well-known/now-registry-key", handle_registry_key);
+        cookbook_http_add_route("/.well-known/now-registry", handle_registry_discovery);
+        cookbook_http_add_route("/auth/token", handle_auth_token);
+        cookbook_http_add_route("/auth/revoke", handle_auth_revoke);
+        cookbook_http_add_route("/auth/device/token", handle_auth_device_token);
+        cookbook_http_add_route("/auth/device/verify", handle_auth_device_verify);
+        cookbook_http_add_route("/auth/device", handle_auth_device);
+        cookbook_http_add_route("/keys", handle_keys);
+        cookbook_http_add_route("/metrics", handle_metrics);
+        cookbook_http_add_route("/mirror/manifest", handle_mirror_manifest);
+        cookbook_http_add_route("/resolve/", handle_resolve);
+        cookbook_http_add_route("/artifact/", handle_artifact);
+        cookbook_http_add_route("/objects/", handle_objects);
+        cookbook_http_add_route("/graphs/", handle_graphs);
+        if (srv->grid_enabled) {
+            cookbook_http_add_route("/grid/resolve/", handle_grid_resolve);
+            cookbook_http_add_route("/grid/artifact/", handle_grid_artifact);
+            cookbook_http_add_route("/grid/manifest", handle_grid_manifest);
+            cookbook_http_add_route("/admin/peers", handle_admin_peers);
+        }
+        cookbook_http_add_route("/admin/groups", handle_admin_groups);
+        cookbook_http_add_route("/admin/credentials", handle_admin_credentials);
+        cookbook_http_add_route("/admin/policies", handle_admin_policies);
+
+        cookbook_http_register_routes(srv);
+        fprintf(stdout, "cookbook: using apennines HTTP server\n");
     }
 #else
     /* ---- civetweb path (default, battle-tested) ---- */

@@ -6,8 +6,29 @@
 
 #ifdef _WIN32
 #include <io.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #else
 #include <unistd.h>
+#include <pthread.h>
+#endif
+
+/* ------------------------------------------------------------------ */
+/*  Platform mutex for thread safety                                   */
+/* ------------------------------------------------------------------ */
+
+#ifdef _WIN32
+typedef CRITICAL_SECTION wal_mutex;
+static void wal_mtx_init(wal_mutex *m)    { InitializeCriticalSection(m); }
+static void wal_mtx_lock(wal_mutex *m)    { EnterCriticalSection(m); }
+static void wal_mtx_unlock(wal_mutex *m)  { LeaveCriticalSection(m); }
+static void wal_mtx_destroy(wal_mutex *m) { DeleteCriticalSection(m); }
+#else
+typedef pthread_mutex_t wal_mutex;
+static void wal_mtx_init(wal_mutex *m)    { pthread_mutex_init(m, NULL); }
+static void wal_mtx_lock(wal_mutex *m)    { pthread_mutex_lock(m); }
+static void wal_mtx_unlock(wal_mutex *m)  { pthread_mutex_unlock(m); }
+static void wal_mtx_destroy(wal_mutex *m) { pthread_mutex_destroy(m); }
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -15,9 +36,10 @@
 /* ------------------------------------------------------------------ */
 
 struct wal {
-    FILE *fp;
-    u64   next_seq;
-    char  path[512];
+    FILE     *fp;
+    u64       next_seq;
+    char      path[512];
+    wal_mutex lock;
 };
 
 struct wal_iter {
@@ -154,6 +176,7 @@ unsigned long wal_create(wal **out, const char *path) {
     }
 
     w->next_seq = max_seq + 1;
+    wal_mtx_init(&w->lock);
 
     *out = w;
     return 0;
@@ -173,6 +196,8 @@ unsigned long wal_append(u64 *out_seq, wal *w,
     if (!w)                return 2;
     if (!data && len > 0)  return 3;
 
+    wal_mtx_lock(&w->lock);
+
     seq = w->next_seq;
     crc = crc32_compute(data, len);
 
@@ -180,24 +205,32 @@ unsigned long wal_append(u64 *out_seq, wal *w,
     write_u32_le(hdr + 8,  (u32)len);
     write_u32_le(hdr + 12, crc);
 
-    /* ensure we are at end of file (append mode should do this,
-       but be explicit after any read-seeking) */
-    if (fseek(w->fp, 0, SEEK_END) != 0)
+    if (fseek(w->fp, 0, SEEK_END) != 0) {
+        wal_mtx_unlock(&w->lock);
         return 4;
-
-    if (fwrite(hdr, 1, WAL_HDR_SIZE, w->fp) != WAL_HDR_SIZE)
-        return 4;
-
-    if (len > 0) {
-        if (fwrite(data, 1, (size_t)len, w->fp) != (size_t)len)
-            return 4;
     }
 
-    if (fflush(w->fp) != 0)
+    if (fwrite(hdr, 1, WAL_HDR_SIZE, w->fp) != WAL_HDR_SIZE) {
+        wal_mtx_unlock(&w->lock);
         return 4;
+    }
+
+    if (len > 0) {
+        if (fwrite(data, 1, (size_t)len, w->fp) != (size_t)len) {
+            wal_mtx_unlock(&w->lock);
+            return 4;
+        }
+    }
+
+    if (fflush(w->fp) != 0) {
+        wal_mtx_unlock(&w->lock);
+        return 4;
+    }
 
     w->next_seq = seq + 1;
     *out_seq = seq;
+
+    wal_mtx_unlock(&w->lock);
     return 0;
 }
 
@@ -453,23 +486,25 @@ unsigned long wal_truncate(wal *w, u64 before_seq) {
 
 unsigned long wal_sync(wal *w) {
     int fd;
+    unsigned long rc = 0;
 
     if (!w) return 1;
 
-    if (fflush(w->fp) != 0)
-        return 2;
+    wal_mtx_lock(&w->lock);
+
+    if (fflush(w->fp) != 0) { rc = 2; goto done; }
 
 #ifdef _WIN32
     fd = _fileno(w->fp);
-    if (fd < 0 || _commit(fd) != 0)
-        return 2;
+    if (fd < 0 || _commit(fd) != 0) { rc = 2; goto done; }
 #else
     fd = fileno(w->fp);
-    if (fd < 0 || fdatasync(fd) != 0)
-        return 2;
+    if (fd < 0 || fdatasync(fd) != 0) { rc = 2; goto done; }
 #endif
 
-    return 0;
+done:
+    wal_mtx_unlock(&w->lock);
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -479,12 +514,18 @@ unsigned long wal_sync(wal *w) {
 unsigned long wal_close(wal *w) {
     if (!w) return 1;
 
+    wal_mtx_lock(&w->lock);
     if (w->fp) {
         if (fclose(w->fp) != 0) {
+            wal_mtx_unlock(&w->lock);
+            wal_mtx_destroy(&w->lock);
             free(w);
             return 2;
         }
+        w->fp = NULL;
     }
+    wal_mtx_unlock(&w->lock);
+    wal_mtx_destroy(&w->lock);
 
     free(w);
     return 0;

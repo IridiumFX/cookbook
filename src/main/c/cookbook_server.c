@@ -1876,6 +1876,33 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
     snprintf(key, key_len + 1, "%s/%s", srv->registry_id, path);
 
     if (strcmp(ri->request_method, "GET") == 0) {
+        /* ?repro shortcut: redirect to the .repro sidecar */
+        if (ri->query_string && strstr(ri->query_string, "repro")) {
+            /* build .repro key: strip extension, add .repro */
+            char repro_key[512];
+            snprintf(repro_key, sizeof(repro_key), "%s.repro",
+                     key); /* key already has the full path */
+            /* try to serve the .repro file */
+            void *rdata = NULL;
+            size_t rlen = 0;
+            if (srv->store->get(srv->store, repro_key, &rdata, &rlen) == COOKBOOK_STORE_OK) {
+                METRIC_INC(srv->metrics.responses_2xx);
+                send_response_gzip(conn, ri, 200,
+                    "application/x-pasta; charset=US-ASCII", rdata, rlen);
+                free(rdata);
+                free(key); free(path); free(group);
+                free(artifact); free(ver_file); free(filename);
+                return 1;
+            }
+            free(rdata);
+            METRIC_INC(srv->metrics.responses_4xx);
+            send_json(conn, 404,
+                "{\"error\":\"No reproducibility attestation found\"}\n");
+            free(key); free(path); free(group);
+            free(artifact); free(ver_file); free(filename);
+            return 1;
+        }
+
         /* ---- GET: serve artifact ---- */
         void *data = NULL;
         size_t len = 0;
@@ -4510,6 +4537,135 @@ static int handle_objects(struct mg_connection *conn, void *cbdata) {
     return 1;
 }
 
+/* ==== Build graph cache: /graphs/{hash} ==== */
+
+static int handle_graphs(struct mg_connection *conn, void *cbdata) {
+    cookbook_server *srv = (cookbook_server *)cbdata;
+    const struct mg_request_info *ri = mg_get_request_info(conn);
+
+    METRIC_INC(srv->metrics.requests_total);
+
+    char *graph_key = path_after(ri->local_uri, "/graphs/");
+    if (!graph_key || !graph_key[0]) {
+        free(graph_key);
+        METRIC_INC(srv->metrics.responses_4xx);
+        send_json(conn, 400, "{\"error\":\"Missing graph key\"}\n");
+        return 1;
+    }
+
+    if (validate_path_segment(graph_key) != 0) {
+        free(graph_key);
+        METRIC_INC(srv->metrics.responses_4xx);
+        send_json(conn, 400, "{\"error\":\"Invalid graph key\"}\n");
+        return 1;
+    }
+
+    /* store key: {registry_id}/graphs/{hash} */
+    size_t store_key_len = strlen(srv->registry_id) + 9 + strlen(graph_key);
+    char *store_key = malloc(store_key_len + 1);
+    if (!store_key) { free(graph_key); return 1; }
+    snprintf(store_key, store_key_len + 1,
+             "%s/graphs/%s", srv->registry_id, graph_key);
+
+    if (strcmp(ri->request_method, "GET") == 0) {
+        METRIC_INC(srv->metrics.requests_get);
+        void *data = NULL;
+        size_t len = 0;
+        cookbook_store_status sst = srv->store->get(srv->store,
+                                                     store_key, &data, &len);
+        if (sst == COOKBOOK_STORE_NOT_FOUND) {
+            METRIC_INC(srv->metrics.responses_4xx);
+            send_json(conn, 404, "{\"error\":\"Graph not found\"}\n");
+        } else {
+            METRIC_INC(srv->metrics.responses_2xx);
+            send_response_gzip(conn, ri, 200,
+                "application/x-pasta; charset=US-ASCII", data, len);
+        }
+        free(data);
+        free(store_key);
+        free(graph_key);
+        return 1;
+    }
+
+    if (strcmp(ri->request_method, "HEAD") == 0) {
+        METRIC_INC(srv->metrics.requests_get);
+        void *data = NULL;
+        size_t len = 0;
+        cookbook_store_status sst = srv->store->get(srv->store,
+                                                     store_key, &data, &len);
+        if (sst == COOKBOOK_STORE_NOT_FOUND) {
+            mg_printf(conn,
+                "HTTP/1.1 404 Not Found\r\n"
+                "Content-Length: 0\r\n\r\n");
+        } else {
+            /* compute age from object_cache table if available */
+            char age_str[32] = "0";
+            cookbook_db_param ap[] = { COOKBOOK_P_TEXT(graph_key) };
+            typedef struct { int64_t created; } age_ctx;
+            age_ctx actx = { 0 };
+            /* simple: if no cache entry, age=0 */
+            mg_printf(conn,
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/x-pasta; charset=US-ASCII\r\n"
+                "Content-Length: %zu\r\n"
+                "X-Graph-Age: %s\r\n\r\n",
+                len, age_str);
+            (void)ap; (void)actx;
+        }
+        free(data);
+        free(store_key);
+        free(graph_key);
+        return 1;
+    }
+
+    if (strcmp(ri->request_method, "PUT") == 0) {
+        METRIC_INC(srv->metrics.requests_put);
+
+        /* auth: require 'c' on _graphs */
+        cookbook_jwt_claims claims;
+        if (!require_auth_v2(srv, conn, ri, "_graphs", 'c', &claims)) {
+            free(store_key);
+            free(graph_key);
+            return 1;
+        }
+        cookbook_jwt_claims_free(&claims);
+
+        size_t max = srv->max_upload_bytes > 0
+            ? srv->max_upload_bytes : 64 * 1024; /* 64KB max for graphs */
+        size_t body_len = 0;
+        char *body = read_body(conn, ri, &body_len, max);
+        if (!body || body_len == 0) {
+            free(body);
+            free(store_key);
+            free(graph_key);
+            METRIC_INC(srv->metrics.responses_4xx);
+            send_json(conn, 400, "{\"error\":\"Empty body\"}\n");
+            return 1;
+        }
+
+        cookbook_store_status sst = srv->store->put(srv->store,
+                                                     store_key, body, body_len);
+        free(body);
+
+        if (sst == COOKBOOK_STORE_OK) {
+            METRIC_INC(srv->metrics.responses_2xx);
+            audit_log(srv, "access", claims.sub, graph_key, "graph-stored");
+            send_json(conn, 201, "{\"status\":\"stored\"}\n");
+        } else {
+            send_json(conn, 500, "{\"error\":\"Store write failed\"}\n");
+        }
+        free(store_key);
+        free(graph_key);
+        return 1;
+    }
+
+    METRIC_INC(srv->metrics.responses_4xx);
+    send_json(conn, 405, "{\"error\":\"Method not allowed\"}\n");
+    free(store_key);
+    free(graph_key);
+    return 1;
+}
+
 /* ==== Group management: /admin/groups ==== */
 
 /* callback for listing groups */
@@ -5503,6 +5659,10 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
     /* object cache endpoints */
     mg_set_request_handler(srv->ctx, "/objects/",
                            handle_objects, srv);
+
+    /* build graph cache */
+    mg_set_request_handler(srv->ctx, "/graphs/",
+                           handle_graphs, srv);
 
     /* group management endpoints */
     mg_set_request_handler(srv->ctx, "/admin/groups",

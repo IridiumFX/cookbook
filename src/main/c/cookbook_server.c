@@ -2088,6 +2088,30 @@ static int handle_artifact(struct mg_connection *conn, void *cbdata) {
                             METRIC_INC(srv->metrics.responses_2xx);
                             METRIC_ADD(srv->metrics.bytes_downloaded,
                                        (long)plen);
+                            /* gzip if client supports and body is large enough */
+                            if (plen > 256 && accepts_gzip(ri)) {
+                                size_t gz_len = 0;
+                                void *gz = cookbook_gzip_compress(pretty, plen, &gz_len);
+                                if (gz && gz_len < plen) {
+                                    mg_printf(conn,
+                                        "HTTP/1.1 200 OK\r\n"
+                                        "Content-Type: application/x-pasta; charset=US-ASCII\r\n"
+                                        "Content-Encoding: gzip\r\n"
+                                        "Content-Length: %zu\r\n"
+                                        "%s\r\n",
+                                        gz_len, yanked_hdrs);
+                                    mg_write(conn, gz, gz_len);
+                                    free(gz);
+                                    free(pretty);
+                                    if (stripped) free(stripped);
+                                    srv->store->free_buf(data);
+                                    free(key); free(path); free(group);
+                                    free(artifact); free(ver_file); free(filename);
+                                    return 1;
+                                }
+                                free(gz);
+                            }
+                            /* fallback: uncompressed */
                             mg_printf(conn,
                                 "HTTP/1.1 200 OK\r\n"
                                 "Content-Type: application/x-pasta; charset=US-ASCII\r\n"

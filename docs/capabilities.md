@@ -1,8 +1,8 @@
 # cookbook — Current Capabilities
 
-**Version**: 0.1.0
-**Last updated**: 2026-03-19
-**Phases complete**: A–E (M1 spec), F1–F3 (feature gaps), G1–G5 (grid federation), Auth v2 (Phases 1–4), Auth v2.5 (wildcard/revocation/credentials), Native Ed25519, Basta migration, Group management, Persistent revocation, Object cache
+**Version**: 0.2.0
+**Last updated**: 2026-03-21
+**Phases complete**: A–E (M1 spec), F1–F3 (feature gaps), G1–G5 (grid federation), Auth v2 (Phases 1–4), Auth v2.5, Native Ed25519, Basta migration, Group management, Persistent revocation, Object cache, LDAP, OIDC, TLS 1.3, Build graph cache, Reproducibility, Gzip, Connection pool, KV backend, Audit (3-file split)
 
 ---
 
@@ -91,13 +91,25 @@ POST /auth/token
 Authorization: Basic base64(subject:token)
 ```
 
-Exchanges credentials for a signed JWT. Credentials are verified against Argon2id hashes in the `credentials` table. Falls back to JSON body `{"sub":"...","groups":"..."}` when no credential record exists.
+Exchanges credentials for a signed JWT. Three authentication methods supported:
+
+**Token** (default): Credentials verified against Argon2id hashes in the `credentials` table. Accepts `Authorization: Basic` header or JSON body `{"subject":"x","token":"y"}`.
+
+**LDAP**: `{"subject":"x","token":"y","method":"ldap"}` — binds against configured LDAP directory. After successful bind, searches for `memberOf` to extract group membership. CN automatically extracted from DN values. Falls back to local credentials if LDAP unreachable.
+
+**OIDC client credentials**: `{"grant_type":"client_credentials","client_id":"x","client_secret":"y"}` — validates against configured OIDC issuer's token endpoint via HTTPS.
+
+**OIDC device code** (interactive):
+- `POST /auth/device` — generates device_code + user_code
+- `POST /auth/device/token` — client polls until authorized
+- `POST /auth/device/verify` — user authenticates with credentials
+- When OIDC issuer is configured, proxies to the IdP. Falls back to standalone mode.
 
 **JWT v1** (no policy): `sub`, `groups` (comma-separated), `iat`, `exp`.
 
 **JWT v2** (with policy): `sub`, `grants` (resolved permission map), `exclude` (deny map), `teams`, `v:2`, `iat`, `exp`. Grants are computed once at token issue time via alforno conflate with merge:"collect".
 
-Token lifetime configurable via `COOKBOOK_JWT_TTL_SEC` (default: 3600s). Signed with the registry's Ed25519 key (native implementation).
+Token lifetime configurable via `COOKBOOK_JWT_TTL_SEC` (default: 3600s). Signed with the registry's Ed25519 key (native implementation). Auth fallback chain: LDAP → local (or local → LDAP) depending on `method` field.
 
 ### Publisher key management
 
@@ -195,9 +207,38 @@ PUT  /objects/{cache_key}    — store object (auth: 'c' on _objects)
 
 Content-addressable blob cache for compiled artifacts. Cache key is typically a SHA-256 hex string with extension (`.o`, `.obj`). Uses the same object store backend as artifacts. GET/HEAD are open; PUT requires JWT authorization on the `_objects` group prefix. Respects `COOKBOOK_MAX_ARTIFACT_MB` upload limit. Cached objects are tracked in the `object_cache` table with creation timestamps for TTL-based eviction.
 
+### Build graph cache
+
+```
+GET  /graphs/{hash}    — retrieve build graph (gzip-compressed)
+HEAD /graphs/{hash}    — existence check + X-Graph-Age header
+PUT  /graphs/{hash}    — store graph (auth: 'c' on _graphs, max 64KB)
+```
+
+Stores project dependency graph snapshots as pasta documents. CI publishes a graph after a successful build; other machines fetch the graph, check if all object keys exist in `/objects/`, and skip compilation if they do. Turns per-file cache lookups into one graph fetch + bulk restore.
+
+### Reproducibility attestation
+
+```
+PUT /artifact/{path}/{artifact}.repro    — upload attestation (validated: format + artifact_hash required)
+GET /artifact/{path}?repro               — shortcut to fetch .repro sidecar
+```
+
+Stores reproducibility metadata alongside artifacts. Format: `now-repro-v1` pasta document with build tool, compiler, flags hash, timestamps, and optional third-party attestations. Upload validated for ASCII, valid pasta, and required fields.
+
+### Gzip compression
+
+Responses larger than 256 bytes are automatically gzip-compressed when the client sends `Accept-Encoding: gzip`. Active on `/resolve/` pasta responses and `/admin/policies/` pastlets. Uses Deflate (RFC 1951) + gzip framing (RFC 1952).
+
 ### Audit log
 
-When `COOKBOOK_AUDIT_LOG` is set to a file path, cookbook appends structured audit events in pasta format:
+When `COOKBOOK_AUDIT_DIR` is set, cookbook writes three audit log files by category:
+
+- `audit-auth.pasta` — token-issue, token-revoke, jwt-invalid, denied, bad-credentials, rate-limited, ldap-ok, ldap-bind-failed, oidc-failed
+- `audit-access.pasta` — publish (ok/duplicate/validation-failed), yank, resolve, objects, graphs
+- `audit-admin.pasta` — credential-create/revoke/delete, group-created/updated/deleted, policy-put/delete
+
+Each line is a valid pasta document:
 
 ```
 { timestamp: "2026-03-19T22:00:00Z", event: "publish", subject: "alice", target: "central/com/example/mylib/1.0.0/mylib.tar", result: "ok" }
@@ -246,6 +287,8 @@ Full spec section 4.1 schema:
 
 **PostgreSQL** (optional): Full vtable implementation using libpq. Automatically translates `?N` placeholders to PostgreSQL `$N` syntax and `INSERT OR IGNORE` to `INSERT ... ON CONFLICT DO NOTHING`. Enabled when libpq is found at build time; graceful stub when unavailable. Connect via `COOKBOOK_DB_URL=postgres://user:pass@host:5432/dbname`.
 
+**KV store** (Nova OS): Lightweight alternative using apennines kv (append-only log + FNV-1a hash index). Each table row stored as `table:pk → col=val\tcol=val` pairs. Supports INSERT, SELECT (by PK + prefix iterate), DELETE, CONSTRAINT detection, OR IGNORE. No JOINs or complex queries. Connect via `COOKBOOK_DB_URL=cookbook.kv` (detected by `.kv` extension).
+
 ### Object store backends
 
 **Filesystem** (default): Spec section 4.2 layout. Objects stored at:
@@ -281,13 +324,15 @@ Compatible with `now cache --mirror` output. Sidecar files (`.sha256`, `.sig`, `
 - JWT-based authentication using EdDSA (Ed25519) signatures (native implementation).
 - **v1**: Group-level authorization via `groups` claim.
 - **v2**: Fine-grained access via `grants`/`exclude` maps (alforno-resolved policies).
-- Credential verification via Argon2id (libsodium).
+- **Three auth methods**: token (Argon2id), LDAP (simple bind + group search), OIDC (client credentials + device code).
+- Auth fallback chains: LDAP ↔ local bidirectional fallback during migration.
 - Per-subject rate limiting with configurable sliding window.
 - Hierarchical prefix matching with deny-overrides-allow.
 
 ### Cryptographic integrity
 
 - **Native Ed25519** (RFC 8032, ~2800 lines) — keygen, sign, verify. No libsodium for Ed25519.
+- **TLS 1.3** (RFC 8446) — client handshake with AES-128-GCM + ChaCha20-Poly1305, X25519 ECDH, certificate verification (RSA-PSS, ECDSA P-256, Ed25519), PKI chain verification, HKDF key schedule. Used for LDAPS, HTTPS grid peers, S3 over HTTPS, OIDC.
 - SHA-256 computed on ingest for every uploaded artifact.
 - Publisher Ed25519 signature verification on `.sig` uploads.
 - Registry Ed25519 countersignature on all published artifacts.
@@ -320,8 +365,16 @@ All configuration is via environment variables:
 | `COOKBOOK_GRID_ENABLED` | `0` | Enable grid federation (1 = on) |
 | `COOKBOOK_GRID_MAX_HOPS` | `3` | Maximum grid fan-out hop count |
 | `COOKBOOK_GRID_PEER_AUTH` | `0` | Require Ed25519 peer signatures (1 = required) |
-| `COOKBOOK_AUDIT_LOG` | *(none)* | Path to pasta-format audit log file |
+| `COOKBOOK_AUDIT_DIR` | *(none)* | Directory for pasta-format audit logs (3 files) |
 | `COOKBOOK_OBJECT_CACHE_TTL_SEC` | `0` (no eviction) | TTL for cached objects; expired entries pruned every 60s |
+| `COOKBOOK_LDAP_URL` | *(none)* | LDAP server (`ldap://` or `ldaps://`) |
+| `COOKBOOK_LDAP_BASE_DN` | *(none)* | LDAP search base DN |
+| `COOKBOOK_LDAP_USER_ATTR` | `uid` | User attribute for DN construction |
+| `COOKBOOK_LDAP_GROUP_ATTR` | *(none)* | Group attribute (`memberOf`) for auto-mapping |
+| `COOKBOOK_LDAP_GROUP_BASE` | *(base_dn)* | Base DN for group search |
+| `COOKBOOK_OIDC_ISSUER` | *(none)* | OIDC issuer URL |
+| `COOKBOOK_OIDC_CLIENT_ID` | *(none)* | OIDC client_id |
+| `COOKBOOK_CA_BUNDLE` | *(none)* | PEM CA certificate bundle for TLS verification |
 
 ---
 
@@ -338,11 +391,12 @@ All configuration is via environment variables:
 
 | Dependency | Version | License | Purpose |
 |------------|---------|---------|---------|
-| libbasta | Basta #2 (submodule) | MIT | Pasta superset — text + binary blobs. Sole format library (compat `pasta.h` header maps `pasta_*` → `basta_*`) |
-| alforno | Alforno #4 (submodule) | MIT | Config merging — conflate, merge:"collect". Built with `ALF_USE_BASTA` |
-| SQLite | 3.49.1 | Public domain | Metadata backend |
+| libbasta | Basta #2 (submodule) | MIT | Pasta superset — text + binary blobs. Sole format library |
+| alforno | Alforno #4 (submodule) | MIT | Config merging — conflate, merge:"collect" |
+| SQLite | 3.49.1 | Public domain | Default metadata backend |
 | civetweb | 1.16 | MIT | HTTP server |
 | libsodium | 1.0.21 | ISC | Argon2id, HMAC-SHA256 (S3 Sig V4) |
+| apennines | T1-T4 (28 modules) | — | TLS 1.3 (AES-GCM, ChaCha20, X25519, HKDF, PKI, X.509, RSA, ECDSA), gzip (Deflate), HTTP client/server, KV store, connection pool, DNS |
 
 ### Optional system dependencies
 
@@ -354,7 +408,7 @@ All configuration is via environment variables:
 
 ## Test suite
 
-555 unit tests covering:
+619 unit tests covering:
 
 - Semver parsing, range evaluation, edge cases, comparison details
 - Database operations (parameterized queries, yank/status transitions, pending lifecycle)

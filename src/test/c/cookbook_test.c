@@ -3442,6 +3442,19 @@ static void test_ldap_config(void) {
     cookbook_ldap_config cfg = {0};
     ASSERT(cookbook_ldap_bind(&cfg, "user", "pass", NULL) == -1,
            "ldap: null url");
+
+    /* test with unreachable LDAP server — should return -1, not crash */
+    cookbook_ldap_config unreachable = {
+        .url = "ldap://127.0.0.1:19389",  /* nothing listening */
+        .base_dn = "dc=test",
+        .user_attr = "uid",
+        .group_attr = NULL,
+        .group_base = NULL
+    };
+    char *groups = NULL;
+    int lrc = cookbook_ldap_bind(&unreachable, "test", "pass", &groups);
+    ASSERT(lrc == -1, "ldap: unreachable returns -1");
+    ASSERT(groups == NULL, "ldap: unreachable groups null");
 }
 
 /* ---- LDAP integration test with mock server ---- */

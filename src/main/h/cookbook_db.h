@@ -57,6 +57,11 @@ struct cookbook_db {
 
 COOKBOOK_API cookbook_db *cookbook_db_open_sqlite(const char *path);
 
+/* KV store backend — apennines kv (append-only log + hash index).
+   Lightweight alternative to SQLite for Nova OS.
+   path is the KV store file path (e.g. "cookbook.kv"). */
+COOKBOOK_API cookbook_db *cookbook_db_open_kv(const char *path);
+
 /* PostgreSQL backend — requires libpq.
    conninfo is a standard libpq connection string, e.g.
    "postgres://user:pass@host:5432/dbname" or keyword=value pairs.

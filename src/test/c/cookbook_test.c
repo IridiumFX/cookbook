@@ -3383,6 +3383,73 @@ static void test_group_admin_lifecycle(void) {
     db->close(db);
 }
 
+/* ---- KV DB backend tests ---- */
+
+static void test_db_kv_backend(void) {
+    const char *path = "test_db.kv";
+    cookbook_db *db = cookbook_db_open_kv(path);
+    ASSERT(db != NULL, "kv db: open");
+
+    /* migrate (no-op for KV — schema-less) */
+    ASSERT(cookbook_db_migrate(db) == COOKBOOK_DB_OK, "kv db: migrate");
+
+    /* insert a group */
+    cookbook_db_param ip[] = {
+        COOKBOOK_P_TEXT("com.example"),
+        COOKBOOK_P_TEXT("alice"),
+        COOKBOOK_P_TEXT("2026-03-21T00:00:00Z"),
+        COOKBOOK_P_TEXT("Example group")
+    };
+    ASSERT(db->exec_p(db,
+        "INSERT INTO groups (group_id, owner_sub, created_at, description) "
+        "VALUES (?1, ?2, ?3, ?4)",
+        ip, 4) == COOKBOOK_DB_OK, "kv db: insert");
+
+    /* duplicate should fail (CONSTRAINT) */
+    ASSERT(db->exec_p(db,
+        "INSERT INTO groups (group_id, owner_sub, created_at, description) "
+        "VALUES (?1, ?2, ?3, ?4)",
+        ip, 4) == COOKBOOK_DB_CONSTRAINT, "kv db: dup constraint");
+
+    /* INSERT OR IGNORE should succeed silently */
+    ASSERT(db->exec_p(db,
+        "INSERT OR IGNORE INTO groups (group_id, owner_sub, created_at, description) "
+        "VALUES (?1, ?2, ?3, ?4)",
+        ip, 4) == COOKBOOK_DB_OK, "kv db: insert or ignore");
+
+    /* query by primary key */
+    int found = 0;
+    cookbook_db_param qp[] = { COOKBOOK_P_TEXT("com.example") };
+    db->query_p(db,
+        "SELECT group_id, owner_sub FROM groups WHERE group_id = ?1",
+        qp, 1, count_cb, &found);
+    ASSERT(found == 1, "kv db: query found");
+
+    /* query non-existent */
+    found = 0;
+    cookbook_db_param qp2[] = { COOKBOOK_P_TEXT("org.missing") };
+    db->query_p(db,
+        "SELECT group_id FROM groups WHERE group_id = ?1",
+        qp2, 1, count_cb, &found);
+    ASSERT(found == 0, "kv db: query not found");
+
+    /* delete */
+    cookbook_db_param dp[] = { COOKBOOK_P_TEXT("com.example") };
+    ASSERT(db->exec_p(db,
+        "DELETE FROM groups WHERE group_id = ?1",
+        dp, 1) == COOKBOOK_DB_OK, "kv db: delete");
+
+    /* verify deleted */
+    found = 0;
+    db->query_p(db,
+        "SELECT group_id FROM groups WHERE group_id = ?1",
+        qp, 1, count_cb, &found);
+    ASSERT(found == 0, "kv db: deleted");
+
+    db->close(db);
+    remove(path);
+}
+
 /* ---- connection pool tests ---- */
 
 static void test_connpool_basic(void) {
@@ -3813,6 +3880,7 @@ int main(void) {
     test_ed25519_rfc8032_vector2();
     test_ed25519_rfc8032_vector3();
     test_ed25519_cross_validation();
+    test_db_kv_backend();
     test_connpool_basic();
     test_gzip_compress();
     test_ldap_config();

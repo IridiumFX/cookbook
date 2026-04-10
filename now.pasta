@@ -51,7 +51,7 @@
     ],
     exclude: [
       "src/main/c/cookbook_import.c",
-      "src/main/c/cookbook_db_postgres_stub.c"
+      "src/main/c/cookbook_db_postgres.c"
     ]
   },
 
@@ -82,14 +82,14 @@
       "NO_SSL=1",
       "NO_CGI=1",
       "NO_CACHING=1",
-      "BUILDING_COOKBOOK",
-      "COOKBOOK_HAS_POSTGRES"
+      "BUILDING_COOKBOOK"
     ]
   },
 
   link: {
     output: "executable",
-    libs: ["ws2_32", "bcrypt", "advapi32", "pq"]
+    archives: ["build/libsodium.a"],
+    libs: ["ws2_32", "bcrypt", "advapi32"]
   },
 
   tests: {

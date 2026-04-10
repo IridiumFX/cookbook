@@ -1,0 +1,103 @@
+{
+  group:    "dev.iridium",
+  artifact: "cookbook",
+  version:  "1.0.0",
+  lang:     "c",
+
+  sources: {
+    dir:     "src/main/c",
+    headers: "src/main/h",
+    include: [
+      "vendor/basta/src/main/c/basta_lexer.c",
+      "vendor/basta/src/main/c/basta_parser.c",
+      "vendor/basta/src/main/c/basta_value.c",
+      "vendor/basta/src/main/c/basta_writer.c",
+      "vendor/alforno/src/main/c/alforno.c",
+      "vendor/alforno/src/main/c/alforno_param.c",
+      "vendor/alforno/src/main/c/alforno_merge.c",
+      "vendor/alforno/src/main/c/alforno_link.c",
+      "vendor/alforno/src/main/c/alforno_include.c",
+      "vendor/alforno/src/main/c/alforno_validate.c",
+      "vendor/sqlite/sqlite3.c",
+      "vendor/civetweb/civetweb.c",
+      "vendor/apennines/sources/t1/buffer/buf.c",
+      "vendor/apennines/sources/t1/random/entropy.c",
+      "vendor/apennines/sources/t2/crypto/cipher.c",
+      "vendor/apennines/sources/t2/crypto/ct.c",
+      "vendor/apennines/sources/t2/crypto/ec.c",
+      "vendor/apennines/sources/t2/crypto/ecdsa.c",
+      "vendor/apennines/sources/t2/crypto/hash.c",
+      "vendor/apennines/sources/t2/crypto/rsa.c",
+      "vendor/apennines/sources/t2/crypto/secret.c",
+      "vendor/apennines/sources/t2/crypto/x509.c",
+      "vendor/apennines/sources/t2/encoding/asn1_der.c",
+      "vendor/apennines/sources/t2/encoding/base.c",
+      "vendor/apennines/sources/t2/encoding/pem.c",
+      "vendor/apennines/sources/t2/math/bigint/bigint.c",
+      "vendor/apennines/sources/t2/compress/compress.c",
+      "vendor/apennines/sources/t2/net/addr.c",
+      "vendor/apennines/sources/t3/crypto/pki.c",
+      "vendor/apennines/sources/t3/db/wal.c",
+      "vendor/apennines/sources/t3/db/kv.c",
+      "vendor/apennines/sources/t3/net/http.c",
+      "vendor/apennines/sources/t3/net/tcp.c",
+      "vendor/apennines/sources/t3/net/dns.c",
+      "vendor/apennines/sources/t3/net/h2.c",
+      "vendor/apennines/sources/t3/net/tls.c",
+      "vendor/apennines/sources/t3/async/threadpool.c",
+      "vendor/apennines/sources/t4/net/http_client.c",
+      "vendor/apennines/sources/t4/net/https_client.c",
+      "vendor/apennines/sources/t4/net/http_server.c"
+    ],
+    exclude: [
+      "src/main/c/cookbook_import.c",
+      "src/main/c/cookbook_db_postgres_stub.c"
+    ]
+  },
+
+  compile: {
+    warnings: ["Wall"],
+    includes: [
+      "vendor/basta/src/main/h",
+      "vendor/basta/src/main/c",
+      "vendor/alforno/src/main/h",
+      "vendor/alforno/src/main/c",
+      "vendor/sqlite",
+      "vendor/civetweb",
+      "vendor/libsodium/src/libsodium/include",
+      "vendor/libsodium/src/libsodium/include/sodium",
+      "vendor/apennines/headers"
+    ],
+    defines: [
+      "COOKBOOK_STATIC",
+      "BASTA_STATIC",
+      "BASTA_BUILDING",
+      "ALF_STATIC",
+      "ALF_USE_BASTA",
+      "APENNINES_STATIC",
+      "SODIUM_STATIC=1",
+      "SQLITE_THREADSAFE=1",
+      "SQLITE_OMIT_LOAD_EXTENSION",
+      "USE_IPV6=1",
+      "NO_SSL=1",
+      "NO_CGI=1",
+      "NO_CACHING=1",
+      "BUILDING_COOKBOOK",
+      "COOKBOOK_HAS_POSTGRES"
+    ]
+  },
+
+  link: {
+    output: "executable",
+    libs: ["ws2_32", "bcrypt", "advapi32", "pq"]
+  },
+
+  tests: {
+    dir: "src/test/c"
+  },
+
+  profiles: {
+    debug:   { compile: { flags: ["-g", "-O0"], defines: ["DEBUG"] } },
+    release: { compile: { flags: ["-O2"], defines: ["NDEBUG"] }, link: { flags: ["-s"] } }
+  }
+}

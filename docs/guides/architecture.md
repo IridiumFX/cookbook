@@ -199,3 +199,34 @@ This produces a single self-contained executable. Test thoroughly — some MinGW
 8. **Everything else compiles as-is** — pure C11
 
 Steps 1-3 are single-file swaps. Step 4 is already done (flag-gated). Step 5 is already done (auto-detected by `.kv` extension). Steps 6-7 are standard C library calls that Nova's libc should provide.
+
+## Build systems
+
+Cookbook builds with two build systems:
+
+### CMake (production, default)
+
+```sh
+cmake --preset default   # or: cmake --preset release
+cmake --build build
+```
+
+- Full feature set including PostgreSQL support
+- Static link option: `-DCOOKBOOK_STATIC_LINK=ON` (4.2MB, zero DLLs)
+- Apennines HTTP server: `-DCOOKBOOK_USE_APENNINES_HTTP=ON`
+
+### `now` (Phase 2, Nova-forward)
+
+```sh
+now build       # debug
+now build -p release  # optimized
+```
+
+- Descriptor: `now.pasta` (100 lines vs 220 lines CMake)
+- 62 source files compiled and linked in ~30 seconds
+- Pre-built libsodium via `link.archives`
+- Output: `target/bin/cookbook.exe` (2.6MB)
+- First external project built with `now`
+- No PostgreSQL support yet (uses stub backend)
+
+For Nova, `now` is the intended build system — it's part of the same ecosystem and designed for the same platform.

@@ -390,8 +390,15 @@ Full client-server integration path is now unblocked. Remaining: `dep:updates` a
 
 619 unit tests + 6-phase stress test. All passing. Server stable in production.
 
+### Phase 2 — `now` build system complete
+
+46. **`now.pasta` descriptor** — 62 source files, vendored deps, link.archives ✓
+47. **cookbook builds with `now`** — 2.6MB exe, ~30s build, healthz+readyz verified ✓
+48. **First external `now` project** — validated link.archives, sources.exclude, pipe deadlock fix ✓
+49. **Dual build** — CMake (production) + now (Nova-forward) both produce working executables ✓
+
 ### Waiting on external (nice-to-have)
 
-43. `now dep:updates` — client UI for `?include_yanked=true` and `*` range
-44. `now cache:mirror` — client for `/mirror/manifest?grid=true`
-45. IANA `application/pasta` registration — pasta team handling
+50. `now dep:updates` — client UI for `?include_yanked=true` and `*` range
+51. `now cache:mirror` — client for `/mirror/manifest?grid=true`
+52. IANA `application/pasta` registration — pasta team handling

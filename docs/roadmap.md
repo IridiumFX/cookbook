@@ -1,7 +1,7 @@
 # cookbook — Roadmap
 
 **Version**: 1.0-rc1
-**Status as of**: 2026-03-21
+**Status as of**: 2026-03-22
 **Spec reference**: cookbook-architecture-M1.docx (d3 final)
 
 ---
@@ -190,10 +190,11 @@ All 29 original gaps from the M1 spec are implemented and tested.
 
 ### Vendored apennines crypto ✓
 
-18 modules (36 files) from the apennines project:
+28 modules (56 files) from the apennines project:
 - **T1**: buf, entropy
-- **T2**: cipher (AES-GCM, ChaCha20-Poly1305), ct, ec (Ed25519, X25519), ecdsa (P-256), hash (SHA-256/512, HMAC, HKDF), rsa (PKCS#1 v1.5, PSS), secret, x509, asn1_der, base, pem, bigint, compress (LZ4, Deflate)
-- **T3**: pki (chain verify, CRL, OCSP), http (request/response parse), wal (append-only log)
+- **T2**: cipher (AES-GCM, ChaCha20-Poly1305), ct, ec (Ed25519, X25519), ecdsa (P-256), hash (SHA-256/512, HMAC, HKDF), rsa (PKCS#1 v1.5, PSS), secret, x509, asn1_der, base, pem, bigint, compress (LZ4, Deflate), addr
+- **T3**: pki (chain verify, CRL, OCSP), http (request/response parse), wal (thread-safe append-only log), tcp, threadpool, kv, tls, h2, dns
+- **T4**: http_client, https_client, http_server
 
 ### Documentation ✓
 
@@ -243,6 +244,15 @@ Six guides under `docs/guides/`:
 - Windows SEH: ACCESS_VIOLATION, STACK_OVERFLOW → `crash.log`
 - Startup sentinel: `startup.log` confirms exe launched
 
+### `now` build system (Phase 2) ✓
+
+- `now.pasta` descriptor: 62 source files, vendored deps via `sources.include`
+- Pre-built libsodium via `link.archives` (new `now` feature, built for cookbook)
+- `target/bin/cookbook.exe`: 2.6MB, fully functional
+- First external project built with `now` — validated 3 bug fixes in the build tool
+- Build time: ~30 seconds (vs ~60s CMake with configure)
+- Phase 2 complete: cookbook can build with either CMake or `now`
+
 ### Test suite
 
 619 unit tests + stress test driver (6 concurrent phases). All passing.
@@ -253,16 +263,18 @@ Server verified stable by now team: token auth, LDAP fallback, CLI flow, audit l
 
 ## 1.0-rc1 Summary
 
-All M1 spec gaps resolved. All enterprise features implemented. All known bugs fixed. Backlog empty.
+All M1 spec gaps resolved. All enterprise features implemented. All known bugs fixed. Backlog empty. Builds with both CMake and `now`.
 
-**58 commits this milestone.** Feature highlights:
+**62 commits this milestone.** Feature highlights:
 - 4 auth methods (token, LDAP with group search, OIDC client credentials, OIDC device code)
 - TLS 1.3 with AES-GCM + ChaCha20-Poly1305 + PKI chain verification
 - 3 database backends (SQLite, PostgreSQL, KV store)
-- Gzip compression, connection pooling, WAL-backed audit
+- Gzip compression, connection pooling, WAL-backed audit (thread-safe)
 - Build graph cache, reproducibility attestation, object cache with TTL
-- Dual HTTP server architecture (civetweb + apennines, shim layer)
+- Dual HTTP server architecture (civetweb + apennines, shim layer with 24 routes)
 - 28 vendored apennines modules (crypto, TLS, HTTP, KV, WAL, compress)
-- 4.2MB fully static single-exe deployment
+- 4.2MB fully static single-exe deployment (CMake), 2.6MB via `now`
 - 6 documentation guides (install, config, admin, user, integration, architecture)
+- Dual build systems: CMake (production) + `now` (Phase 2, Nova-forward)
 - Nova OS porting: 5 of 8 checklist items already done at compile time
+- Cross-team collaboration: cookbook + now + apennines via pasta mailbox protocol

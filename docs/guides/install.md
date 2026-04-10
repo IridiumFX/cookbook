@@ -113,9 +113,19 @@ cmake --build build
 
 Output binaries are in `build/bin/`:
 - `cookbook_server` — the server
-- `cookbook_test` — test suite (571 tests)
+- `cookbook_test` — test suite (619 tests)
 - `cookbook_stress` — stress test driver
 - `cookbook_import` — CLI import tool
+
+### Alternative: build with `now`
+
+If the `now` build tool is available:
+
+```sh
+now build          # output: target/bin/cookbook.exe
+```
+
+The `now.pasta` descriptor is included in the repository. This produces a 2.6MB executable in ~30 seconds. No CMake required. See the architecture guide for details.
 
 ### Build with PostgreSQL support
 

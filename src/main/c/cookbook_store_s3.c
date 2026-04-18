@@ -1,11 +1,12 @@
 /* S3-compatible object store backend for cookbook.
    Implements the cookbook_store vtable using AWS Signature V4 over raw sockets.
-   No libcurl dependency — uses HMAC-SHA256 from libsodium and our SHA-256. */
+   No libcurl dependency — uses HMAC-SHA256 from apennines and our SHA-256. */
 
 #include "cookbook_store.h"
 #include "cookbook_socket.h"
 #include "cookbook_sha256.h"
-#include <sodium.h>
+#include "apennines/t2/crypto/hash.h"
+#include "apennines/t2/crypto/ct.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,10 +34,10 @@ typedef struct {
 static void hmac_sha256(const void *key, size_t key_len,
                          const void *data, size_t data_len,
                          unsigned char out[32]) {
-    crypto_auth_hmacsha256_state st;
-    crypto_auth_hmacsha256_init(&st, key, key_len);
-    crypto_auth_hmacsha256_update(&st, data, data_len);
-    crypto_auth_hmacsha256_final(&st, out);
+    hmac_ctx st;
+    hmac_create(&st, HMAC_HASH_SHA256, (const unsigned char *)key, (unsigned long long)key_len);
+    hmac_update(&st, (const unsigned char *)data, (unsigned long long)data_len);
+    hmac_final(out, &st);
 }
 
 static void hex_encode(const unsigned char *data, size_t len,
@@ -491,7 +492,7 @@ static void s3_close(cookbook_store *store) {
     free(self->region);
     /* zero secret key before freeing */
     if (self->secret_key) {
-        sodium_memzero(self->secret_key, strlen(self->secret_key));
+        ct_memzero(self->secret_key, strlen(self->secret_key));
         free(self->secret_key);
     }
     free(self->access_key);

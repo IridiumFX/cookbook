@@ -30,9 +30,9 @@
 | alforno | Alforno #4 (git submodule) | MIT | Config merging — merge:"collect", conflate, scatter/gather. Built with `ALF_USE_BASTA` |
 | SQLite | 3.49.1 | Public domain | Dev/CI metadata backend |
 | civetweb | 1.16 | MIT | HTTP server |
-| libsodium | 1.0.21 | ISC | Argon2id credential hashing, HMAC-SHA256 for S3 Sig V4 |
+| apennines | 28 vendored modules | MIT | Argon2id (RFC 9106), HMAC-SHA256, TLS 1.3, PKI, compress, WAL, HTTP — full crypto + net stack |
 
-*Note: Ed25519 signing uses a native implementation (RFC 8032) — libsodium is no longer used for Ed25519.*
+*Note: cookbook is now libsodium-free. Ed25519 is a native RFC 8032 implementation. Argon2id credential hashing, HMAC-SHA256 (S3 Sig V4), and `ct_memzero` all come from apennines — one less cross-platform C dependency to port to Nova.*
 
 ## Optional dependencies (system-provided)
 
@@ -40,7 +40,7 @@
 |------------|---------|---------|--------|
 | libpq | PostgreSQL License | PostgreSQL metadata backend | Optional; stub when absent |
 
-*Note: S3 support uses raw sockets + libsodium HMAC-SHA256 for AWS Signature V4 (no libcurl).*
+*Note: S3 support uses raw sockets + apennines HMAC-SHA256 for AWS Signature V4 (no libcurl).*
 
 ---
 
@@ -85,7 +85,7 @@ All 29 original gaps from the M1 spec are implemented and tested.
 - Full RFC 8032 implementation (~2800 lines) — keygen, sign, verify
 - Replaced all libsodium Ed25519 calls in JWT, publisher keys, registry signing, grid peer auth
 - Verified against all 5 RFC 8032 test vectors
-- libsodium retained only for Argon2id and HMAC-SHA256
+- libsodium fully removed 2026-04-18 — Argon2id / HMAC-SHA256 / ct_memzero now come from apennines
 
 ### Auth v2.5 — Wildcard grants, token revocation, credential management ✓
 
@@ -246,16 +246,15 @@ Six guides under `docs/guides/`:
 
 ### `now` build system (Phase 2) ✓
 
-- `now.pasta` descriptor: 62 source files, vendored deps via `sources.include`
-- Pre-built libsodium via `link.archives` (new `now` feature, built for cookbook)
-- `target/bin/cookbook.exe`: 2.6MB, fully functional
+- `now.pasta` descriptor: 64 source files, vendored deps via `sources.include`
+- `target/bin/cookbook.exe`: 2.2MB (down from 2.6MB after libsodium removal)
 - First external project built with `now` — validated 3 bug fixes in the build tool
 - Build time: ~30 seconds (vs ~60s CMake with configure)
 - Phase 2 complete: cookbook can build with either CMake or `now`
 
 ### Test suite
 
-619 unit tests + stress test driver (6 concurrent phases). All passing.
+617 unit tests + stress test driver (6 concurrent phases). All passing.
 
 Server verified stable by now team: token auth, LDAP fallback, CLI flow, audit logging, object cache, build graph cache all confirmed working end-to-end.
 

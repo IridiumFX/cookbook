@@ -22,6 +22,8 @@
       "vendor/civetweb/civetweb.c",
       "vendor/apennines/sources/t1/buffer/buf.c",
       "vendor/apennines/sources/t1/random/entropy.c",
+      "vendor/apennines/sources/t2/crypto/argon2.c",
+      "vendor/apennines/sources/t2/crypto/blake2b.c",
       "vendor/apennines/sources/t2/crypto/cipher.c",
       "vendor/apennines/sources/t2/crypto/ct.c",
       "vendor/apennines/sources/t2/crypto/ec.c",
@@ -64,8 +66,6 @@
       "vendor/alforno/src/main/c",
       "vendor/sqlite",
       "vendor/civetweb",
-      "vendor/libsodium/src/libsodium/include",
-      "vendor/libsodium/src/libsodium/include/sodium",
       "vendor/apennines/headers"
     ],
     defines: [
@@ -75,7 +75,6 @@
       "ALF_STATIC",
       "ALF_USE_BASTA",
       "APENNINES_STATIC",
-      "SODIUM_STATIC=1",
       "SQLITE_THREADSAFE=1",
       "SQLITE_OMIT_LOAD_EXTENSION",
       "USE_IPV6=1",
@@ -88,7 +87,6 @@
 
   link: {
     output: "executable",
-    archives: ["build/libsodium.a"],
     libs: ["ws2_32", "bcrypt", "advapi32"]
   },
 

@@ -147,5 +147,4 @@ All dependencies are vendored — no package manager needed:
 | alforno | Alforno #4 | Config merging (policy resolution) |
 | SQLite | 3.49.1 | Default metadata backend |
 | civetweb | 1.16 | HTTP server |
-| libsodium | 1.0.21 | Argon2id, HMAC-SHA256 (S3 signing) |
-| apennines | T1+T2 | TLS 1.3 crypto (AES-GCM, X25519, RSA, X.509) |
+| apennines | 28 modules | Argon2id, HMAC-SHA256, TLS 1.3 crypto, PKI, compress, WAL, HTTP |

@@ -26,7 +26,7 @@
 #include "civetweb.h"
 #endif
 #include "pasta.h"
-#include <sodium.h>
+#include "apennines/t2/crypto/ct.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -5825,7 +5825,7 @@ void cookbook_server_stop(cookbook_server *srv) {
     if (srv->wal_access) wal_close(srv->wal_access);
     if (srv->wal_admin)  wal_close(srv->wal_admin);
 
-    sodium_memzero(srv->registry_sk, 64);
+    ct_memzero(srv->registry_sk, 64);
     free(srv->registry_id);
     free(srv);
 }

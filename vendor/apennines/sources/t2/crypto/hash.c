@@ -1,6 +1,7 @@
 #include "apennines/t2/crypto/hash.h"
 #include "apennines/t2/crypto/ct.h"
 #include <string.h>
+#include <stdlib.h>
 
 /* ================================================================
  * SHA-256 (FIPS 180-4)
@@ -687,5 +688,276 @@ unsigned long hkdf_derive(u8 *okm, u64 okm_len, unsigned long hash_id, const u8 
 
     memset(prk, 0, sizeof(prk));
 
+    return 0;
+}
+/* ================================================================
+ * PBKDF2-HMAC-SHA256 (RFC 2898) — internal helper used by scrypt
+ * ================================================================ */
+
+static unsigned long pbkdf2_hmac_sha256(u8 *out, u64 out_len,
+                                        const u8 *password, u64 password_len,
+                                        const u8 *salt, u64 salt_len,
+                                        u64 iterations) {
+    hmac_ctx base_ctx;
+    u64 digest_sz = 32;
+    u64 blocks;
+    u64 i;
+    unsigned long rc;
+
+    if (out_len == 0) return 0;
+
+    /* RFC 2898: dkLen must be <= (2^32 - 1) * hLen. Effectively unlimited here. */
+    blocks = (out_len + digest_sz - 1) / digest_sz;
+    if (iterations == 0) return 1;
+
+    /* Pre-build an HMAC context keyed with the password to avoid recomputing
+     * the ipad/opad for each iteration. We'll copy it for each U_1. */
+    rc = hmac_create(&base_ctx, HMAC_HASH_SHA256, password, password_len);
+    if (rc) return 2;
+
+    for (i = 1; i <= blocks; i++) {
+        hmac_ctx ctx;
+        u8 int_i[4];
+        u8 u[32];
+        u8 t[32];
+        u64 j;
+        u64 k;
+        u64 copy_len;
+
+        int_i[0] = (u8)(i >> 24);
+        int_i[1] = (u8)(i >> 16);
+        int_i[2] = (u8)(i >> 8);
+        int_i[3] = (u8)(i);
+
+        /* U_1 = HMAC(P, S || INT(i)) */
+        memcpy(&ctx, &base_ctx, sizeof(hmac_ctx));
+        rc = hmac_update(&ctx, salt, salt_len);
+        if (rc) { memset(&base_ctx, 0, sizeof(base_ctx)); return 3; }
+        rc = hmac_update(&ctx, int_i, 4);
+        if (rc) { memset(&base_ctx, 0, sizeof(base_ctx)); return 4; }
+        rc = hmac_final(u, &ctx);
+        if (rc) { memset(&base_ctx, 0, sizeof(base_ctx)); return 5; }
+
+        memcpy(t, u, 32);
+
+        /* U_j = HMAC(P, U_{j-1}); T_i = U_1 XOR U_2 XOR ... XOR U_c */
+        for (j = 2; j <= iterations; j++) {
+            memcpy(&ctx, &base_ctx, sizeof(hmac_ctx));
+            rc = hmac_update(&ctx, u, 32);
+            if (rc) { memset(&base_ctx, 0, sizeof(base_ctx)); return 6; }
+            rc = hmac_final(u, &ctx);
+            if (rc) { memset(&base_ctx, 0, sizeof(base_ctx)); return 7; }
+            for (k = 0; k < 32; k++) t[k] ^= u[k];
+        }
+
+        copy_len = digest_sz;
+        if ((i - 1) * digest_sz + copy_len > out_len) {
+            copy_len = out_len - (i - 1) * digest_sz;
+        }
+        memcpy(out + (i - 1) * digest_sz, t, (size_t)copy_len);
+
+        memset(u, 0, sizeof(u));
+        memset(t, 0, sizeof(t));
+    }
+
+    memset(&base_ctx, 0, sizeof(base_ctx));
+    return 0;
+}
+
+/* ================================================================
+ * scrypt (RFC 7914)
+ * ================================================================ */
+
+/* Little-endian 32-bit load/store (scrypt / Salsa20 operate on LE words) */
+static u32 load_le32(const u8 *p) {
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
+}
+
+static void store_le32(u8 *p, u32 v) {
+    p[0] = (u8)(v);
+    p[1] = (u8)(v >> 8);
+    p[2] = (u8)(v >> 16);
+    p[3] = (u8)(v >> 24);
+}
+
+#define ROTL32(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
+
+/* Salsa20/8 core on a 64-byte block. RFC 7914 §3. */
+static void salsa20_8(u8 out[64], const u8 in[64]) {
+    u32 x[16];
+    u32 orig[16];
+    int i;
+
+    for (i = 0; i < 16; i++) {
+        x[i] = load_le32(in + i * 4);
+        orig[i] = x[i];
+    }
+
+    for (i = 0; i < 8; i += 2) {
+        /* Column round */
+        x[ 4] ^= ROTL32(x[ 0] + x[12],  7);
+        x[ 8] ^= ROTL32(x[ 4] + x[ 0],  9);
+        x[12] ^= ROTL32(x[ 8] + x[ 4], 13);
+        x[ 0] ^= ROTL32(x[12] + x[ 8], 18);
+        x[ 9] ^= ROTL32(x[ 5] + x[ 1],  7);
+        x[13] ^= ROTL32(x[ 9] + x[ 5],  9);
+        x[ 1] ^= ROTL32(x[13] + x[ 9], 13);
+        x[ 5] ^= ROTL32(x[ 1] + x[13], 18);
+        x[14] ^= ROTL32(x[10] + x[ 6],  7);
+        x[ 2] ^= ROTL32(x[14] + x[10],  9);
+        x[ 6] ^= ROTL32(x[ 2] + x[14], 13);
+        x[10] ^= ROTL32(x[ 6] + x[ 2], 18);
+        x[ 3] ^= ROTL32(x[15] + x[11],  7);
+        x[ 7] ^= ROTL32(x[ 3] + x[15],  9);
+        x[11] ^= ROTL32(x[ 7] + x[ 3], 13);
+        x[15] ^= ROTL32(x[11] + x[ 7], 18);
+        /* Row round */
+        x[ 1] ^= ROTL32(x[ 0] + x[ 3],  7);
+        x[ 2] ^= ROTL32(x[ 1] + x[ 0],  9);
+        x[ 3] ^= ROTL32(x[ 2] + x[ 1], 13);
+        x[ 0] ^= ROTL32(x[ 3] + x[ 2], 18);
+        x[ 6] ^= ROTL32(x[ 5] + x[ 4],  7);
+        x[ 7] ^= ROTL32(x[ 6] + x[ 5],  9);
+        x[ 4] ^= ROTL32(x[ 7] + x[ 6], 13);
+        x[ 5] ^= ROTL32(x[ 4] + x[ 7], 18);
+        x[11] ^= ROTL32(x[10] + x[ 9],  7);
+        x[ 8] ^= ROTL32(x[11] + x[10],  9);
+        x[ 9] ^= ROTL32(x[ 8] + x[11], 13);
+        x[10] ^= ROTL32(x[ 9] + x[ 8], 18);
+        x[12] ^= ROTL32(x[15] + x[14],  7);
+        x[13] ^= ROTL32(x[12] + x[15],  9);
+        x[14] ^= ROTL32(x[13] + x[12], 13);
+        x[15] ^= ROTL32(x[14] + x[13], 18);
+    }
+
+    for (i = 0; i < 16; i++) {
+        store_le32(out + i * 4, x[i] + orig[i]);
+    }
+}
+
+/* scryptBlockMix: operates in-place on B (128*r bytes). RFC 7914 §4. */
+static void scrypt_block_mix(u8 *B, u32 r, u8 *scratch /* 128*r bytes */) {
+    u8 X[64];
+    u32 i;
+    u32 two_r = 2 * r;
+
+    /* X = B_{2r-1} */
+    memcpy(X, B + (two_r - 1) * 64, 64);
+
+    for (i = 0; i < two_r; i++) {
+        u32 j;
+        /* X = X XOR B_i */
+        for (j = 0; j < 64; j++) X[j] ^= B[i * 64 + j];
+        /* X = Salsa20/8(X) */
+        salsa20_8(X, X);
+        /* Y_i = X — stored in interleaved order straight into scratch */
+        /* B'_i = Y_{2i} for i=0..r-1; B'_{r+i} = Y_{2i+1} for i=0..r-1 */
+        if ((i & 1) == 0) {
+            memcpy(scratch + (i / 2) * 64, X, 64);
+        } else {
+            memcpy(scratch + (r + i / 2) * 64, X, 64);
+        }
+    }
+
+    memcpy(B, scratch, (size_t)(128 * r));
+    memset(X, 0, sizeof(X));
+}
+
+/* Integerify(B): treats last 64-byte block of B as little-endian integer and
+ * returns its value modulo N. Since N is a power of two <= 2^64, we can simply
+ * take the low 64 bits of B_{2r-1} and AND with N-1. */
+static u64 scrypt_integerify(const u8 *B, u32 r, u64 N_mask) {
+    const u8 *last = B + (2 * r - 1) * 64;
+    u64 v = load_le32(last);
+    v |= ((u64)load_le32(last + 4)) << 32;
+    return v & N_mask;
+}
+
+/* scryptROMix: operates in-place on B (128*r bytes). RFC 7914 §5. */
+static unsigned long scrypt_romix(u8 *B, u32 r, u64 N) {
+    u64 block_sz = (u64)128 * r;
+    u8 *V;
+    u8 *scratch; /* scratch for block_mix */
+    u64 i;
+    u64 N_mask = N - 1;
+
+    V = (u8 *)malloc((size_t)(block_sz * N));
+    if (!V) return 1;
+    scratch = (u8 *)malloc((size_t)block_sz);
+    if (!scratch) { free(V); return 2; }
+
+    /* Step 2: V_i = X; X = BlockMix(X) */
+    for (i = 0; i < N; i++) {
+        memcpy(V + i * block_sz, B, (size_t)block_sz);
+        scrypt_block_mix(B, r, scratch);
+    }
+
+    /* Step 3: j = Integerify(X) mod N; X = BlockMix(X XOR V_j) */
+    for (i = 0; i < N; i++) {
+        u64 j = scrypt_integerify(B, r, N_mask);
+        u64 k;
+        u8 *Vj = V + j * block_sz;
+        for (k = 0; k < block_sz; k++) B[k] ^= Vj[k];
+        scrypt_block_mix(B, r, scratch);
+    }
+
+    /* Wipe & free */
+    memset(V, 0, (size_t)(block_sz * N));
+    memset(scratch, 0, (size_t)block_sz);
+    free(V);
+    free(scratch);
+    return 0;
+}
+
+unsigned long scrypt_derive(u8 *out, u64 out_len,
+                            const u8 *password, u64 password_len,
+                            const u8 *salt, u64 salt_len,
+                            u64 N, u32 r, u32 p) {
+    u64 block_sz;
+    u64 B_len;
+    u8 *B = NULL;
+    u32 i;
+    unsigned long rc;
+
+    if (!out) return 1;
+    if (password_len > 0 && !password) return 2;
+    if (salt_len > 0 && !salt) return 3;
+
+    /* N must be a power of two and >= 2 */
+    if (N < 2) return 4;
+    if (N & (N - 1)) return 4;
+
+    /* r, p >= 1. Also guard against overflow in p * 128 * r. */
+    if (r == 0 || p == 0) return 5;
+    /* RFC 7914: p <= ((2^32 - 1) * 32) / (128 * r). For our 64-bit arithmetic,
+     * requiring (u64)p * 128 * r to fit in u64 is trivially true; we mainly
+     * need to ensure malloc won't blow up. Use a conservative upper bound. */
+    if ((u64)r > (u64)0xFFFFFFFFULL / 128) return 5;
+
+    if (out_len == 0) return 0;
+
+    block_sz = (u64)128 * r;
+    B_len = block_sz * p;
+
+    B = (u8 *)malloc((size_t)B_len);
+    if (!B) return 6;
+
+    /* Step 1: B = PBKDF2(P, S, 1, p*128*r) */
+    rc = pbkdf2_hmac_sha256(B, B_len, password, password_len, salt, salt_len, 1);
+    if (rc) { memset(B, 0, (size_t)B_len); free(B); return 6; }
+
+    /* Step 2: for i = 0..p-1: B_i = scryptROMix(r, B_i, N) */
+    for (i = 0; i < p; i++) {
+        rc = scrypt_romix(B + (u64)i * block_sz, r, N);
+        if (rc) { memset(B, 0, (size_t)B_len); free(B); return 6; }
+    }
+
+    /* Step 3: out = PBKDF2(P, B, 1, dkLen) */
+    rc = pbkdf2_hmac_sha256(out, out_len, password, password_len, B, B_len, 1);
+
+    memset(B, 0, (size_t)B_len);
+    free(B);
+
+    if (rc) return 6;
     return 0;
 }

@@ -1,13 +1,31 @@
 #include "cookbook_auth.h"
 #include "cookbook_ed25519.h"
-#include <sodium.h>
+#include "apennines/t2/crypto/argon2.h"
+#include "apennines/t2/crypto/ct.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt")
+#else
+#include <stdio.h>
 #endif
+
+static int cookbook_random_bytes(void *buf, size_t n) {
+#ifdef _WIN32
+    return (BCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)n,
+                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0) ? 0 : -1;
+#else
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f) return -1;
+    size_t rd = fread(buf, 1, n, f);
+    fclose(f);
+    return (rd == n) ? 0 : -1;
+#endif
+}
 
 /* ==== Base64url ==== */
 
@@ -111,15 +129,22 @@ size_t cookbook_base64_decode(const char *src, size_t src_len,
     return out;
 }
 
-/* ==== Credential hashing (Argon2id via libsodium) ==== */
+/* ==== Credential hashing (Argon2id via apennines, RFC 9106) ==== */
 
 char *cookbook_credential_hash(const char *token) {
-    char *hash = malloc(crypto_pwhash_STRBYTES);
+    char *hash = malloc(128);
     if (!hash) return NULL;
 
-    if (crypto_pwhash_str(hash, token, strlen(token),
-                          crypto_pwhash_OPSLIMIT_INTERACTIVE,
-                          crypto_pwhash_MEMLIMIT_INTERACTIVE) != 0) {
+    unsigned char salt[16];
+    if (cookbook_random_bytes(salt, 16) != 0) {
+        free(hash);
+        return NULL;
+    }
+
+    if (argon2id_hash_interactive(hash, 128,
+                                  (const unsigned char *)token,
+                                  (unsigned long long)strlen(token),
+                                  salt) != 0) {
         free(hash);
         return NULL;
     }
@@ -127,7 +152,13 @@ char *cookbook_credential_hash(const char *token) {
 }
 
 int cookbook_credential_verify(const char *token, const char *hash) {
-    return crypto_pwhash_str_verify(hash, token, strlen(token));
+    unsigned long ok = 0;
+    if (argon2id_verify(&ok, hash,
+                        (const unsigned char *)token,
+                        (unsigned long long)strlen(token)) != 0) {
+        return -1;
+    }
+    return ok ? 0 : -1;
 }
 
 /* ==== Token revocation list ==== */

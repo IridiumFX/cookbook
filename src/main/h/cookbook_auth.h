@@ -87,7 +87,7 @@ COOKBOOK_API int cookbook_jwt_has_group(const cookbook_jwt_claims *claims,
 COOKBOOK_API size_t cookbook_base64_decode(const char *src, size_t src_len,
                                           void *dst, size_t dst_len);
 
-/* Hash a credential token for storage (Argon2id via libsodium).
+/* Hash a credential token for storage (Argon2id via apennines, RFC 9106).
    Returns malloc'd hash string, caller must free. */
 COOKBOOK_API char *cookbook_credential_hash(const char *token);
 

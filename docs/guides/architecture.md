@@ -60,7 +60,7 @@ Uses threads and sockets. On Nova, replace with Nova's HTTP server or adapt cive
 cookbook_server
   ├── cookbook_auth (JWT create/verify, credential hash)
   │     ├── cookbook_ed25519 (native Ed25519, SHA-512)
-  │     └── libsodium (Argon2id, HMAC-SHA256 for S3)
+  │     └── apennines (Argon2id, HMAC-SHA256 for S3, ct_memzero)
   ├── cookbook_policy (alforno conflate, pasta pastlets)
   │     ├── alforno (config merging)
   │     └── libbasta (pasta/basta parsing)
@@ -87,7 +87,6 @@ cookbook_server
 | alforno | 5 .c + 2 .h | MIT | Yes (pure C) |
 | SQLite | 1 .c + 1 .h | Public domain | Yes (pure C) |
 | civetweb | 1 .c + 1 .h + .inl | MIT | Replaced by apennines HTTP server on Nova |
-| libsodium | ~100 .c | ISC | Mostly pure C, some asm |
 | apennines | 28 modules (56 .c + .h) | — | Yes (pure C, swap entropy + socket) |
 
 Apennines modules: T1 (buf, entropy), T2 (cipher, ct, ec, ecdsa, hash, rsa, secret, x509, asn1_der, base, pem, bigint, compress, addr), T3 (pki, http, wal, tcp, threadpool, kv, tls, h2, dns), T4 (http_client, https_client, http_server)
@@ -223,9 +222,8 @@ now build -p release  # optimized
 ```
 
 - Descriptor: `now.pasta` (100 lines vs 220 lines CMake)
-- 62 source files compiled and linked in ~30 seconds
-- Pre-built libsodium via `link.archives`
-- Output: `target/bin/cookbook.exe` (2.6MB)
+- 64 source files compiled and linked in ~30 seconds
+- Output: `target/bin/cookbook.exe` (2.2MB, libsodium-free)
 - First external project built with `now`
 - No PostgreSQL support yet (uses stub backend)
 

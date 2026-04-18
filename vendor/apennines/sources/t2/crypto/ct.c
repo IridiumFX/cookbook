@@ -69,3 +69,11 @@ unsigned long ct_copy_if(u8 *dst, const u8 *src, u64 len, unsigned long conditio
 
     return 0;
 }
+
+unsigned long ct_memzero(void *data, u64 len) {
+    volatile u8 *p = (volatile u8 *)data;
+    u64 i;
+    if (!data && len > 0) return 1;
+    for (i = 0; i < len; i++) p[i] = 0;
+    return 0;
+}

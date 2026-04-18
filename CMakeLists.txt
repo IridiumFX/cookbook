@@ -57,6 +57,8 @@ target_compile_definitions(alforno PUBLIC ALF_STATIC)
 add_library(apennines STATIC
     vendor/apennines/sources/t1/buffer/buf.c
     vendor/apennines/sources/t1/random/entropy.c
+    vendor/apennines/sources/t2/crypto/argon2.c
+    vendor/apennines/sources/t2/crypto/blake2b.c
     vendor/apennines/sources/t2/crypto/cipher.c
     vendor/apennines/sources/t2/crypto/ct.c
     vendor/apennines/sources/t2/crypto/ec.c
@@ -105,37 +107,6 @@ if(NOT WIN32)
     find_package(Threads REQUIRED)
     target_link_libraries(sqlite3 PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 endif()
-
-# ---------- vendor: libsodium (ISC) ----------
-
-file(GLOB_RECURSE SODIUM_SOURCES vendor/libsodium/src/libsodium/*.c)
-add_library(sodium STATIC ${SODIUM_SOURCES})
-target_include_directories(sodium PUBLIC
-    vendor/libsodium/src/libsodium/include
-    vendor/libsodium/src/libsodium/include/sodium
-)
-target_include_directories(sodium PRIVATE
-    vendor/libsodium/src/libsodium
-)
-target_compile_definitions(sodium PRIVATE
-    SODIUM_STATIC=1
-    CONFIGURED=1
-    DEV_MODE=0
-    HAVE_C_VARARRAYS=1
-    HAVE_CATCHABLE_SEGV=1
-    HAVE_INLINE_ASM=1
-    HAVE_TI_MODE=1
-    HAVE_PTHREAD=1
-)
-if(WIN32)
-    target_compile_definitions(sodium PRIVATE HAVE_RAISE=1)
-    target_link_libraries(sodium PUBLIC advapi32)
-else()
-    target_compile_definitions(sodium PRIVATE HAVE_POSIX_MEMALIGN=1 HAVE_MMAP=1 HAVE_MPROTECT=1 HAVE_MADVISE=1 HAVE_NANOSLEEP=1)
-    find_package(Threads REQUIRED)
-    target_link_libraries(sodium PUBLIC Threads::Threads)
-endif()
-target_compile_definitions(sodium PUBLIC SODIUM_STATIC=1)
 
 # ---------- vendor: civetweb (MIT) ----------
 
@@ -191,7 +162,10 @@ target_include_directories(cookbook
 
 target_compile_definitions(cookbook PUBLIC COOKBOOK_STATIC)
 target_compile_definitions(cookbook PRIVATE BUILDING_COOKBOOK)
-target_link_libraries(cookbook PUBLIC sqlite3 civetweb basta alforno sodium apennines)
+target_link_libraries(cookbook PUBLIC sqlite3 civetweb basta alforno apennines)
+if(WIN32)
+    target_link_libraries(cookbook PUBLIC bcrypt)
+endif()
 
 
 if(COOKBOOK_HAS_POSTGRES)

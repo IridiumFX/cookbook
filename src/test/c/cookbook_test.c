@@ -18,7 +18,6 @@
 #ifdef COOKBOOK_HAS_BASTA
 #include "basta.h"
 #endif
-#include <sodium.h>
 #include <time.h>
 
 #ifdef _WIN32
@@ -303,8 +302,6 @@ static void test_base64url_roundtrip(void) {
 }
 
 static void test_jwt_create_verify(void) {
-    if (sodium_init() < -1) return;
-
     unsigned char pk[32], sk[64];
     cookbook_keygen(pk, sk);
 
@@ -339,8 +336,6 @@ static void test_jwt_create_verify(void) {
 }
 
 static void test_ed25519_sign_verify(void) {
-    if (sodium_init() < -1) return;
-
     unsigned char pk[32], sk[64];
     cookbook_keygen(pk, sk);
 
@@ -1433,8 +1428,6 @@ static void test_store_large_value(void) {
 /* ---- additional auth tests ---- */
 
 static void test_jwt_expired(void) {
-    if (sodium_init() < -1) return;
-
     unsigned char pk[32], sk[64];
     cookbook_keygen(pk, sk);
 
@@ -1450,8 +1443,6 @@ static void test_jwt_expired(void) {
 }
 
 static void test_jwt_group_boundary(void) {
-    if (sodium_init() < -1) return;
-
     unsigned char pk[32], sk[64];
     cookbook_keygen(pk, sk);
 
@@ -3078,32 +3069,28 @@ static void hex_to_bytes(const char *hex, unsigned char *out, size_t len) {
 extern void cookbook_ed25519_sha512_test(const void *data, size_t len, unsigned char out[64]);
 
 static void test_ed25519_sha512(void) {
-    /* compare native SHA-512 against libsodium */
-    unsigned char native[64], sodium_out[64];
-    const unsigned char seed[] = {
-        0x9d,0x61,0xb1,0x9d,0xef,0xfd,0x5a,0x60,
-        0xba,0x84,0x4a,0xf4,0x92,0xec,0x2c,0xc4,
-        0x44,0x49,0xc5,0x69,0x7b,0x32,0x69,0x19,
-        0x70,0x3b,0xac,0x03,0x1c,0xae,0x7f,0x60
-    };
+    /* SHA-512 known-answer test: "abc" → ddaf35a1... (FIPS 180-4 Appendix C.1) */
+    unsigned char native[64];
+    unsigned char expected_abc[64];
+    hex_to_bytes(
+        "ddaf35a193617abacc417349ae204131"
+        "12e6fa4e89a97ea20a9eeee64b55d39a"
+        "2192992a274fc1a836ba3c23a3feebbd"
+        "454d4423643ce80e2a9ac94fa54ca49f", expected_abc, 64);
 
-    cookbook_ed25519_sha512_test(seed, 32, native);
-    crypto_hash_sha512(sodium_out, seed, 32);
+    cookbook_ed25519_sha512_test("abc", 3, native);
+    ASSERT(memcmp(native, expected_abc, 64) == 0, "SHA-512 FIPS 180-4 C.1 (abc)");
 
-    if (memcmp(native, sodium_out, 64) != 0) {
-        fprintf(stderr, "  SHA512 native : %02x%02x%02x%02x%02x%02x%02x%02x\n",
-                native[0],native[1],native[2],native[3],
-                native[4],native[5],native[6],native[7]);
-        fprintf(stderr, "  SHA512 sodium : %02x%02x%02x%02x%02x%02x%02x%02x\n",
-                sodium_out[0],sodium_out[1],sodium_out[2],sodium_out[3],
-                sodium_out[4],sodium_out[5],sodium_out[6],sodium_out[7]);
-    }
-    ASSERT(memcmp(native, sodium_out, 64) == 0, "SHA-512 matches libsodium");
+    /* empty message: cf83e1357eec... */
+    unsigned char expected_empty[64];
+    hex_to_bytes(
+        "cf83e1357eefb8bdf1542850d66d8007"
+        "d620e4050b5715dc83f4a921d36ce9ce"
+        "47d0d13c5d85f2b0ff8318d2877eec2f"
+        "63b931bd47417a81a538327af927da3e", expected_empty, 64);
 
-    /* also test empty message: SHA-512("") should be cf83e135... */
     cookbook_ed25519_sha512_test(NULL, 0, native);
-    ASSERT(native[0] == 0xcf && native[1] == 0x83 && native[2] == 0xe1,
-           "SHA-512 empty message prefix correct");
+    ASSERT(memcmp(native, expected_empty, 64) == 0, "SHA-512 empty message");
 }
 
 extern void cookbook_ed25519_scalarmult_base_test(const unsigned char scalar[32],
@@ -3235,40 +3222,25 @@ static void test_ed25519_rfc8032_vector3(void) {
     ASSERT(rc == 0, "rfc8032 v3: verify succeeds");
 }
 
-static void test_ed25519_cross_validation(void) {
-    /* generate key with libsodium, sign with native, verify with both */
-    if (sodium_init() < -1) return;
+static void test_ed25519_sign_verify_roundtrip(void) {
+    /* native-only round trip (cross-check against libsodium removed with the
+     * libsodium dependency; RFC 8032 KATs above already pin correctness). */
+    unsigned char pk[32], sk[64], sig[64];
+    int rc = cookbook_ed25519_keygen(pk, sk);
+    ASSERT(rc == 0, "roundtrip: keygen");
 
-    unsigned char pk[32], sk[64], sig_native[64], sig_sodium[64];
-    crypto_sign_ed25519_keypair(pk, sk);
-
-    const char *msg = "cross-validation test message";
+    const char *msg = "cookbook roundtrip";
     size_t mlen = strlen(msg);
 
-    /* sign with native */
-    int rc = cookbook_ed25519_sign(sig_native, msg, mlen, sk);
-    ASSERT(rc == 0, "cross: native sign succeeds");
+    rc = cookbook_ed25519_sign(sig, msg, mlen, sk);
+    ASSERT(rc == 0, "roundtrip: sign");
 
-    /* verify native sig with libsodium */
-    rc = crypto_sign_ed25519_verify_detached(sig_native, (const unsigned char *)msg, mlen, pk);
-    ASSERT(rc == 0, "cross: sodium verifies native sig");
+    rc = cookbook_ed25519_verify(sig, msg, mlen, pk);
+    ASSERT(rc == 0, "roundtrip: verify");
 
-    /* sign with libsodium */
-    crypto_sign_ed25519_detached(sig_sodium, NULL, (const unsigned char *)msg, mlen, sk);
-
-    /* verify sodium sig with native */
-    rc = cookbook_ed25519_verify(sig_sodium, msg, mlen, pk);
-    ASSERT(rc == 0, "cross: native verifies sodium sig");
-
-    /* generate key with native, verify with sodium */
-    unsigned char pk2[32], sk2[64], sig2[64];
-    rc = cookbook_ed25519_keygen(pk2, sk2);
-    ASSERT(rc == 0, "cross: native keygen succeeds");
-
-    rc = cookbook_ed25519_sign(sig2, msg, mlen, sk2);
-    ASSERT(rc == 0, "cross: native sign with native key");
-    rc = crypto_sign_ed25519_verify_detached(sig2, (const unsigned char *)msg, mlen, pk2);
-    ASSERT(rc == 0, "cross: sodium verifies native key+sig");
+    sig[0] ^= 1;
+    rc = cookbook_ed25519_verify(sig, msg, mlen, pk);
+    ASSERT(rc != 0, "roundtrip: tampered sig rejected");
 }
 
 static void test_group_admin_lifecycle(void) {
@@ -3879,7 +3851,7 @@ int main(void) {
     test_ed25519_rfc8032_vector1();
     test_ed25519_rfc8032_vector2();
     test_ed25519_rfc8032_vector3();
-    test_ed25519_cross_validation();
+    test_ed25519_sign_verify_roundtrip();
     test_db_kv_backend();
     test_connpool_basic();
     test_gzip_compress();

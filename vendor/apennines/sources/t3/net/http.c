@@ -860,7 +860,17 @@ unsigned long http_response_parse(http_response *out, const u8 *data, u64 len) {
                 declared = declared * 10 + (u64)(*cp - '0');
                 ++cp;
             }
-            if (declared < body_len) body_len = declared;
+            if (declared > body_len) {
+                /* Server advertised more body bytes than we have. Signal
+                 * incomplete so the caller keeps reading — previously
+                 * this silently returned success with a short body,
+                 * which hit both cookbook (libsodium migration era) and
+                 * gut (SHA-256 smart-HTTP clone). Hatch 6 matches the
+                 * existing "header-end not found" convention above. */
+                http_response_destroy(out);
+                return 6;
+            }
+            body_len = declared;
         }
     }
 

@@ -8,7 +8,9 @@
 #include "cookbook_ldap.h"
 #include "cookbook_oidc.h"
 #include "cookbook_tls.h"
+#include <apennines/t1/buffer/buf.h>
 #include <apennines/t1/random/entropy.h>
+#include <apennines/t2/encoding/pem.h>
 #include <apennines/t3/crypto/pki.h>
 #include <apennines/t3/db/wal.h>
 #ifdef COOKBOOK_USE_APENNINES_HTTP
@@ -5623,13 +5625,66 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
                                        const unsigned char *, size_t);
 
         int iport = atoi(port);
-        /* TODO: load TLS cert/key from COOKBOOK_KEY_DIR if needed */
-        if (cookbook_http_start("0.0.0.0", iport, NULL, 0, NULL, 0) != 0) {
+
+        /* Optional inbound TLS. Two env vars: COOKBOOK_TLS_CERT_PEM +
+         * COOKBOOK_TLS_KEY_PEM point to PEM files on disk. We decode
+         * them to DER via apennines pem and hand the bytes to the
+         * HTTP server — same path gut's `gut server --cert --key` uses. */
+        const unsigned char *cert_der = NULL, *key_der = NULL;
+        size_t cert_len = 0, key_len = 0;
+        unsigned char *cert_pem = NULL, *key_pem = NULL;
+        buf cert_buf = {0}, key_buf = {0};
+        const char *cert_path = getenv("COOKBOOK_TLS_CERT_PEM");
+        const char *key_path  = getenv("COOKBOOK_TLS_KEY_PEM");
+        if (cert_path && key_path) {
+            FILE *fc = fopen(cert_path, "rb");
+            FILE *fk = fopen(key_path,  "rb");
+            if (fc && fk) {
+                fseek(fc, 0, SEEK_END); long cl = ftell(fc); fseek(fc, 0, SEEK_SET);
+                fseek(fk, 0, SEEK_END); long kl = ftell(fk); fseek(fk, 0, SEEK_SET);
+                cert_pem = (unsigned char *)malloc((size_t)cl);
+                key_pem  = (unsigned char *)malloc((size_t)kl);
+                if (cert_pem && key_pem &&
+                    fread(cert_pem, 1, (size_t)cl, fc) == (size_t)cl &&
+                    fread(key_pem,  1, (size_t)kl, fk) == (size_t)kl) {
+                    char label[64] = {0};
+                    if (pem_decode(&cert_buf, label, sizeof(label),
+                                   cert_pem, (u64)cl) == 0 &&
+                        pem_decode(&key_buf, label, sizeof(label),
+                                   key_pem, (u64)kl) == 0) {
+                        u8 *cp = NULL; u64 cn = 0;
+                        u8 *kp = NULL; u64 kn = 0;
+                        buf_ptr(&cp, &cert_buf); buf_len(&cn, &cert_buf);
+                        buf_ptr(&kp, &key_buf);  buf_len(&kn, &key_buf);
+                        cert_der = cp; cert_len = (size_t)cn;
+                        key_der  = kp; key_len  = (size_t)kn;
+                        fprintf(stdout, "cookbook: TLS: cert=%s key=%s (DER: %zuB/%zuB)\n",
+                                cert_path, key_path, cert_len, key_len);
+                    } else {
+                        fprintf(stderr, "cookbook: TLS: PEM decode failed\n");
+                    }
+                }
+            } else {
+                fprintf(stderr, "cookbook: TLS: cannot open cert/key files\n");
+            }
+            if (fc) fclose(fc);
+            if (fk) fclose(fk);
+        }
+
+        if (cookbook_http_start("0.0.0.0", iport,
+                                cert_der, cert_len,
+                                key_der, key_len) != 0) {
             fprintf(stderr, "cookbook: failed to start apennines HTTP server on port %s\n", port);
+            buf_destroy(&cert_buf); buf_destroy(&key_buf);
+            free(cert_pem); free(key_pem);
             free(srv->registry_id);
             free(srv);
             return NULL;
         }
+        /* cert/key DER buffers are owned by http_server now — but we keep
+         * the PEM scratch around because set_tls copies the DER bytes. */
+        buf_destroy(&cert_buf); buf_destroy(&key_buf);
+        free(cert_pem); free(key_pem);
         srv->ctx = NULL; /* no civetweb context */
 
         /* register all routes via shim dispatch table */

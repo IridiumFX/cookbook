@@ -3,6 +3,8 @@
 #include "apennines/t2/crypto/hash.h"
 #include "apennines/t2/crypto/ec.h"
 #include "apennines/t2/crypto/ecdsa.h"
+#include "apennines/t2/crypto/rsa.h"
+#include "apennines/t1/buffer/buf.h"
 #include "apennines/t3/crypto/pki.h"
 #include <stdlib.h>
 #include <string.h>
@@ -788,19 +790,116 @@ static unsigned long build_finished(u8 *out_msg, u64 *out_msg_len,
     return 0;
 }
 
-/* Receive a handshake message from an encrypted record.
- * The caller frees *out_msg. */
-static unsigned long recv_handshake_encrypted(u8 **out_msg, u64 *out_msg_len,
-                                               tls_conn *conn)
-{
-    u8 inner_type;
-    unsigned long rc = recv_encrypted_record(&inner_type, out_msg, out_msg_len, conn);
+/* ================================================================
+ *  Handshake-message reader with record reassembly
+ *
+ *  RFC 8446 §5.1: a single handshake message MAY span multiple TLS
+ *  records, and a single record MAY carry multiple handshake messages.
+ *  This buffer accumulates decrypted handshake payload across records
+ *  and hands out exactly one complete message per call.
+ * ================================================================ */
+
+typedef struct {
+    u8 *data;
+    u64 len;
+    u64 cap;
+} hs_buf_t;
+
+static unsigned long hs_buf_init(hs_buf_t *b) {
+    b->cap = 16384;
+    b->data = (u8 *)malloc((size_t)b->cap);
+    if (!b->data) { b->cap = 0; return 1; }
+    b->len = 0;
+    return 0;
+}
+
+static void hs_buf_free(hs_buf_t *b) {
+    free(b->data);
+    b->data = NULL;
+    b->len = 0;
+    b->cap = 0;
+}
+
+static unsigned long hs_buf_grow(hs_buf_t *b, u64 need) {
+    u64 new_cap;
+    u8 *p;
+    if (b->len + need <= b->cap) return 0;
+    new_cap = b->cap == 0 ? 16384 : b->cap * 2;
+    while (new_cap < b->len + need) new_cap *= 2;
+    p = (u8 *)realloc(b->data, (size_t)new_cap);
+    if (!p) return 1;
+    b->data = p;
+    b->cap = new_cap;
+    return 0;
+}
+
+static unsigned long hs_buf_append(hs_buf_t *b, const u8 *data, u64 len) {
+    unsigned long rc = hs_buf_grow(b, len);
     if (rc) return rc;
-    if (inner_type != CT_HANDSHAKE) {
-        free(*out_msg);
-        *out_msg = NULL;
-        return 1;
+    memcpy(b->data + b->len, data, (size_t)len);
+    b->len += len;
+    return 0;
+}
+
+static void hs_buf_consume(hs_buf_t *b, u64 n) {
+    if (n >= b->len) { b->len = 0; return; }
+    memmove(b->data, b->data + n, (size_t)(b->len - n));
+    b->len -= n;
+}
+
+/* Read exactly one complete handshake message, possibly spanning several
+ * records or sharing a record with adjacent messages. Any overrun stays in
+ * hs_buf for the next call. Caller frees *out_msg.
+ *
+ * Error hatches:
+ *   1  underlying record read / decryption failed (bubble-up is preserved)
+ *   2  received non-handshake inner content type in the middle of handshake
+ *   3  hs_buf grow failed
+ *   4  output alloc failed */
+static unsigned long recv_handshake_msg(u8 **out_msg, u64 *out_msg_len,
+                                         tls_conn *conn, hs_buf_t *hs_buf)
+{
+    u32 body_len;
+    u64 total;
+    unsigned long rc;
+
+    *out_msg = NULL;
+    *out_msg_len = 0;
+
+    /* Ensure the 4-byte handshake header is present. */
+    while (hs_buf->len < 4) {
+        u8 inner_type;
+        u8 *rec_data = NULL;
+        u64 rec_len = 0;
+        rc = recv_encrypted_record(&inner_type, &rec_data, &rec_len, conn);
+        if (rc) return 1;
+        if (inner_type != CT_HANDSHAKE) { free(rec_data); return 2; }
+        rc = hs_buf_append(hs_buf, rec_data, rec_len);
+        free(rec_data);
+        if (rc) return 3;
     }
+
+    body_len = get_u24(hs_buf->data + 1);
+    total = 4 + (u64)body_len;
+
+    /* Keep pulling records until the full message is buffered. */
+    while (hs_buf->len < total) {
+        u8 inner_type;
+        u8 *rec_data = NULL;
+        u64 rec_len = 0;
+        rc = recv_encrypted_record(&inner_type, &rec_data, &rec_len, conn);
+        if (rc) return 1;
+        if (inner_type != CT_HANDSHAKE) { free(rec_data); return 2; }
+        rc = hs_buf_append(hs_buf, rec_data, rec_len);
+        free(rec_data);
+        if (rc) return 3;
+    }
+
+    *out_msg = (u8 *)malloc((size_t)total);
+    if (!*out_msg) return 4;
+    memcpy(*out_msg, hs_buf->data, (size_t)total);
+    *out_msg_len = total;
+    hs_buf_consume(hs_buf, total);
     return 0;
 }
 
@@ -1071,13 +1170,13 @@ unsigned long tls_conn_create_client(tls_conn **out, tcp_conn *tcp,
     u8 server_finished_key[32], client_finished_key[32];
     u8 *hs_msg = NULL;
     u64 hs_msg_len;
-    u8 inner_type;
     char *alpn_result = NULL;
     u8 *peer_cert = NULL;
     u64 peer_cert_len = 0;
     u8 th[32];
     u8 finished_buf[36];
     u64 finished_len;
+    hs_buf_t hs_buf = { NULL, 0, 0 };
     unsigned long rc;
 
     if (!out) return 1;
@@ -1090,6 +1189,8 @@ unsigned long tls_conn_create_client(tls_conn **out, tcp_conn *tcp,
     conn->cfg = cfg;
     conn->is_client = 1;
     conn->version = TLS_VERSION_13;
+
+    if (hs_buf_init(&hs_buf)) { free(conn); return 6; }
 
     /* Step 1: Generate ephemeral X25519 keypair */
     rc = x25519_keygen(&eph);
@@ -1162,7 +1263,7 @@ unsigned long tls_conn_create_client(tls_conn **out, tcp_conn *tcp,
     if (rc) { rc = 4; goto fail_ts; }
 
     /* Step 7: Receive EncryptedExtensions */
-    rc = recv_handshake_encrypted(&hs_msg, &hs_msg_len, conn);
+    rc = recv_handshake_msg(&hs_msg, &hs_msg_len, conn, &hs_buf);
     if (rc) { rc = 4; goto fail_ts; }
     rc = parse_encrypted_extensions(&alpn_result, hs_msg, hs_msg_len);
     transcript_append(&ts, hs_msg, hs_msg_len);
@@ -1170,7 +1271,7 @@ unsigned long tls_conn_create_client(tls_conn **out, tcp_conn *tcp,
     if (rc) { rc = 4; goto fail_ts; }
 
     /* Step 8: Receive Certificate */
-    rc = recv_handshake_encrypted(&hs_msg, &hs_msg_len, conn);
+    rc = recv_handshake_msg(&hs_msg, &hs_msg_len, conn, &hs_buf);
     if (rc) { rc = 4; goto fail_ts; }
     rc = parse_certificate(&peer_cert, &peer_cert_len, hs_msg, hs_msg_len);
     transcript_append(&ts, hs_msg, hs_msg_len);
@@ -1178,7 +1279,7 @@ unsigned long tls_conn_create_client(tls_conn **out, tcp_conn *tcp,
     if (rc) { rc = 4; goto fail_ts; }
 
     /* Step 9: Receive CertificateVerify */
-    rc = recv_handshake_encrypted(&hs_msg, &hs_msg_len, conn);
+    rc = recv_handshake_msg(&hs_msg, &hs_msg_len, conn, &hs_buf);
     if (rc) { rc = 4; goto fail_ts; }
     rc = parse_certificate_verify(hs_msg, hs_msg_len);
     transcript_append(&ts, hs_msg, hs_msg_len);
@@ -1186,7 +1287,7 @@ unsigned long tls_conn_create_client(tls_conn **out, tcp_conn *tcp,
     if (rc) { rc = 4; goto fail_ts; }
 
     /* Step 10: Receive Finished */
-    rc = recv_handshake_encrypted(&hs_msg, &hs_msg_len, conn);
+    rc = recv_handshake_msg(&hs_msg, &hs_msg_len, conn, &hs_buf);
     if (rc) { rc = 4; goto fail_ts; }
 
     /* Verify server Finished */
@@ -1197,7 +1298,20 @@ unsigned long tls_conn_create_client(tls_conn **out, tcp_conn *tcp,
     free(hs_msg); hs_msg = NULL;
     if (rc) { rc = 4; goto fail_ts; }
 
-    /* Step 11: Send client Finished */
+    /* Step 11: Derive application traffic keys.
+     *
+     * RFC 8446 §7.1: application_traffic_secret_0 is derived from the
+     * transcript ending at server Finished (NOT including client Finished).
+     * We derive BEFORE sending our own Finished and BEFORE appending it to
+     * the transcript. */
+    u8 app_c_key[16], app_c_iv[12];
+    u8 app_s_key[16], app_s_iv[12];
+    rc = derive_application_keys(app_c_key, app_c_iv,
+                                  app_s_key, app_s_iv,
+                                  handshake_secret, &ts);
+    if (rc) { rc = 4; goto fail_ts; }
+
+    /* Step 12: Send client Finished (still using handshake traffic keys) */
     rc = transcript_hash(th, &ts);
     if (rc) { rc = 4; goto fail_ts; }
     rc = build_finished(finished_buf, &finished_len, client_finished_key, th);
@@ -1206,17 +1320,8 @@ unsigned long tls_conn_create_client(tls_conn **out, tcp_conn *tcp,
     rc = send_encrypted_record(conn, CT_HANDSHAKE, finished_buf, finished_len);
     if (rc) { rc = 4; goto fail_ts; }
 
-    /* Add client Finished to transcript for application key derivation */
-    transcript_append(&ts, finished_buf, finished_len);
-
-    /* Step 12: Derive application traffic keys */
+    /* Step 13: Install application traffic keys for subsequent records. */
     {
-        u8 app_c_key[16], app_c_iv[12];
-        u8 app_s_key[16], app_s_iv[12];
-        rc = derive_application_keys(app_c_key, app_c_iv,
-                                      app_s_key, app_s_iv,
-                                      handshake_secret, &ts);
-        if (rc) { rc = 4; goto fail_ts; }
 
         memcpy(conn->client_write_key, app_c_key, 16);
         memcpy(conn->client_write_iv,  app_c_iv,  12);
@@ -1255,6 +1360,7 @@ unsigned long tls_conn_create_client(tls_conn **out, tcp_conn *tcp,
     memset(server_finished_key, 0, 32);
     memset(client_finished_key, 0, 32);
     transcript_free(&ts);
+    hs_buf_free(&hs_buf);
 
     *out = conn;
     return 0;
@@ -1262,6 +1368,7 @@ unsigned long tls_conn_create_client(tls_conn **out, tcp_conn *tcp,
 fail_ts:
     transcript_free(&ts);
 fail:
+    hs_buf_free(&hs_buf);
     free(conn->alpn_selected);
     free(conn->peer_cert);
     free(conn->read_buf);
@@ -1400,22 +1507,160 @@ static unsigned long build_certificate(u8 *out, u64 *out_len,
     return 0;
 }
 
-/* Build a stub CertificateVerify (placeholder — Ed25519 with zero sig) */
+/* Does the client's signature_algorithms list include the given alg? */
+static int client_supports_sigalg(const u16 *client_sigalgs,
+                                   u64 client_sigalgs_len, u16 alg) {
+    u64 i;
+    if (!client_sigalgs) return 0;
+    for (i = 0; i < client_sigalgs_len; i++) {
+        if (client_sigalgs[i] == alg) return 1;
+    }
+    return 0;
+}
+
+/* Decode one DER length field at p (max end). Returns 0 on success.
+ * On success, *out_len is the value length and *out_hdr is the number of
+ * bytes consumed by the length field itself. */
+static int der_read_len(u64 *out_len, u64 *out_hdr,
+                        const u8 *p, u64 max) {
+    u64 first;
+    if (max == 0) return -1;
+    first = p[0];
+    if (first < 0x80) { *out_len = first; *out_hdr = 1; return 0; }
+    else {
+        u64 n = first & 0x7F;
+        u64 i, len = 0;
+        if (n == 0 || n > 4 || n + 1 > max) return -1;
+        for (i = 0; i < n; i++) len = (len << 8) | p[1 + i];
+        *out_len = len; *out_hdr = n + 1; return 0;
+    }
+}
+
+/* If the DER is a PKCS#8 PrivateKeyInfo, extract:
+ *   - alg OID bytes into *alg_oid (caller-provided ≥12)
+ *   - alg OID length into *alg_oid_len
+ *   - privateKey OCTET STRING contents into (*out_key, *out_key_len)
+ * Returns 0 on success, non-zero if input is not PKCS#8 shaped. The
+ * returned pointer aliases into the caller's buffer — do not free. */
+static unsigned long try_parse_pkcs8(const u8 **out_key, u64 *out_key_len,
+                                      u8 *alg_oid, u64 *alg_oid_len,
+                                      const u8 *data, u64 len) {
+    u64 pos = 0;
+    u64 seq_len, hdr;
+    u64 end;
+    /* Outer SEQUENCE */
+    if (len < 2 || data[0] != 0x30) return 1;
+    pos = 1;
+    if (der_read_len(&seq_len, &hdr, data + pos, len - pos)) return 2;
+    pos += hdr;
+    end = pos + seq_len;
+    if (end > len) return 3;
+    /* INTEGER version (must be 0) */
+    if (pos + 3 > end) return 4;
+    if (data[pos] != 0x02 || data[pos + 1] != 0x01 || data[pos + 2] != 0x00)
+        return 5;
+    pos += 3;
+    /* SEQUENCE AlgorithmIdentifier */
+    if (pos + 2 > end || data[pos] != 0x30) return 6;
+    pos++;
+    if (der_read_len(&seq_len, &hdr, data + pos, end - pos)) return 7;
+    pos += hdr;
+    {
+        u64 alg_end = pos + seq_len;
+        if (alg_end > end) return 8;
+        /* First element in algorithm is OBJECT IDENTIFIER 0x06. */
+        if (data[pos] != 0x06) return 9;
+        pos++;
+        if (der_read_len(&seq_len, &hdr, data + pos, alg_end - pos)) return 10;
+        pos += hdr;
+        if (seq_len > 16) return 11;
+        memcpy(alg_oid, data + pos, seq_len);
+        *alg_oid_len = seq_len;
+        pos = alg_end;  /* skip past any algorithm parameters */
+    }
+    /* OCTET STRING privateKey */
+    if (pos + 2 > end || data[pos] != 0x04) return 12;
+    pos++;
+    if (der_read_len(&seq_len, &hdr, data + pos, end - pos)) return 13;
+    pos += hdr;
+    if (pos + seq_len > end) return 14;
+    *out_key = data + pos;
+    *out_key_len = seq_len;
+    return 0;
+}
+
+/* rsaEncryption OID: 1.2.840.113549.1.1.1 */
+static const u8 OID_RSA_ENCRYPTION[] = {
+    0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01
+};
+/* ecPublicKey OID: 1.2.840.10045.2.1 */
+static const u8 OID_EC_PUBLIC_KEY[] = {
+    0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01
+};
+
+/* Build CertificateVerify using the server's real private key.
+ * Picks a signature algorithm the client advertised that matches the
+ * key's type:
+ *   - RSA key         → rsa_pss_rsae_sha256
+ *   - ECDSA P-256 key → ecdsa_secp256r1_sha256
+ *   - Ed25519 raw 32B → ed25519
+ * If none match, returns hatch 7.
+ *
+ * out buffer must be at least 8 + max_sig_len bytes (RSA-2048 → 256 byte
+ * sig, ECDSA DER ≤ 72, Ed25519 = 64). Caller sizes out[512] which is
+ * adequate for up to RSA-3072. */
 static unsigned long build_certificate_verify(u8 *out, u64 *out_len,
                                                const u8 *key_data, u64 key_len,
-                                               const u8 *transcript_hash_val)
+                                               const u8 *transcript_hash_val,
+                                               const u16 *client_sigalgs,
+                                               u64 client_sigalgs_len)
 {
     u64 pos = 0;
-    u8 content[130]; /* 64 spaces + 33 context + 1 zero + 32 hash */
+    u8 content[130];
     u64 content_len;
-    ed25519_keypair kp;
-    u8 sig[64];
+    u16 chosen_alg = 0;
+    u8 sig_buf[512];
+    u64 sig_len = 0;
     unsigned long rc;
-    (void)key_data;
-    (void)key_len;
 
-    /* Build signature content per RFC 8446 sec 4.4.3 */
-    memset(content, 0x20, 64); /* 64 spaces */
+    /* Unwrap PKCS#8 if present. Effective RSA key bytes / ECDSA key
+     * bytes point into either the caller's buffer (non-PKCS#8) or the
+     * inner OCTET STRING contents (PKCS#8). */
+    u8 alg_oid[16];
+    u64 alg_oid_len = 0;
+    const u8 *rsa_key_der = key_data;
+    u64       rsa_key_der_len = key_len;
+    const u8 *ec_key_der  = key_data;
+    u64       ec_key_der_len = key_len;
+    int       is_pkcs8_rsa = 0;
+    int       is_pkcs8_ec  = 0;
+    {
+        const u8 *inner_key = NULL;
+        u64 inner_len = 0;
+        if (key_data && key_len > 0
+            && try_parse_pkcs8(&inner_key, &inner_len,
+                               alg_oid, &alg_oid_len,
+                               key_data, key_len) == 0)
+        {
+            if (alg_oid_len == sizeof(OID_RSA_ENCRYPTION)
+                && memcmp(alg_oid, OID_RSA_ENCRYPTION, alg_oid_len) == 0) {
+                rsa_key_der = inner_key;
+                rsa_key_der_len = inner_len;
+                is_pkcs8_rsa = 1;
+            }
+            else if (alg_oid_len == sizeof(OID_EC_PUBLIC_KEY)
+                     && memcmp(alg_oid, OID_EC_PUBLIC_KEY, alg_oid_len) == 0) {
+                ec_key_der = inner_key;
+                ec_key_der_len = inner_len;
+                is_pkcs8_ec = 1;
+            }
+        }
+    }
+    (void)is_pkcs8_rsa; (void)is_pkcs8_ec;
+
+    /* RFC 8446 §4.4.3 signature content:
+     * 64 spaces | "TLS 1.3, server CertificateVerify" | 0x00 | hash */
+    memset(content, 0x20, 64);
     content_len = 64;
     memcpy(content + content_len, "TLS 1.3, server CertificateVerify", 33);
     content_len += 33;
@@ -1423,31 +1668,120 @@ static unsigned long build_certificate_verify(u8 *out, u64 *out_len,
     memcpy(content + content_len, transcript_hash_val, 32);
     content_len += 32;
 
-    /* For now, sign with an ephemeral Ed25519 key as a placeholder.
-     * Real implementation would use the private key from config. */
-    rc = ed25519_keygen(&kp);
-    if (rc) return rc;
-    rc = ed25519_sign(sig, &kp.priv, &kp.pub, content, content_len);
-    if (rc) return rc;
+    /* Try RSA first. Accepts raw PKCS#1 RSAPrivateKey DER, or the
+     * unwrapped-from-PKCS#8 inner OCTET STRING content. */
+    if (!chosen_alg && rsa_key_der && rsa_key_der_len > 0
+        && client_supports_sigalg(client_sigalgs, client_sigalgs_len,
+                                   SIG_RSA_PSS_RSAE_SHA256))
+    {
+        rsa_privkey rpriv;
+        if (rsa_privkey_import_der(&rpriv, rsa_key_der, rsa_key_der_len) == 0) {
+            buf sig_b = {0};
+            rc = rsa_sign_pss(&sig_b, &rpriv, content, content_len);
+            if (!rc && sig_b.len <= sizeof(sig_buf)) {
+                memcpy(sig_buf, sig_b.data, sig_b.len);
+                sig_len = sig_b.len;
+                chosen_alg = SIG_RSA_PSS_RSAE_SHA256;
+            }
+            buf_destroy(&sig_b);
+            rsa_privkey_destroy(&rpriv);
+        }
+    }
+
+    /* Try ECDSA P-256. Accepts raw 32-byte scalar, SEC1 ECPrivateKey
+     * DER (scan for first OCTET STRING (32)), or the PKCS#8-unwrapped
+     * inner SEC1 content. */
+    if (!chosen_alg && ec_key_der && ec_key_der_len > 0
+        && client_supports_sigalg(client_sigalgs, client_sigalgs_len,
+                                   SIG_ECDSA_SECP256R1_SHA256))
+    {
+        ecdsa_privkey epriv;
+        ecdsa_sig esig;
+        int have_key = 0;
+        if (ec_key_der_len == 32) {
+            memcpy(epriv.data, ec_key_der, 32);
+            have_key = 1;
+        } else if (ec_key_der_len > 40 && ec_key_der[0] == 0x30) {
+            u64 i;
+            for (i = 0; i + 34 <= ec_key_der_len; i++) {
+                if (ec_key_der[i] == 0x04 && ec_key_der[i + 1] == 0x20) {
+                    memcpy(epriv.data, ec_key_der + i + 2, 32);
+                    have_key = 1;
+                    break;
+                }
+            }
+        }
+        if (have_key && ecdsa_sign(&esig, &epriv, content, content_len) == 0) {
+            /* DER-encode r and s as a SEQUENCE of two INTEGERs. Each
+             * integer needs a leading 0x00 when its high bit is set. */
+            u64 sl = 0;
+            u8 *rbytes = esig.r;
+            u8 *sbytes = esig.s;
+            u8 rlen_prefix = (rbytes[0] & 0x80) ? 1 : 0;
+            u8 slen_prefix = (sbytes[0] & 0x80) ? 1 : 0;
+            u8 rlen = 32 + rlen_prefix;
+            u8 slen_b = 32 + slen_prefix;
+            u8 seq_len = 2 + rlen + 2 + slen_b;
+            sig_buf[sl++] = 0x30;  /* SEQUENCE */
+            sig_buf[sl++] = seq_len;
+            sig_buf[sl++] = 0x02;  /* INTEGER */
+            sig_buf[sl++] = rlen;
+            if (rlen_prefix) sig_buf[sl++] = 0x00;
+            memcpy(sig_buf + sl, rbytes, 32); sl += 32;
+            sig_buf[sl++] = 0x02;
+            sig_buf[sl++] = slen_b;
+            if (slen_prefix) sig_buf[sl++] = 0x00;
+            memcpy(sig_buf + sl, sbytes, 32); sl += 32;
+            sig_len = sl;
+            chosen_alg = SIG_ECDSA_SECP256R1_SHA256;
+        }
+    }
+
+    /* Ed25519 raw-32-byte seed (expanded internally by ed25519_keygen_from_seed). */
+    if (!chosen_alg && key_data && key_len == 32
+        && client_supports_sigalg(client_sigalgs, client_sigalgs_len,
+                                   SIG_ED25519))
+    {
+        ed25519_seed seed;
+        ed25519_keypair kp;
+        memcpy(seed.data, key_data, 32);
+        if (ed25519_keygen_from_seed(&kp, &seed) == 0
+            && ed25519_sign(sig_buf, &kp.priv, &kp.pub,
+                            content, content_len) == 0) {
+            sig_len = 64;
+            chosen_alg = SIG_ED25519;
+        }
+    }
+
+    if (!chosen_alg) return 7;
+    if (sig_len > 500) return 8;
 
     out[pos++] = HT_CERTIFICATE_VERIFY;
     pos += 3; /* length placeholder */
-    put_u16(out + pos, SIG_ED25519);
+    put_u16(out + pos, chosen_alg);
     pos += 2;
-    put_u16(out + pos, 64);
+    put_u16(out + pos, (u16)sig_len);
     pos += 2;
-    memcpy(out + pos, sig, 64);
-    pos += 64;
+    memcpy(out + pos, sig_buf, sig_len);
+    pos += sig_len;
 
     put_u24(out + 1, (u32)(pos - 4));
     *out_len = pos;
     return 0;
 }
 
-/* Parse ClientHello from raw handshake bytes, extract key share and session_id */
+/* Parse ClientHello from raw handshake bytes, extract key share, session_id,
+ * ALPN match, and the client's advertised signature_algorithms list.
+ *
+ * out_client_sigalgs is a caller-provided buffer of capacity
+ * *out_client_sigalgs_cap; on return *out_client_sigalgs_len holds the
+ * number of sig algs parsed (may be 0). */
 static unsigned long parse_client_hello(u8 *out_session_id, u8 *out_session_id_len,
                                          u8 *out_client_pub32,
                                          char **out_alpn_match,
+                                         u16 *out_client_sigalgs,
+                                         u64 *out_client_sigalgs_len,
+                                         u64 client_sigalgs_cap,
                                          const tls_config *cfg,
                                          const u8 *msg, u64 msg_len)
 {
@@ -1460,6 +1794,7 @@ static unsigned long parse_client_hello(u8 *out_session_id, u8 *out_session_id_l
 
     *out_alpn_match = NULL;
     *out_session_id_len = 0;
+    *out_client_sigalgs_len = 0;
 
     if (msg_len < 4) return 1;
     if (msg[0] != HT_CLIENT_HELLO) return 2;
@@ -1523,6 +1858,22 @@ static unsigned long parse_client_hello(u8 *out_session_id, u8 *out_session_id_l
                 sp += klen;
             }
         }
+        else if (ext_type == EXT_SIGNATURE_ALGORITHMS) {
+            /* supported_signature_algorithms: u16 list_len, then u16[] algs. */
+            if (ext_len >= 2) {
+                u16 list_len = get_u16(msg + pos);
+                u64 lp = pos + 2;
+                u64 list_end = lp + list_len;
+                u64 n = 0;
+                if (list_end <= pos + ext_len) {
+                    while (lp + 2 <= list_end && n < client_sigalgs_cap) {
+                        out_client_sigalgs[n++] = get_u16(msg + lp);
+                        lp += 2;
+                    }
+                    *out_client_sigalgs_len = n;
+                }
+            }
+        }
         else if (ext_type == EXT_ALPN && cfg->alpn && cfg->alpn_count > 0) {
             /* Try to match one of our ALPN protocols */
             u64 ap = pos;
@@ -1580,13 +1931,16 @@ unsigned long tls_conn_create_server(tls_conn **out, tcp_conn *tcp,
     u64 enc_ext_len;
     u8 cert_buf[8192];
     u64 cert_buf_len;
-    u8 cv_buf[256];
+    u8 cv_buf[600];
     u64 cv_len;
     u8 th[32];
     u8 finished_buf[36];
     u64 finished_len;
     u8 *hs_msg = NULL;
     u64 hs_msg_len;
+    hs_buf_t hs_buf = { NULL, 0, 0 };
+    u16 client_sigalgs[32];
+    u64 client_sigalgs_len = 0;
     unsigned long rc;
 
     if (!out) return 1;
@@ -1601,13 +1955,17 @@ unsigned long tls_conn_create_server(tls_conn **out, tcp_conn *tcp,
     conn->is_client = 0;
     conn->version = TLS_VERSION_13;
 
+    if (hs_buf_init(&hs_buf)) { free(conn); return 6; }
+
     /* Step 1: Receive ClientHello */
     rc = recv_record(&rec_type, &ch_raw, &ch_raw_len, tcp);
     if (rc) goto fail;
     if (rec_type != CT_HANDSHAKE) { free(ch_raw); rc = 4; goto fail; }
 
     rc = parse_client_hello(session_id, &session_id_len, client_pub,
-                             &alpn_match, cfg, ch_raw, ch_raw_len);
+                             &alpn_match,
+                             client_sigalgs, &client_sigalgs_len, 32,
+                             cfg, ch_raw, ch_raw_len);
     if (rc) { free(ch_raw); rc = 4; goto fail; }
 
     /* Init transcript */
@@ -1696,7 +2054,9 @@ unsigned long tls_conn_create_server(tls_conn **out, tcp_conn *tcp,
     /* Step 8: Send CertificateVerify */
     rc = transcript_hash(th, &ts);
     if (rc) { rc = 4; goto fail_ts; }
-    rc = build_certificate_verify(cv_buf, &cv_len, cfg->key_data, cfg->key_len, th);
+    rc = build_certificate_verify(cv_buf, &cv_len,
+                                   cfg->key_data, cfg->key_len, th,
+                                   client_sigalgs, client_sigalgs_len);
     if (rc) { rc = 4; goto fail_ts; }
     rc = send_encrypted_record(conn, CT_HANDSHAKE, cv_buf, cv_len);
     if (rc) { rc = 4; goto fail_ts; }
@@ -1711,8 +2071,19 @@ unsigned long tls_conn_create_server(tls_conn **out, tcp_conn *tcp,
     if (rc) { rc = 4; goto fail_ts; }
     transcript_append(&ts, finished_buf, finished_len);
 
-    /* Step 10: Receive client Finished */
-    rc = recv_handshake_encrypted(&hs_msg, &hs_msg_len, conn);
+    /* Step 10: Derive application traffic keys BEFORE receiving client
+     * Finished. RFC 8446 §7.1 specifies that application_traffic_secret_0
+     * is derived from the transcript ending at server Finished (not
+     * including client Finished). */
+    u8 app_c_key[16], app_c_iv[12];
+    u8 app_s_key[16], app_s_iv[12];
+    rc = derive_application_keys(app_c_key, app_c_iv,
+                                  app_s_key, app_s_iv,
+                                  handshake_secret, &ts);
+    if (rc) { rc = 4; goto fail_ts; }
+
+    /* Step 11: Receive client Finished (still using handshake traffic keys) */
+    rc = recv_handshake_msg(&hs_msg, &hs_msg_len, conn, &hs_buf);
     if (rc) { rc = 4; goto fail_ts; }
 
     rc = transcript_hash(th, &ts);
@@ -1722,15 +2093,8 @@ unsigned long tls_conn_create_server(tls_conn **out, tcp_conn *tcp,
     free(hs_msg); hs_msg = NULL;
     if (rc) { rc = 4; goto fail_ts; }
 
-    /* Step 11: Derive application traffic keys */
+    /* Step 12: Install application traffic keys for subsequent records. */
     {
-        u8 app_c_key[16], app_c_iv[12];
-        u8 app_s_key[16], app_s_iv[12];
-        rc = derive_application_keys(app_c_key, app_c_iv,
-                                      app_s_key, app_s_iv,
-                                      handshake_secret, &ts);
-        if (rc) { rc = 4; goto fail_ts; }
-
         memcpy(conn->client_write_key, app_c_key, 16);
         memcpy(conn->client_write_iv,  app_c_iv,  12);
         memcpy(conn->server_write_key, app_s_key, 16);
@@ -1756,6 +2120,7 @@ unsigned long tls_conn_create_server(tls_conn **out, tcp_conn *tcp,
     memset(server_finished_key, 0, 32);
     memset(client_finished_key, 0, 32);
     transcript_free(&ts);
+    hs_buf_free(&hs_buf);
 
     *out = conn;
     return 0;
@@ -1763,6 +2128,7 @@ unsigned long tls_conn_create_server(tls_conn **out, tcp_conn *tcp,
 fail_ts:
     transcript_free(&ts);
 fail:
+    hs_buf_free(&hs_buf);
     free(alpn_match);
     free(conn->read_buf);
     free(conn);

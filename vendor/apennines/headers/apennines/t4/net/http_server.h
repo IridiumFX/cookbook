@@ -74,4 +74,16 @@ APENNINES_API unsigned long http_ctx_set_cookie(http_ctx *ctx,
 APENNINES_API unsigned long http_ctx_remote_addr(const char **out, http_ctx *ctx);
 APENNINES_API unsigned long http_ctx_is_tls(int *out, http_ctx *ctx);
 
+/* ---- Async listen ---- */
+APENNINES_API unsigned long http_server_listen_async(http_server *s,
+                                                      const char *addr, u16 port);
+
+/* ---- Streaming response ---- */
+APENNINES_API unsigned long http_ctx_request(const u8 **out, u64 *out_len,
+                                              http_ctx *ctx);
+APENNINES_API unsigned long http_ctx_respond_stream(http_ctx *ctx, u16 status);
+APENNINES_API unsigned long http_ctx_stream_write(http_ctx *ctx,
+                                                    const u8 *chunk, u64 chunk_len);
+APENNINES_API unsigned long http_ctx_stream_end(http_ctx *ctx);
+
 #endif

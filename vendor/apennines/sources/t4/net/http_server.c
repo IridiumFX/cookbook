@@ -1,6 +1,7 @@
 #include "apennines/t4/net/http_server.h"
 #include "apennines/t3/net/tcp.h"
 #include "apennines/t3/net/http.h"
+#include "apennines/t3/net/tls.h"
 #include "apennines/t3/async/threadpool.h"
 #include "apennines/t2/net/addr.h"
 
@@ -107,6 +108,7 @@ struct http_ctx {
 
     /* connection */
     tcp_conn       *conn;
+    tls_conn       *tls;   /* non-NULL when the server was configured for TLS */
     int             is_tls;
 
     /* back-pointer to server (for config) */
@@ -137,11 +139,14 @@ struct http_server {
     tcp_listener    listener;
     int             listening;
 
-    /* TLS material (stored, not used in this tier) */
+    /* TLS: raw DER cert and key bytes + a live tls_config built from
+     * them at http_server_start time. When tls_cfg != NULL, incoming
+     * tcp_conns are wrapped in a tls_conn before any HTTP read. */
     u8             *tls_cert;
     u64             tls_cert_len;
     u8             *tls_key;
     u64             tls_key_len;
+    tls_config     *tls_cfg;
 
     /* config */
     u64             keep_alive_ms;
@@ -512,9 +517,35 @@ static http_ctx *ctx_create(http_server *server, tcp_conn *conn) {
     if (!ctx) return NULL;
     ctx->server = server;
     ctx->conn = conn;
+    ctx->tls = NULL;
     ctx->resp_status = 200;
     http_headers_create(&ctx->resp_headers);
     return ctx;
+}
+
+static http_ctx *ctx_create_tls(http_server *server, tcp_conn *conn,
+                                 tls_conn *tls) {
+    http_ctx *ctx = ctx_create(server, conn);
+    if (!ctx) return NULL;
+    ctx->tls = tls;
+    ctx->is_tls = (tls != NULL) ? 1 : 0;
+    return ctx;
+}
+
+/* Transport-level read/write that branch on whether the connection
+ * has been upgraded to TLS. Used by the worker loop and by
+ * http_ctx_respond's write path. */
+static unsigned long srv_read(u64 *out_n, tcp_conn *tcp, tls_conn *tls,
+                               u8 *buf, u64 len) {
+    if (tls) return tls_conn_read(out_n, tls, buf, len);
+    return tcp_conn_read(out_n, tcp, buf, len);
+}
+
+static unsigned long srv_write_all(u64 *out_written, tcp_conn *tcp,
+                                    tls_conn *tls,
+                                    const u8 *data, u64 len) {
+    if (tls) return tls_conn_write_all(out_written, tls, data, len);
+    return tcp_conn_write_all(out_written, tcp, data, len);
 }
 
 static void ctx_destroy(http_ctx *ctx) {
@@ -599,12 +630,14 @@ static unsigned long run_handler_with_middleware(http_server *server,
 typedef struct {
     http_server *server;
     tcp_conn     conn;
+    tls_conn    *tls;  /* NULL for plain HTTP; live TLS conn for HTTPS */
 } conn_task_arg;
 
 static unsigned long conn_worker(void *arg, void **result) {
     conn_task_arg *cta = (conn_task_arg *)arg;
     http_server *server = cta->server;
     tcp_conn conn = cta->conn;
+    tls_conn *tls = cta->tls;
     u8 *read_buf = NULL;
     u64 total_read = 0;
     u64 buf_cap = READ_BUF_SIZE;
@@ -614,7 +647,12 @@ static unsigned long conn_worker(void *arg, void **result) {
     (void)result;
 
     read_buf = (u8 *)malloc((size_t)buf_cap);
-    if (!read_buf) { tcp_conn_destroy(&conn); free(cta); return 1; }
+    if (!read_buf) {
+        if (tls) tls_conn_destroy(tls);
+        tcp_conn_destroy(&conn);
+        free(cta);
+        return 1;
+    }
 
     /* keep-alive loop */
     while (keep_alive && !server->shutdown_flag) {
@@ -643,7 +681,7 @@ static unsigned long conn_worker(void *arg, void **result) {
                 buf_cap = new_cap;
             }
 
-            rc = tcp_conn_read(&bytes_read, &conn, read_buf + total_read, READ_BUF_SIZE);
+            rc = srv_read(&bytes_read, &conn, tls, read_buf + total_read, READ_BUF_SIZE);
             if (rc != 0 || bytes_read == 0) goto close_conn;
             total_read += bytes_read;
 
@@ -693,7 +731,7 @@ static unsigned long conn_worker(void *arg, void **result) {
 
                 if (found_cl && content_len > server->max_body_size) {
                     /* 413 Payload Too Large */
-                    ctx = ctx_create(server, &conn);
+                    ctx = ctx_create_tls(server, &conn, tls);
                     if (ctx) {
                         http_ctx_respond(ctx, 413, (const u8 *)"Payload Too Large", 17);
                         ctx_destroy(ctx);
@@ -713,17 +751,21 @@ static unsigned long conn_worker(void *arg, void **result) {
                             read_buf = tmp;
                             buf_cap = new_cap;
                         }
-                        rc = tcp_conn_read(&bytes_read, &conn, read_buf + total_read,
-                                           (u64)(need - total_read));
+                        rc = srv_read(&bytes_read, &conn, tls,
+                                       read_buf + total_read,
+                                       (u64)(need - total_read));
                         if (rc != 0 || bytes_read == 0) goto close_conn;
                         total_read += bytes_read;
                     }
                 }
+                /* Downstream paths allocate ctx via ctx_create_tls to
+                 * plumb `tls` into response write. */
+                (void)tls;
             }
         }
 
         /* parse request */
-        ctx = ctx_create(server, &conn);
+        ctx = ctx_create_tls(server, &conn, tls);
         if (!ctx) goto close_conn;
 
         rc = parse_request(ctx, read_buf, total_read);
@@ -810,6 +852,7 @@ static unsigned long conn_worker(void *arg, void **result) {
 
 close_conn:
     free(read_buf);
+    if (tls) tls_conn_destroy(tls);
     tcp_conn_shutdown(&conn, TCP_SHUTDOWN_BOTH);
     tcp_conn_destroy(&conn);
     free(cta);
@@ -971,11 +1014,22 @@ unsigned long http_server_listen(http_server *s, const char *addr, u16 port) {
     if (rc != 0) return 5;
     s->listening = 1;
 
+    /* Build the tls_config once if TLS material is configured. */
+    if (s->tls_cert && s->tls_key && !s->tls_cfg) {
+        rc = tls_config_create(&s->tls_cfg);
+        if (rc != 0) return 6;
+        rc = tls_config_set_cert(s->tls_cfg, s->tls_cert, s->tls_cert_len);
+        if (rc != 0) return 7;
+        rc = tls_config_set_key(s->tls_cfg, s->tls_key, s->tls_key_len);
+        if (rc != 0) return 8;
+    }
+
     /* accept loop */
     while (!s->shutdown_flag) {
         tcp_conn accepted;
         conn_task_arg *cta;
         future *fut = NULL;
+        tls_conn *tls = NULL;
 
         rc = tcp_listener_accept(&accepted, &s->listener);
         if (rc != 0) {
@@ -988,16 +1042,31 @@ unsigned long http_server_listen(http_server *s, const char *addr, u16 port) {
             tcp_conn_set_keepalive(&accepted, 1);
         }
 
+        /* Handshake upfront — if this fails the peer isn't talking TLS
+         * and there's no point running the HTTP worker. Done on the
+         * accept thread; for very high connection rates this could be
+         * moved into the pool, but that's a later optimisation. */
+        if (s->tls_cfg) {
+            rc = tls_conn_create_server(&tls, &accepted, s->tls_cfg);
+            if (rc != 0) {
+                tcp_conn_destroy(&accepted);
+                continue;
+            }
+        }
+
         cta = (conn_task_arg *)malloc(sizeof(conn_task_arg));
         if (!cta) {
+            if (tls) tls_conn_destroy(tls);
             tcp_conn_destroy(&accepted);
             continue;
         }
         cta->server = s;
         cta->conn = accepted;
+        cta->tls = tls;
 
         rc = threadpool_submit(&fut, s->pool, conn_worker, cta);
         if (rc != 0) {
+            if (tls) tls_conn_destroy(tls);
             tcp_conn_destroy(&accepted);
             free(cta);
             continue;
@@ -1045,6 +1114,7 @@ unsigned long http_server_destroy(http_server *s) {
     }
 
     /* free TLS material */
+    if (s->tls_cfg) tls_config_destroy(s->tls_cfg);
     free(s->tls_cert);
     free(s->tls_key);
 
@@ -1225,7 +1295,7 @@ unsigned long http_ctx_respond(http_ctx *ctx, u16 status,
     rc = serialize_response(&rb, status, &ctx->resp_headers, body, body_len);
     if (rc != 0) return 3;
 
-    rc = tcp_conn_write_all(&written, ctx->conn, rb.data, rb.len);
+    rc = srv_write_all(&written, ctx->conn, ctx->tls, rb.data, rb.len);
     free(rb.data);
     if (rc != 0) return 4;
 
@@ -1299,5 +1369,47 @@ unsigned long http_ctx_is_tls(int *out, http_ctx *ctx) {
     if (!out) return 1;
     if (!ctx) return 2;
     *out = ctx->is_tls;
+    return 0;
+}
+
+/* ================================================================
+ *  Gap-fill stubs — Section 36
+ * ================================================================ */
+
+unsigned long http_server_listen_async(http_server *s, const char *addr, u16 port) {
+    if (!s) return 1;
+    if (!addr) return 2;
+    (void)port;
+    /* TODO: spawn listener thread */
+    return 0;
+}
+
+unsigned long http_ctx_request(const u8 **out, u64 *out_len, http_ctx *ctx) {
+    if (!out) return 1;
+    if (!out_len) return 2;
+    if (!ctx) return 3;
+    return http_ctx_body(out, out_len, ctx);
+}
+
+unsigned long http_ctx_respond_stream(http_ctx *ctx, u16 status) {
+    if (!ctx) return 1;
+    if (ctx->resp_sent) return 2;
+    ctx->resp_status = status;
+    /* TODO: send headers with Transfer-Encoding: chunked */
+    return 0;
+}
+
+unsigned long http_ctx_stream_write(http_ctx *ctx, const u8 *chunk, u64 chunk_len) {
+    if (!ctx) return 1;
+    if (!chunk && chunk_len > 0) return 2;
+    (void)chunk_len;
+    /* TODO: write chunked data */
+    return 0;
+}
+
+unsigned long http_ctx_stream_end(http_ctx *ctx) {
+    if (!ctx) return 1;
+    ctx->resp_sent = 1;
+    /* TODO: send final zero-length chunk */
     return 0;
 }

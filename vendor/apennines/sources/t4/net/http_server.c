@@ -230,8 +230,25 @@ static const char *mime_from_ext(const char *path) {
  * ================================================================ */
 
 /*
- * Match a request path against a route pattern with :param placeholders.
- * Returns 1 on match, 0 otherwise.  Populates params/param_count on match.
+ * Match a request path against a route pattern.
+ *
+ * Pattern syntax:
+ *   /literal            — exact match
+ *   /:name              — single-segment capture into param `name`;
+ *                         requires non-empty value (can't match "/")
+ *   /*name              — splat capture: must be the final element of
+ *                         the pattern; captures the rest of the path
+ *                         including embedded slashes; requires at least
+ *                         one non-slash byte
+ *
+ * Splat is useful for variable-depth paths like
+ * `/artifact/:group_path_splat/:artifact/:version/:filename` that can't
+ * be expressed with single-segment params because `group_path` varies
+ * in depth. Usage:
+ *   `/artifact/*tail` matches `/artifact/com/example/lib/1.0/jar.jar`
+ *   with tail = "com/example/lib/1.0/jar.jar".
+ *
+ * Returns 1 on match, 0 otherwise. Populates params/param_count on match.
  */
 static int route_match(const http_route *route, const char *path,
                        route_param *params, u32 *param_count) {
@@ -242,12 +259,10 @@ static int route_match(const http_route *route, const char *path,
     /* static route: prefix match */
     if (route->is_static) {
         size_t prefix_len = strlen(pp);
-        /* strip trailing slash for comparison */
         while (prefix_len > 1 && pp[prefix_len - 1] == '/')
             --prefix_len;
         if (strlen(rp) < prefix_len) return 0;
         if (memcmp(rp, pp, prefix_len) != 0) return 0;
-        /* must be exact or followed by '/' */
         if (rp[prefix_len] != '\0' && rp[prefix_len] != '/') return 0;
         return 1;
     }
@@ -260,7 +275,6 @@ static int route_match(const http_route *route, const char *path,
         }
 
         if (*pp == ':') {
-            /* param placeholder */
             const char *pname_start = pp + 1;
             const char *pname_end = pname_start;
             const char *val_start = rp;
@@ -270,7 +284,7 @@ static int route_match(const http_route *route, const char *path,
             while (*rp && *rp != '/') ++rp;
             val_end = rp;
 
-            if (val_start == val_end) return 0; /* empty segment */
+            if (val_start == val_end) return 0;
             if (*param_count >= MAX_ROUTE_PARAMS) return 0;
 
             params[*param_count].name = s_ndup(pname_start, (size_t)(pname_end - pname_start));
@@ -279,6 +293,34 @@ static int route_match(const http_route *route, const char *path,
 
             pp = pname_end;
             continue;
+        }
+
+        if (*pp == '*') {
+            const char *pname_start = pp + 1;
+            const char *pname_end = pname_start;
+            const char *val_start = rp;
+            const char *val_end;
+
+            while (*pname_end && *pname_end != '/') ++pname_end;
+            /* Splat must be the last element — no characters after it,
+             * optionally a trailing slash the pattern-author wrote but
+             * that we treat the same. */
+            {
+                const char *after = pname_end;
+                while (*after == '/') ++after;
+                if (*after != '\0') return 0;
+            }
+            /* Capture everything remaining in the path. */
+            while (*rp) ++rp;
+            val_end = rp;
+
+            if (val_start == val_end) return 0;  /* splat requires ≥ 1 byte */
+            if (*param_count >= MAX_ROUTE_PARAMS) return 0;
+
+            params[*param_count].name = s_ndup(pname_start, (size_t)(pname_end - pname_start));
+            params[*param_count].value = s_ndup(val_start, (size_t)(val_end - val_start));
+            ++(*param_count);
+            return 1;
         }
 
         /* literal match */
@@ -1411,5 +1453,65 @@ unsigned long http_ctx_stream_end(http_ctx *ctx) {
     if (!ctx) return 1;
     ctx->resp_sent = 1;
     /* TODO: send final zero-length chunk */
+    return 0;
+}
+
+/* ================================================================
+ *  Test-only route matching hook. Thin wrapper around route_match
+ *  so the test suite can verify pattern→path behaviour without
+ *  spinning up a real listener. Not part of the public API; the
+ *  `_dbg` suffix warns callers.
+ * ================================================================ */
+
+APENNINES_API unsigned long http_server_dbg_route_match(
+    int *out_matched,
+    char *out_param_names, u64 out_names_cap,
+    char *out_param_values, u64 out_values_cap,
+    const char *pattern, const char *path);
+
+unsigned long http_server_dbg_route_match(
+    int *out_matched,
+    char *out_param_names, u64 out_names_cap,
+    char *out_param_values, u64 out_values_cap,
+    const char *pattern, const char *path) {
+    http_route r;
+    route_param params[MAX_ROUTE_PARAMS];
+    u32 param_count = 0;
+    int matched;
+    u32 i;
+    u64 np = 0, vp = 0;
+
+    if (!out_matched) return 1;
+    if (!pattern)     return 2;
+    if (!path)        return 3;
+
+    memset(&r, 0, sizeof(r));
+    r.pattern = (char *)pattern;  /* read-only in route_match */
+    r.is_static = 0;
+
+    matched = route_match(&r, path, params, &param_count);
+    *out_matched = matched;
+
+    /* Serialise captured params as comma-separated names/values into
+     * caller buffers for easy string-compare in tests. */
+    if (out_param_names && out_names_cap > 0) out_param_names[0] = '\0';
+    if (out_param_values && out_values_cap > 0) out_param_values[0] = '\0';
+    for (i = 0; i < param_count; i++) {
+        u64 nl = params[i].name ? strlen(params[i].name) : 0;
+        u64 vl = params[i].value ? strlen(params[i].value) : 0;
+        if (out_param_names && np + nl + 2 < out_names_cap) {
+            if (np > 0) out_param_names[np++] = ',';
+            memcpy(out_param_names + np, params[i].name, (size_t)nl);
+            np += nl;
+            out_param_names[np] = '\0';
+        }
+        if (out_param_values && vp + vl + 2 < out_values_cap) {
+            if (vp > 0) out_param_values[vp++] = ',';
+            memcpy(out_param_values + vp, params[i].value, (size_t)vl);
+            vp += vl;
+            out_param_values[vp] = '\0';
+        }
+    }
+    free_params(params, param_count);
     return 0;
 }

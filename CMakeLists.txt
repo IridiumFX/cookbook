@@ -57,6 +57,7 @@ target_compile_definitions(alforno PUBLIC ALF_STATIC)
 add_library(apennines STATIC
     vendor/apennines/sources/t1/buffer/buf.c
     vendor/apennines/sources/t1/random/entropy.c
+    vendor/apennines/sources/t1/sync/thread/thread.c
     vendor/apennines/sources/t2/crypto/argon2.c
     vendor/apennines/sources/t2/crypto/blake2b.c
     vendor/apennines/sources/t2/crypto/cipher.c

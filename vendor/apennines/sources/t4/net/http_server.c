@@ -4,6 +4,7 @@
 #include "apennines/t3/net/tls.h"
 #include "apennines/t3/async/threadpool.h"
 #include "apennines/t2/net/addr.h"
+#include "apennines/t1/sync/thread/thread.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -157,6 +158,12 @@ struct http_server {
 
     /* control */
     volatile int    shutdown_flag;
+
+    /* async listener (spawned by http_server_listen_async) */
+    thread_handle   listener_thread;
+    int             listener_running;
+    char           *async_addr;
+    u16             async_port;
 };
 
 /* ================================================================
@@ -1084,32 +1091,37 @@ unsigned long http_server_listen(http_server *s, const char *addr, u16 port) {
             tcp_conn_set_keepalive(&accepted, 1);
         }
 
-        /* Handshake upfront — if this fails the peer isn't talking TLS
-         * and there's no point running the HTTP worker. Done on the
-         * accept thread; for very high connection rates this could be
-         * moved into the pool, but that's a later optimisation. */
-        if (s->tls_cfg) {
-            rc = tls_conn_create_server(&tls, &accepted, s->tls_cfg);
-            if (rc != 0) {
-                tcp_conn_destroy(&accepted);
-                continue;
-            }
-        }
-
+        /* Allocate cta before handshake so tls_conn can hold a stable
+         * pointer to cta->conn instead of a stack address. (tls_conn
+         * stores tcp_conn* by pointer, not by value — passing &accepted
+         * here would leave tls->tcp dangling once this frame unwinds.) */
         cta = (conn_task_arg *)malloc(sizeof(conn_task_arg));
         if (!cta) {
-            if (tls) tls_conn_destroy(tls);
             tcp_conn_destroy(&accepted);
             continue;
         }
         cta->server = s;
         cta->conn = accepted;
-        cta->tls = tls;
+        cta->tls = NULL;
+
+        /* Handshake upfront — if this fails the peer isn't talking TLS
+         * and there's no point running the HTTP worker. Done on the
+         * accept thread; for very high connection rates this could be
+         * moved into the pool, but that's a later optimisation. */
+        if (s->tls_cfg) {
+            rc = tls_conn_create_server(&tls, &cta->conn, s->tls_cfg);
+            if (rc != 0) {
+                tcp_conn_destroy(&cta->conn);
+                free(cta);
+                continue;
+            }
+            cta->tls = tls;
+        }
 
         rc = threadpool_submit(&fut, s->pool, conn_worker, cta);
         if (rc != 0) {
-            if (tls) tls_conn_destroy(tls);
-            tcp_conn_destroy(&accepted);
+            if (cta->tls) tls_conn_destroy(cta->tls);
+            tcp_conn_destroy(&cta->conn);
             free(cta);
             continue;
         }
@@ -1124,9 +1136,20 @@ unsigned long http_server_shutdown(http_server *s) {
     if (!s) return 1;
     s->shutdown_flag = 1;
 
+    /* Destroy the listener socket first. This unblocks an accept() that
+     * might be parked in the async listener thread so it can observe
+     * shutdown_flag and return. */
     if (s->listening) {
         tcp_listener_destroy(&s->listener);
         s->listening = 0;
+    }
+
+    /* If we spawned a background listener via http_server_listen_async,
+     * wait for it to drain. */
+    if (s->listener_running) {
+        unsigned long ret = 0;
+        thread_join(&ret, &s->listener_thread);
+        s->listener_running = 0;
     }
 
     return 0;
@@ -1137,9 +1160,18 @@ unsigned long http_server_destroy(http_server *s) {
 
     if (!s) return 1;
 
-    /* ensure shutdown */
+    /* ensure shutdown (also joins the async listener if one is live) */
     if (!s->shutdown_flag) {
         http_server_shutdown(s);
+    } else if (s->listener_running) {
+        /* shutdown_flag was set another way — still need to join */
+        unsigned long ret = 0;
+        if (s->listening) {
+            tcp_listener_destroy(&s->listener);
+            s->listening = 0;
+        }
+        thread_join(&ret, &s->listener_thread);
+        s->listener_running = 0;
     }
 
     /* shutdown threadpool */
@@ -1159,6 +1191,8 @@ unsigned long http_server_destroy(http_server *s) {
     if (s->tls_cfg) tls_config_destroy(s->tls_cfg);
     free(s->tls_cert);
     free(s->tls_key);
+
+    free(s->async_addr);
 
     free(s);
     return 0;
@@ -1418,11 +1452,31 @@ unsigned long http_ctx_is_tls(int *out, http_ctx *ctx) {
  *  Gap-fill stubs — Section 36
  * ================================================================ */
 
+static unsigned long async_listen_trampoline(void *arg) {
+    http_server *s = (http_server *)arg;
+    return http_server_listen(s, s->async_addr, s->async_port);
+}
+
 unsigned long http_server_listen_async(http_server *s, const char *addr, u16 port) {
+    unsigned long rc;
+
     if (!s) return 1;
     if (!addr) return 2;
-    (void)port;
-    /* TODO: spawn listener thread */
+    if (s->listener_running) return 3;
+    if (s->listening) return 4;
+
+    free(s->async_addr);
+    s->async_addr = s_dup(addr);
+    if (!s->async_addr) return 5;
+    s->async_port = port;
+
+    rc = thread_create(&s->listener_thread, async_listen_trampoline, s);
+    if (rc != 0) {
+        free(s->async_addr);
+        s->async_addr = NULL;
+        return 6;
+    }
+    s->listener_running = 1;
     return 0;
 }
 

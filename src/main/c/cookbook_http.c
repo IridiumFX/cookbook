@@ -173,6 +173,8 @@ int shim_send_http_ok(shim_connection *sc, const char *content_type, long long l
    happens in cookbook_server.c via cookbook_http_start/stop. */
 
 static http_server *g_http = NULL;
+static char          g_listen_addr[64];
+static u16           g_listen_port;
 
 int cookbook_http_start(const char *addr, int port,
                         const unsigned char *tls_cert, size_t cert_len,
@@ -187,14 +189,11 @@ int cookbook_http_start(const char *addr, int port,
     http_server_set_keep_alive(g_http, 30000); /* 30s keep-alive */
     http_server_set_max_body_size(g_http, 256 * 1024 * 1024); /* 256MB */
 
-    if (http_server_listen(g_http, addr, (u16)port) != 0) {
-        http_server_destroy(g_http);
-        g_http = NULL;
-        return -1;
-    }
-
-    fprintf(stdout, "cookbook: apennines HTTP server listening on %s:%d\n",
-            addr, port);
+    /* Stash addr/port — actual listen happens in cookbook_http_register_routes
+     * after the shim dispatch table is populated, so there's no window where
+     * the server accepts connections without a dispatch target. */
+    snprintf(g_listen_addr, sizeof(g_listen_addr), "%s", addr);
+    g_listen_port = (u16)port;
     return 0;
 }
 
@@ -289,21 +288,33 @@ void cookbook_http_add_route(const char *pattern, void *handler) {
     g_route_count++;
 }
 
-/* Register the generic handler on the http_server — catches all requests */
+/* Register the generic handler on the http_server, then start listening.
+ * Must be called after every cookbook_http_add_route() so the shim's
+ * dispatch table is populated before requests start arriving. */
 void cookbook_http_register_routes(void *srv) {
     g_server_ptr = srv;
     if (!g_http) return;
 
-    /* register a catch-all route that dispatches through our route table */
-    http_server_route(g_http, HTTP_GET, "/", generic_handler);
-    http_server_route(g_http, HTTP_POST, "/", generic_handler);
-    http_server_route(g_http, HTTP_PUT, "/", generic_handler);
-    http_server_route(g_http, HTTP_DELETE, "/", generic_handler);
-    http_server_route(g_http, HTTP_HEAD, "/", generic_handler);
-    http_server_route(g_http, HTTP_PATCH, "/", generic_handler);
+    /* Register a splat catch-all so every path hits our dispatch table.
+     * Apennines router uses exact segment match by default — `/` only
+     * matches literal `/`. The splat form `/*path` captures everything
+     * below root (apennines commit 000116). */
+    http_server_route(g_http, HTTP_GET,    "/*path", generic_handler);
+    http_server_route(g_http, HTTP_POST,   "/*path", generic_handler);
+    http_server_route(g_http, HTTP_PUT,    "/*path", generic_handler);
+    http_server_route(g_http, HTTP_DELETE, "/*path", generic_handler);
+    http_server_route(g_http, HTTP_HEAD,   "/*path", generic_handler);
+    http_server_route(g_http, HTTP_PATCH,  "/*path", generic_handler);
 
-    fprintf(stdout, "cookbook: apennines HTTP routes registered (%d routes via shim)\n",
-            g_route_count);
+    /* Start the accept loop on apennines' background thread (000117). */
+    if (http_server_listen_async(g_http, g_listen_addr, g_listen_port) != 0) {
+        fprintf(stderr, "cookbook: http_server_listen_async failed\n");
+        return;
+    }
+
+    fprintf(stdout, "cookbook: apennines HTTP server listening on %s:%d "
+                     "(%d routes via shim)\n",
+            g_listen_addr, g_listen_port, g_route_count);
 }
 
 #endif /* COOKBOOK_USE_APENNINES_HTTP */

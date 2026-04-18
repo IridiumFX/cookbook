@@ -41,6 +41,7 @@ struct shim_connection {
     struct shim_request_info    ri;
     /* response state */
     int                status_sent;
+    unsigned short     resp_status;
     /* request body cache */
     const unsigned char *body;
     size_t              body_len;

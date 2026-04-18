@@ -106,6 +106,7 @@ struct http_ctx {
     u8             *resp_body;
     u64             resp_body_len;
     int             resp_sent;
+    int             stream_started;  /* headers sent via http_ctx_respond_stream */
 
     /* connection */
     tcp_conn       *conn;
@@ -1077,7 +1078,6 @@ unsigned long http_server_listen(http_server *s, const char *addr, u16 port) {
     while (!s->shutdown_flag) {
         tcp_conn accepted;
         conn_task_arg *cta;
-        future *fut = NULL;
         tls_conn *tls = NULL;
 
         rc = tcp_listener_accept(&accepted, &s->listener);
@@ -1118,15 +1118,18 @@ unsigned long http_server_listen(http_server *s, const char *addr, u16 port) {
             cta->tls = tls;
         }
 
-        rc = threadpool_submit(&fut, s->pool, conn_worker, cta);
+        /* Fire-and-forget via a detached submit: no future allocated,
+         * nothing to destroy early. Previous code used threadpool_submit
+         * + immediate future_destroy, which raced with the worker's
+         * future_mark_done — use-after-free that crashed the process on
+         * first request. */
+        rc = threadpool_submit_detached(s->pool, conn_worker, cta);
         if (rc != 0) {
             if (cta->tls) tls_conn_destroy(cta->tls);
             tcp_conn_destroy(&cta->conn);
             free(cta);
             continue;
         }
-        /* fire-and-forget: destroy future immediately */
-        future_destroy(fut);
     }
 
     return 0;
@@ -1356,6 +1359,7 @@ unsigned long http_ctx_respond(http_ctx *ctx, u16 status,
 
     if (!ctx) return 1;
     if (ctx->resp_sent) return 2;
+    if (ctx->stream_started) return 5;  /* already committed to chunked */
 
     ctx->resp_status = status;
 
@@ -1487,26 +1491,121 @@ unsigned long http_ctx_request(const u8 **out, u64 *out_len, http_ctx *ctx) {
     return http_ctx_body(out, out_len, ctx);
 }
 
+/*
+ * Streaming response: HTTP/1.1 chunked Transfer-Encoding (RFC 7230 §4.1).
+ *
+ * Flow:
+ *   http_ctx_respond_stream(ctx, status)   — send status line + headers
+ *                                            with "Transfer-Encoding: chunked".
+ *                                            Any caller-set Content-Length is
+ *                                            stripped (they're mutually
+ *                                            exclusive per RFC 7230 §3.3.3).
+ *   http_ctx_stream_write(ctx, buf, len)   — send one chunk:
+ *                                            "<hex-len>\r\n<data>\r\n".
+ *                                            No-op on zero-length (which would
+ *                                            otherwise be interpreted as the
+ *                                            terminator).
+ *   http_ctx_stream_end(ctx)               — send "0\r\n\r\n" terminator.
+ *
+ * After respond_stream, http_ctx_respond / http_ctx_respond_json / _file must
+ * not be called. After stream_end, nothing more may be written.
+ */
+
 unsigned long http_ctx_respond_stream(http_ctx *ctx, u16 status) {
+    resp_buf rb;
+    char line[256];
+    u64 i;
+    u64 written = 0;
+    unsigned long rc;
+
     if (!ctx) return 1;
     if (ctx->resp_sent) return 2;
+    if (ctx->stream_started) return 3;
+
     ctx->resp_status = status;
-    /* TODO: send headers with Transfer-Encoding: chunked */
+
+    if (rb_init(&rb) != 0) return 4;
+
+    /* status line */
+    snprintf(line, sizeof(line), "HTTP/1.1 %u %s\r\n",
+             (unsigned)status, reason_for(status));
+    if (rb_append_str(&rb, line) != 0) { free(rb.data); return 4; }
+
+    /* headers — skip any caller-set Content-Length (incompatible with
+     * Transfer-Encoding: chunked per RFC 7230 §3.3.3) */
+    for (i = 0; i < ctx->resp_headers.count; ++i) {
+        const char *name = ctx->resp_headers.items[i].name;
+        if (ci_eq(name, "Content-Length")) continue;
+        if (ci_eq(name, "Transfer-Encoding")) continue;
+        if (rb_append_str(&rb, name) != 0) { free(rb.data); return 4; }
+        if (rb_append_str(&rb, ": ") != 0) { free(rb.data); return 4; }
+        if (rb_append_str(&rb, ctx->resp_headers.items[i].value) != 0) {
+            free(rb.data); return 4;
+        }
+        if (rb_append_str(&rb, "\r\n") != 0) { free(rb.data); return 4; }
+    }
+
+    if (rb_append_str(&rb, "Transfer-Encoding: chunked\r\n") != 0) {
+        free(rb.data); return 4;
+    }
+    if (rb_append_str(&rb, "\r\n") != 0) { free(rb.data); return 4; }
+
+    rc = srv_write_all(&written, ctx->conn, ctx->tls, rb.data, rb.len);
+    free(rb.data);
+    if (rc != 0) return 5;
+
+    ctx->stream_started = 1;
     return 0;
 }
 
 unsigned long http_ctx_stream_write(http_ctx *ctx, const u8 *chunk, u64 chunk_len) {
+    char hdr[32];
+    int hdr_len;
+    u64 written = 0;
+    unsigned long rc;
+
     if (!ctx) return 1;
     if (!chunk && chunk_len > 0) return 2;
-    (void)chunk_len;
-    /* TODO: write chunked data */
+    if (!ctx->stream_started) return 3;
+    if (ctx->resp_sent) return 4;
+
+    /* A zero-length chunk would be interpreted as the terminator, so skip
+     * it silently. Callers should use http_ctx_stream_end for that. */
+    if (chunk_len == 0) return 0;
+
+    /* chunk size line: "<hex>\r\n" */
+    hdr_len = snprintf(hdr, sizeof(hdr), "%llx\r\n",
+                       (unsigned long long)chunk_len);
+    if (hdr_len <= 0 || hdr_len >= (int)sizeof(hdr)) return 5;
+
+    rc = srv_write_all(&written, ctx->conn, ctx->tls,
+                       (const u8 *)hdr, (u64)hdr_len);
+    if (rc != 0) return 6;
+
+    rc = srv_write_all(&written, ctx->conn, ctx->tls, chunk, chunk_len);
+    if (rc != 0) return 7;
+
+    rc = srv_write_all(&written, ctx->conn, ctx->tls,
+                       (const u8 *)"\r\n", 2);
+    if (rc != 0) return 8;
+
     return 0;
 }
 
 unsigned long http_ctx_stream_end(http_ctx *ctx) {
+    u64 written = 0;
+    unsigned long rc;
+
     if (!ctx) return 1;
+    if (!ctx->stream_started) return 2;
+    if (ctx->resp_sent) return 3;
+
+    /* Final chunk: "0\r\n\r\n" (zero-length chunk + empty trailer) */
+    rc = srv_write_all(&written, ctx->conn, ctx->tls,
+                       (const u8 *)"0\r\n\r\n", 5);
+    if (rc != 0) return 4;
+
     ctx->resp_sent = 1;
-    /* TODO: send final zero-length chunk */
     return 0;
 }
 

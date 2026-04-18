@@ -153,7 +153,10 @@ static void *worker_entry(void *param) {
         if (task) {
             void          *res = NULL;
             unsigned long  rc  = task->fn(task->arg, &res);
-            future_mark_done(task->fut, rc, res);
+            /* task->fut is NULL for detached submits — skip mark_done */
+            if (task->fut) {
+                future_mark_done(task->fut, rc, res);
+            }
             free(task);
         }
     }
@@ -353,6 +356,64 @@ unsigned long threadpool_submit(future **out_future, threadpool *pool,
 }
 
 /* ----------------------------------------------------------------
+ *  threadpool_submit_detached
+ *
+ *  Enqueue a task without a future. Caller gets no handle back and
+ *  can't wait for completion. Safe for fire-and-forget work (e.g. the
+ *  http_server accept loop handing connections to the pool) where
+ *  calling future_destroy early would race with the worker's
+ *  future_mark_done → use-after-free.
+ * ---------------------------------------------------------------- */
+
+unsigned long threadpool_submit_detached(threadpool *pool,
+                                          threadpool_task_fn fn,
+                                          void *arg) {
+    task_node *node;
+
+    if (!pool) return 1;
+    if (!fn)   return 2;
+
+    pool_lock(pool);
+    if (pool->shutdown != 0) {
+        pool_unlock(pool);
+        return 3;
+    }
+    pool_unlock(pool);
+
+    node = (task_node *)malloc(sizeof(task_node));
+    if (!node) return 4;
+
+    node->fn   = fn;
+    node->arg  = arg;
+    node->fut  = NULL;           /* detached — no future */
+    node->next = NULL;
+
+    pool_lock(pool);
+    if (pool->shutdown != 0) {
+        pool_unlock(pool);
+        free(node);
+        return 3;
+    }
+
+    if (pool->queue_tail) {
+        pool->queue_tail->next = node;
+    } else {
+        pool->queue_head = node;
+    }
+    pool->queue_tail = node;
+    pool->queue_size++;
+
+#ifdef _WIN32
+    WakeConditionVariable(&pool->cond);
+#else
+    pthread_cond_signal(&pool->cond);
+#endif
+
+    pool_unlock(pool);
+    return 0;
+}
+
+/* ----------------------------------------------------------------
  *  shutdown helpers
  * ---------------------------------------------------------------- */
 
@@ -380,8 +441,11 @@ static void drain_queue(threadpool *pool) {
 
     while ((node = dequeue(pool)) != NULL) {
         /* Mark the future done with a non-zero rc so waiters unblock.
-         * We use rc=1 to signal cancellation. */
-        future_mark_done(node->fut, 1, NULL);
+         * We use rc=1 to signal cancellation. Detached tasks have no
+         * future — just drop them. */
+        if (node->fut) {
+            future_mark_done(node->fut, 1, NULL);
+        }
         free(node);
     }
 }

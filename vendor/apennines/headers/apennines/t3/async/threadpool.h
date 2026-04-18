@@ -49,6 +49,23 @@ APENNINES_API unsigned long threadpool_submit(future **out_future, threadpool *p
                                               threadpool_task_fn fn, void *arg);
 
 /*
+ * threadpool_submit_detached - submit a task, discard the result, never allocate
+ * a future. The task function's return value and *result output are ignored.
+ * Use this for true fire-and-forget work where the caller has no reason to
+ * wait. Avoids the lifetime trap of calling future_destroy on a future that
+ * the worker thread may still be signalling.
+ *
+ * Hatches:
+ *   1 - pool is NULL
+ *   2 - fn is NULL
+ *   3 - pool is shut down
+ *   4 - allocation failure
+ */
+APENNINES_API unsigned long threadpool_submit_detached(threadpool *pool,
+                                                        threadpool_task_fn fn,
+                                                        void *arg);
+
+/*
  * threadpool_shutdown - graceful shutdown; finish pending tasks, then stop.
  *
  * Hatches:

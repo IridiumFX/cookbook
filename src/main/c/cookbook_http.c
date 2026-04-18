@@ -89,11 +89,9 @@ int shim_printf(shim_connection *sc, const char *fmt, ...) {
     if (n > 0) {
         /* parse status from first line if this is the initial response */
         if (!sc->status_sent && strncmp(buf, "HTTP/1.", 7) == 0) {
+            int status = 200;
             const char *sp = strchr(buf, ' ');
-            if (sp) {
-                int status = atoi(sp + 1);
-                http_ctx_set_status(sc->ctx, (u16)status);
-            }
+            if (sp) status = atoi(sp + 1);
 
             /* extract headers from the buffer */
             const char *line = strchr(buf, '\n');
@@ -108,7 +106,6 @@ int shim_printf(shim_connection *sc, const char *fmt, ...) {
                     memcpy(hname, line, nlen);
                     const char *hval = colon + 1;
                     while (*hval == ' ') hval++;
-                    /* find end of value */
                     char hvalue[1024] = {0};
                     const char *eol = strchr(hval, '\r');
                     if (!eol) eol = strchr(hval, '\n');
@@ -117,33 +114,51 @@ int shim_printf(shim_connection *sc, const char *fmt, ...) {
                         if (vlen >= sizeof(hvalue)) vlen = sizeof(hvalue) - 1;
                         memcpy(hvalue, hval, vlen);
                     }
-                    if (hname[0] && hvalue[0])
+                    /* Content-Length is incompatible with chunked — strip it;
+                     * apennines streaming emits Transfer-Encoding: chunked. */
+                    if (hname[0] && hvalue[0] &&
+                        strcasecmp(hname, "Content-Length") != 0)
                         http_ctx_set_header(sc->ctx, hname, hvalue);
                 }
                 const char *next = strchr(line, '\n');
                 line = next;
             }
 
-            /* find body after \r\n\r\n */
+            /* Always open the streaming channel — the handler may write
+             * the body in a separate mg_write call (civetweb pattern).
+             * generic_handler calls http_ctx_stream_end after the handler
+             * returns to finalize the response. */
+            sc->resp_status = (u16)status;
+            http_ctx_respond_stream(sc->ctx, (u16)status);
+            sc->status_sent = 1;
+
+            /* If the first printf also included body bytes after \r\n\r\n
+             * (typical for send_json), write those now. */
             const char *body_start = strstr(buf, "\r\n\r\n");
             if (body_start) {
                 body_start += 4;
                 size_t body_len = (size_t)(n - (body_start - buf));
-                if (body_len > 0) {
-                    http_ctx_respond(sc->ctx, 0, (const u8 *)body_start, (u64)body_len);
-                }
+                if (body_len > 0)
+                    http_ctx_stream_write(sc->ctx,
+                                          (const u8 *)body_start, (u64)body_len);
             }
-            sc->status_sent = 1;
-        } else {
-            /* subsequent writes are body data */
-            http_ctx_respond(sc->ctx, 0, (const u8 *)buf, (u64)n);
+        } else if (sc->status_sent) {
+            /* subsequent writes are body bytes */
+            http_ctx_stream_write(sc->ctx, (const u8 *)buf, (u64)n);
         }
     }
     return n;
 }
 
 int shim_write(shim_connection *sc, const void *data, size_t len) {
-    http_ctx_respond(sc->ctx, 0, (const u8 *)data, (u64)len);
+    /* Streaming write — status must have been sent via shim_printf or
+     * shim_send_http_ok first. If not, open with 200. */
+    if (!sc->status_sent) {
+        sc->resp_status = 200;
+        http_ctx_respond_stream(sc->ctx, 200);
+        sc->status_sent = 1;
+    }
+    http_ctx_stream_write(sc->ctx, (const u8 *)data, (u64)len);
     return (int)len;
 }
 
@@ -157,11 +172,10 @@ int shim_read(shim_connection *sc, void *buf, size_t len) {
 }
 
 int shim_send_http_ok(shim_connection *sc, const char *content_type, long long len) {
-    http_ctx_set_status(sc->ctx, 200);
+    (void)len;  /* chunked streaming — apennines emits Transfer-Encoding */
     http_ctx_set_header(sc->ctx, "Content-Type", content_type);
-    char cl[32];
-    snprintf(cl, sizeof(cl), "%lld", len);
-    http_ctx_set_header(sc->ctx, "Content-Length", cl);
+    sc->resp_status = 200;
+    http_ctx_respond_stream(sc->ctx, 200);
     sc->status_sent = 1;
     return 0;
 }
@@ -272,6 +286,15 @@ static unsigned long generic_handler(http_ctx *ctx) {
     shim_connection sc;
     shim_init(&sc, ctx);
     best->handler(&sc, g_server_ptr);
+
+    /* Handler finished — close the chunked stream if we opened one.
+     * If the handler never wrote anything, send an empty 200 so the
+     * client doesn't hang. */
+    if (sc.status_sent) {
+        http_ctx_stream_end(ctx);
+    } else {
+        http_ctx_respond(ctx, 200, NULL, 0);
+    }
     return 0;
 }
 

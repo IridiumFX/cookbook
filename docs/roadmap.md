@@ -1,6 +1,6 @@
 # cookbook — Roadmap
 
-**Version**: 1.0-rc1
+**Version**: 1.0-rc2
 **Status as of**: 2026-03-22
 **Spec reference**: cookbook-architecture-M1.docx (d3 final)
 
@@ -277,3 +277,27 @@ All M1 spec gaps resolved. All enterprise features implemented. All known bugs f
 - Dual build systems: CMake (production) + `now` (Phase 2, Nova-forward)
 - Nova OS porting: 5 of 8 checklist items already done at compile time
 - Cross-team collaboration: cookbook + now + apennines via pasta mailbox protocol
+
+---
+
+## 1.0-rc2 Summary
+
+Follow-on milestone. Dependency surface shrinks, Phase 3 (civetweb→apennines HTTP swap) goes from "scoped" to "functional". Everything is additive or reductive — no breaking changes, no new user-visible APIs.
+
+**Key deltas vs rc1:**
+
+- **libsodium fully removed.** Argon2id (RFC 9106), HMAC-SHA256, and `ct_memzero` now come from apennines. Format-compatible — existing credential hashes verify unchanged. `vendor/libsodium/` submodule gone. Exe shrinks: CMake 4.2MB → 3.9MB, `now` 2.6MB → 2.2MB. Forward alignment for Nova (one less cross-platform C dependency).
+- **Phase 3 functional under flag.** `COOKBOOK_USE_APENNINES_HTTP=ON` now produces a working apennines-HTTP server serving the entire registry surface with zero handler code changes. Shim (`cookbook_http.c` + `cookbook_http_shim.h`, ~350 lines) bridges civetweb's `mg_connection`/`mg_read`/`mg_printf` to apennines' `http_ctx`/streaming API. Flag still OFF by default — civetweb remains production.
+- **Inbound HTTPS wired.** New env vars `COOKBOOK_TLS_CERT_PEM` + `COOKBOOK_TLS_KEY_PEM`. PEM files decoded to DER via apennines pem, handed to `http_server_set_tls`. Verified end-to-end with self-signed cert — TLS 1.3 / AES_128_GCM_SHA256 / X25519 / rsa_pss_rsae_sha256 via `openssl s_client 3.5`.
+- **Apennines upgrades (vendored):** 000113 (http.c body-length clamp fix), 000115 (http_server TLS termination), 000116 (router splat `*name`), 000117 (listen_async + streaming triplet real, TLS pointer fix), 000118 (WAL Win32 native — closes our March-21 crash report), 000119 (`threadpool_submit_detached` — fixes accept-path UAF), latest tls.c (PKCS#8 key unwrap).
+- **New vendored T1 module:** `t1/sync/thread` (dependency of http_server's new listen_async).
+- **Tests:** 617/617 pass in both flag-OFF and flag-ON builds. `now` build produces working exe.
+- **Cross-team collaboration delta:** 4 apennines fixes shipped in ~24h (splat routing, listen_async, streaming triplet, threadpool UAF) unblocking Phase 3 from "parked indefinitely" to "works in one afternoon".
+
+**What did NOT change:**
+- Public HTTP API surface (same endpoints, same semantics)
+- Database schema and credential format
+- Default build (civetweb path)
+- `now.pasta` descriptor structure
+
+Phase 3 flag flip + civetweb removal is deferred to the formal Nova cutover milestone; cookbook 1.0 final will ship on civetweb.

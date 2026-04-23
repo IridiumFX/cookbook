@@ -1,16 +1,15 @@
 /*
- * cookbook_http.c — Apennines HTTP server adapter
+ * cookbook_http.c — apennines HTTP server adapter.
  *
- * When COOKBOOK_USE_APENNINES_HTTP is defined, this provides the bridge
- * between our existing civetweb-style handlers and the apennines
- * http_server API. Each handler is wrapped to translate http_ctx calls
- * to mg_connection-compatible operations.
+ * Bridges handler code (written against a civetweb-style mg_* API)
+ * onto apennines' http_ctx. Registers a splat catch-all route on the
+ * apennines http_server and dispatches via longest-prefix match
+ * against the table populated by cookbook_http_add_route. Chunked
+ * streaming responses via http_ctx_respond_stream / stream_write /
+ * stream_end.
  *
- * This file is only compiled when COOKBOOK_USE_APENNINES_HTTP is active.
- * Otherwise, civetweb remains the HTTP server.
+ * civetweb was removed in rc3; this is cookbook's sole HTTP transport.
  */
-
-#ifdef COOKBOOK_USE_APENNINES_HTTP
 
 #include "cookbook_http_shim.h"
 #include <apennines/t3/net/http.h>
@@ -223,30 +222,13 @@ http_server *cookbook_http_get_server(void) {
     return g_http;
 }
 
-/* ---- Generic wrapper: translates http_ctx → shim → civetweb handler ---- */
+/* ---- Route dispatch table ----
+ * Handlers keep their civetweb-style signature
+ * `int handler(struct mg_connection *, void *cbdata)` which, via the
+ * #defines in cookbook_server.c, expands to
+ * `int handler(shim_connection *, void *cbdata)`. generic_handler picks
+ * the longest-matching pattern and dispatches. */
 
-/*
- * Each civetweb handler has signature:
- *   int handler(struct mg_connection *conn, void *cbdata);
- *
- * We can't use that directly. Instead, we define a macro-generated wrapper
- * for each route that:
- * 1. Creates a shim_connection from http_ctx
- * 2. Calls the original handler (which uses mg_* via #ifdef redirects)
- * 3. Returns the result
- *
- * The trick: in cookbook_server.c, when COOKBOOK_USE_APENNINES_HTTP is defined,
- * we #define mg_connection to shim_connection, mg_get_request_info to
- * shim_get_request_info, etc. This makes the existing handlers use the
- * shim transparently.
- *
- * For now, we register routes using simple wrappers that the server
- * will provide via cookbook_http_register_routes().
- */
-
-/* ---- Route dispatch table ---- */
-
-/* civetweb handler signature (with shim types via #define) */
 typedef int (*cw_handler_fn)(shim_connection *conn, void *cbdata);
 
 typedef struct {
@@ -340,4 +322,3 @@ void cookbook_http_register_routes(void *srv) {
             g_listen_addr, g_listen_port, g_route_count);
 }
 
-#endif /* COOKBOOK_USE_APENNINES_HTTP */

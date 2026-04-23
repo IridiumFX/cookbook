@@ -2,18 +2,17 @@
 #define COOKBOOK_HTTP_SHIM_H
 
 /*
- * cookbook_http_shim.h — Compatibility shim between apennines http_ctx
- * and civetweb's mg_connection/mg_request_info API.
+ * cookbook_http_shim.h — handler-facing adapter over apennines http_ctx.
  *
- * When COOKBOOK_USE_APENNINES_HTTP is defined, this provides:
- * - shim_connection: wraps http_ctx, looks like mg_connection to handlers
- * - shim_mg_* functions: translate mg_printf/mg_write/mg_read to http_ctx
- * - shim_request_info: populated from http_ctx, looks like mg_request_info
+ * Handlers are written against a civetweb-style mg_connection API
+ * (mg_printf / mg_write / mg_read / mg_get_request_info). This header
+ * defines the shim types; cookbook_server.c #defines mg_* → shim_*.
+ * cookbook_http.c is the implementation.
  *
- * This allows ALL existing handlers to work unchanged with both servers.
+ * History: civetweb was removed in rc3. The shim is kept because it's
+ * a clean transport-isolation layer — handlers don't know or care that
+ * the wire-level implementation is apennines.
  */
-
-#ifdef COOKBOOK_USE_APENNINES_HTTP
 
 #include <apennines/t4/net/http_server.h>
 #include <stddef.h>
@@ -59,5 +58,4 @@ int shim_write(shim_connection *sc, const void *data, size_t len);
 int shim_read(shim_connection *sc, void *buf, size_t len);
 int shim_send_http_ok(shim_connection *sc, const char *content_type, long long len);
 
-#endif /* COOKBOOK_USE_APENNINES_HTTP */
 #endif /* COOKBOOK_HTTP_SHIM_H */

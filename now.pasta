@@ -19,7 +19,6 @@
       "vendor/alforno/src/main/c/alforno_include.c",
       "vendor/alforno/src/main/c/alforno_validate.c",
       "vendor/sqlite/sqlite3.c",
-      "vendor/civetweb/civetweb.c",
       "vendor/apennines/sources/t1/buffer/buf.c",
       "vendor/apennines/sources/t1/random/entropy.c",
       "vendor/apennines/sources/t1/sync/thread/thread.c",
@@ -66,7 +65,6 @@
       "vendor/alforno/src/main/h",
       "vendor/alforno/src/main/c",
       "vendor/sqlite",
-      "vendor/civetweb",
       "vendor/apennines/headers"
     ],
     defines: [
@@ -78,10 +76,6 @@
       "APENNINES_STATIC",
       "SQLITE_THREADSAFE=1",
       "SQLITE_OMIT_LOAD_EXTENSION",
-      "USE_IPV6=1",
-      "NO_SSL=1",
-      "NO_CGI=1",
-      "NO_CACHING=1",
       "BUILDING_COOKBOOK"
     ]
   },

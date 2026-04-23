@@ -13,9 +13,10 @@
 #include <apennines/t2/encoding/pem.h>
 #include <apennines/t3/crypto/pki.h>
 #include <apennines/t3/db/wal.h>
-#ifdef COOKBOOK_USE_APENNINES_HTTP
 #include "cookbook_http_shim.h"
-/* Redirect civetweb API to shim — makes all handlers work with both servers */
+/* Handlers use mg_* names by convention; the shim maps them to apennines
+ * http_ctx calls so handlers stay transport-agnostic. civetweb was
+ * removed in rc3 — this is the only HTTP path now. */
 #define mg_connection       shim_connection
 #define mg_request_info     shim_request_info
 #define mg_get_request_info shim_get_request_info
@@ -23,10 +24,6 @@
 #define mg_write            shim_write
 #define mg_read             shim_read
 #define mg_send_http_ok     shim_send_http_ok
-/* mg_start/mg_stop/mg_set_request_handler handled in #ifdef blocks */
-#else
-#include "civetweb.h"
-#endif
 #include "pasta.h"
 #include "apennines/t2/crypto/ct.h"
 
@@ -5617,8 +5614,7 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
     const char *colon = strrchr(url, ':');
     if (colon) port = colon + 1;
 
-#ifdef COOKBOOK_USE_APENNINES_HTTP
-    /* ---- apennines HTTP server path ---- */
+    /* ---- apennines HTTP server path (sole transport since rc3) ---- */
     {
         extern int cookbook_http_start(const char *, int,
                                        const unsigned char *, size_t,
@@ -5681,13 +5677,14 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
             free(srv);
             return NULL;
         }
-        /* cert/key DER buffers are owned by http_server now — but we keep
-         * the PEM scratch around because set_tls copies the DER bytes. */
+        /* set_tls copies the DER bytes, so we can free the scratch buffers. */
         buf_destroy(&cert_buf); buf_destroy(&key_buf);
         free(cert_pem); free(key_pem);
-        srv->ctx = NULL; /* no civetweb context */
+        srv->ctx = NULL; /* http_server lives in cookbook_http.c */
 
-        /* register all routes via shim dispatch table */
+        /* Register all routes through the shim dispatch table. The shim
+         * wires a single splat catch-all onto apennines http_server and
+         * does longest-prefix matching internally — civetweb semantics. */
         extern void cookbook_http_add_route(const char *pattern, void *handler);
         extern void cookbook_http_register_routes(void *srv);
 
@@ -5718,78 +5715,7 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
         cookbook_http_add_route("/admin/policies", handle_admin_policies);
 
         cookbook_http_register_routes(srv);
-        fprintf(stdout, "cookbook: using apennines HTTP server\n");
     }
-#else
-    /* ---- civetweb path (default, battle-tested) ---- */
-    const char *civetweb_opts[] = {
-        "listening_ports", port,
-        "num_threads", "4",
-        "request_timeout_ms", "30000",
-        NULL
-    };
-
-    srv->ctx = mg_start(NULL, NULL, civetweb_opts);
-    if (!srv->ctx) {
-        fprintf(stderr, "cookbook: failed to start civetweb on port %s\n", port);
-        free(srv->registry_id);
-        free(srv);
-        return NULL;
-    }
-
-    /* register route handlers */
-    mg_set_request_handler(srv->ctx, "/healthz", handle_healthz, srv);
-    mg_set_request_handler(srv->ctx, "/readyz", handle_readyz, srv);
-    mg_set_request_handler(srv->ctx, "/.well-known/now-registry-key",
-                           handle_registry_key, srv);
-    mg_set_request_handler(srv->ctx, "/.well-known/now-registry",
-                           handle_registry_discovery, srv);
-    mg_set_request_handler(srv->ctx, "/auth/token", handle_auth_token, srv);
-    mg_set_request_handler(srv->ctx, "/auth/revoke", handle_auth_revoke, srv);
-    mg_set_request_handler(srv->ctx, "/auth/device/token",
-                           handle_auth_device_token, srv);
-    mg_set_request_handler(srv->ctx, "/auth/device/verify",
-                           handle_auth_device_verify, srv);
-    mg_set_request_handler(srv->ctx, "/auth/device",
-                           handle_auth_device, srv);
-    mg_set_request_handler(srv->ctx, "/keys", handle_keys, srv);
-    mg_set_request_handler(srv->ctx, "/metrics", handle_metrics, srv);
-    mg_set_request_handler(srv->ctx, "/mirror/manifest", handle_mirror_manifest, srv);
-    mg_set_request_handler(srv->ctx, "/resolve/", handle_resolve, srv);
-    mg_set_request_handler(srv->ctx, "/artifact/", handle_artifact, srv);
-
-    /* grid federation endpoints */
-    if (srv->grid_enabled) {
-        mg_set_request_handler(srv->ctx, "/grid/resolve/",
-                               handle_grid_resolve, srv);
-        mg_set_request_handler(srv->ctx, "/grid/artifact/",
-                               handle_grid_artifact, srv);
-        mg_set_request_handler(srv->ctx, "/grid/manifest",
-                               handle_grid_manifest, srv);
-        mg_set_request_handler(srv->ctx, "/admin/peers",
-                               handle_admin_peers, srv);
-    }
-
-    /* object cache endpoints */
-    mg_set_request_handler(srv->ctx, "/objects/",
-                           handle_objects, srv);
-
-    /* build graph cache */
-    mg_set_request_handler(srv->ctx, "/graphs/",
-                           handle_graphs, srv);
-
-    /* group management endpoints */
-    mg_set_request_handler(srv->ctx, "/admin/groups",
-                           handle_admin_groups, srv);
-
-    /* credential management endpoints */
-    mg_set_request_handler(srv->ctx, "/admin/credentials",
-                           handle_admin_credentials, srv);
-
-    /* auth v2: policy admin endpoints */
-    mg_set_request_handler(srv->ctx, "/admin/policies",
-                           handle_admin_policies, srv);
-#endif /* !COOKBOOK_USE_APENNINES_HTTP */
 
     /* #20: start reconciliation thread */
     srv->reconcile_running = 1;
@@ -5819,7 +5745,9 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
 }
 
 int cookbook_server_poll(cookbook_server *srv, int timeout_ms) {
-    if (!srv || !srv->ctx) return -1;
+    if (!srv) return -1;
+    /* HTTP accept loop runs on its own thread inside apennines http_server.
+     * Poll is just a sleep so main() can honour SIGINT/SIGTERM. */
 #ifdef _WIN32
     Sleep((DWORD)timeout_ms);
 #else
@@ -5845,14 +5773,10 @@ void cookbook_server_stop(cookbook_server *srv) {
 
     cookbook_grid_destroy_pool();
 
-#ifdef COOKBOOK_USE_APENNINES_HTTP
     {
         extern void cookbook_http_stop(void);
         cookbook_http_stop();
     }
-#else
-    if (srv->ctx) mg_stop(srv->ctx);
-#endif
 
     /* clean up revocation list */
     cookbook_revocation_free(&srv->revocations);

@@ -109,23 +109,6 @@ if(NOT WIN32)
     target_link_libraries(sqlite3 PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 endif()
 
-# ---------- vendor: civetweb (MIT) ----------
-
-add_library(civetweb STATIC vendor/civetweb/civetweb.c)
-target_include_directories(civetweb PUBLIC vendor/civetweb)
-target_compile_definitions(civetweb PRIVATE
-    USE_IPV6=1
-    NO_SSL=1
-    NO_CGI=1
-    NO_CACHING=1
-)
-if(WIN32)
-    target_link_libraries(civetweb PUBLIC ws2_32)
-else()
-    find_package(Threads REQUIRED)
-    target_link_libraries(civetweb PUBLIC Threads::Threads)
-endif()
-
 # ---------- optional: PostgreSQL (libpq) ----------
 
 find_package(PostgreSQL QUIET)
@@ -163,7 +146,7 @@ target_include_directories(cookbook
 
 target_compile_definitions(cookbook PUBLIC COOKBOOK_STATIC)
 target_compile_definitions(cookbook PRIVATE BUILDING_COOKBOOK)
-target_link_libraries(cookbook PUBLIC sqlite3 civetweb basta alforno apennines)
+target_link_libraries(cookbook PUBLIC sqlite3 basta alforno apennines)
 if(WIN32)
     target_link_libraries(cookbook PUBLIC bcrypt)
 endif()
@@ -187,10 +170,6 @@ target_link_libraries(cookbook_server PRIVATE cookbook)
 # Fully static build option — eliminates MinGW DLL dependencies.
 # Enable with: cmake --preset default -DCOOKBOOK_STATIC_LINK=ON
 option(COOKBOOK_STATIC_LINK "Link executables fully static (no DLLs)" OFF)
-option(COOKBOOK_USE_APENNINES_HTTP "Use apennines HTTP server instead of civetweb" OFF)
-if(COOKBOOK_USE_APENNINES_HTTP)
-    target_compile_definitions(cookbook PRIVATE COOKBOOK_USE_APENNINES_HTTP)
-endif()
 if(COOKBOOK_STATIC_LINK AND WIN32)
     target_link_options(cookbook_server PRIVATE -static)
 endif()

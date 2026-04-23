@@ -1,6 +1,6 @@
 # cookbook — Roadmap
 
-**Version**: 1.0-rc2
+**Version**: 1.0-rc3
 **Status as of**: 2026-03-22
 **Spec reference**: cookbook-architecture-M1.docx (d3 final)
 
@@ -301,3 +301,29 @@ Follow-on milestone. Dependency surface shrinks, Phase 3 (civetweb→apennines H
 - `now.pasta` descriptor structure
 
 Phase 3 flag flip + civetweb removal is deferred to the formal Nova cutover milestone; cookbook 1.0 final will ship on civetweb.
+
+---
+
+## 1.0-rc3 Summary
+
+Nova-alignment milestone. Civetweb is gone; the organization-wide push to apennines-first consolidation officially begins.
+
+**Key deltas vs rc2:**
+
+- **Civetweb removed.** `vendor/civetweb/` deleted, CMake target deleted, `COOKBOOK_USE_APENNINES_HTTP` flag deleted (no longer optional — apennines http_server is the only HTTP transport). `#else` civetweb branches in `cookbook_server.c` removed. The shim (`cookbook_http.c` + `cookbook_http_shim.h`) stays — it's a clean handler-facing adapter layer, transport-agnostic.
+- **`vendor/pasta/` submodule removed** (dead weight — superseded by basta in the rc1 era, just hadn't been cleaned up).
+- **`now` build: 2.2MB → 2.0MB** after civetweb drop.
+- **Tests:** 617/617 pass on default CMake and `now` builds. Live smoke test green (HTTP + HTTPS endpoints all respond correctly).
+
+**Remaining vendored third-party dependencies:**
+- `apennines` — our strategic dep, grows
+- `basta` + `alforno` (IridiumFX submodules) — apennines now has native `t4/pasta/` + `t4/pasta/alforno.h`; migration scheduled for rc4
+- `sqlite` — last pure external; apennines has `t4/db/database.h` but data-format migration is its own milestone
+- `libpq` (optional, system-provided) — stays (not in apennines' territory)
+
+**Platform libs (unavoidable):** pthread (Unix), ws2_32 / bcrypt / advapi32 (Windows), libdl (Unix).
+
+**What did NOT change:**
+- Public HTTP API surface
+- Database schema / credential format
+- Environment variable names and semantics

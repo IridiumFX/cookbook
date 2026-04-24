@@ -209,7 +209,11 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* database */
+    /* database — backend chosen by the URL scheme / suffix of COOKBOOK_DB_URL:
+     *   postgres:// or postgresql://  -> libpq backend
+     *   *.kv                          -> apennines append-only KV
+     *   *.apennines or apennines://   -> apennines t4/db/database (embedded SQL)
+     *   anything else (or unset)      -> SQLite (default) */
     cookbook_db *db;
     if (db_url && (strstr(db_url, "postgres://") || strstr(db_url, "postgresql://"))) {
         db = cookbook_db_open_postgres(db_url);
@@ -225,6 +229,17 @@ int main(int argc, char **argv) {
             return 1;
         }
         printf("cookbook: database: KV store (%s)\n", db_url);
+    } else if (db_url && (strstr(db_url, "apennines://") == db_url ||
+                          strstr(db_url, ".apennines") != NULL)) {
+        const char *ap_path = (strstr(db_url, "apennines://") == db_url)
+                            ? db_url + strlen("apennines://")
+                            : db_url;
+        db = cookbook_db_open_apennines(ap_path);
+        if (!db) {
+            fprintf(stderr, "cookbook: failed to open apennines DB: %s\n", ap_path);
+            return 1;
+        }
+        printf("cookbook: database: apennines t4/db/database (%s)\n", ap_path);
     } else {
         const char *sqlite_path = db_url ? db_url : "cookbook.db";
         db = cookbook_db_open_sqlite(sqlite_path);

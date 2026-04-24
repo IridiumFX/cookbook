@@ -42,7 +42,9 @@ add_library(apennines STATIC
     vendor/apennines/sources/t3/async/threadpool.c
     vendor/apennines/sources/t3/crypto/pki.c
     vendor/apennines/sources/t3/db/kv.c
+    vendor/apennines/sources/t3/db/sql.c
     vendor/apennines/sources/t3/db/wal.c
+    vendor/apennines/sources/t4/db/database.c
     vendor/apennines/sources/t3/net/http.c
     vendor/apennines/sources/t3/net/tcp.c
     vendor/apennines/sources/t3/net/dns.c

@@ -68,6 +68,12 @@ COOKBOOK_API cookbook_db *cookbook_db_open_kv(const char *path);
    Returns NULL if libpq is not available or connection fails. */
 COOKBOOK_API cookbook_db *cookbook_db_open_postgres(const char *conninfo);
 
+/* Apennines t4/db/database backend — embedded SQL engine with WAL +
+   B-tree + MVCC, same family as the rest of apennines. Not sqlite-file
+   compatible; dump-and-load migration only. INSERT-heavy workloads
+   outperform sqlite 12-20x; SELECT-heavy the reverse. */
+COOKBOOK_API cookbook_db *cookbook_db_open_apennines(const char *path);
+
 COOKBOOK_API cookbook_db_status cookbook_db_migrate(cookbook_db *db);
 
 #endif /* COOKBOOK_DB_H */

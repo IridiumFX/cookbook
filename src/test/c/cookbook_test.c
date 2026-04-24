@@ -2618,15 +2618,18 @@ static void test_credential_admin_lifecycle(void) {
     char *hash = cookbook_credential_hash("secret123");
     ASSERT(hash != NULL, "cred admin: hash ok");
 
+    char now_iso[20];
+    cookbook_now_iso(now_iso);
     cookbook_db_param ip[] = {
         COOKBOOK_P_TEXT("alice"),
         COOKBOOK_P_TEXT(hash),
-        COOKBOOK_P_TEXT("admin,publish")
+        COOKBOOK_P_TEXT("admin,publish"),
+        COOKBOOK_P_TEXT(now_iso)
     };
     ASSERT(db->exec_p(db,
         "INSERT INTO credentials (subject, token_hash, groups, created_at) "
-        "VALUES (?1, ?2, ?3, datetime('now'))",
-        ip, 3) == COOKBOOK_DB_OK, "cred admin: insert alice");
+        "VALUES (?1, ?2, ?3, ?4)",
+        ip, 4) == COOKBOOK_DB_OK, "cred admin: insert alice");
 
     /* verify credential works */
     ASSERT(cookbook_credential_verify("secret123", hash) == 0,
@@ -2647,11 +2650,16 @@ static void test_credential_admin_lifecycle(void) {
            "cred admin: groups include admin");
 
     /* revoke credential */
-    cookbook_db_param rp[] = { COOKBOOK_P_TEXT("alice") };
+    char rev_iso[20];
+    cookbook_now_iso(rev_iso);
+    cookbook_db_param rp[] = {
+        COOKBOOK_P_TEXT(rev_iso),
+        COOKBOOK_P_TEXT("alice")
+    };
     ASSERT(db->exec_p(db,
-        "UPDATE credentials SET revoked_at = datetime('now') "
-        "WHERE subject = ?1 AND revoked_at IS NULL",
-        rp, 1) == COOKBOOK_DB_OK, "cred admin: revoke ok");
+        "UPDATE credentials SET revoked_at = ?1 "
+        "WHERE subject = ?2 AND revoked_at IS NULL",
+        rp, 2) == COOKBOOK_DB_OK, "cred admin: revoke ok");
 
     /* lookup after revoke should fail */
     test_cred_ctx lctx2 = { {0}, {0}, 0 };
@@ -2664,16 +2672,19 @@ static void test_credential_admin_lifecycle(void) {
     /* re-create after revoke (INSERT OR REPLACE) */
     char *hash2 = cookbook_credential_hash("newsecret");
     ASSERT(hash2 != NULL, "cred admin: hash2 ok");
+    char now_iso2[20];
+    cookbook_now_iso(now_iso2);
     cookbook_db_param ip2[] = {
         COOKBOOK_P_TEXT("alice"),
         COOKBOOK_P_TEXT(hash2),
-        COOKBOOK_P_TEXT("readonly")
+        COOKBOOK_P_TEXT("readonly"),
+        COOKBOOK_P_TEXT(now_iso2)
     };
     ASSERT(db->exec_p(db,
         "INSERT OR REPLACE INTO credentials "
         "(subject, token_hash, groups, created_at, revoked_at) "
-        "VALUES (?1, ?2, ?3, datetime('now'), NULL)",
-        ip2, 3) == COOKBOOK_DB_OK, "cred admin: re-create ok");
+        "VALUES (?1, ?2, ?3, ?4, NULL)",
+        ip2, 4) == COOKBOOK_DB_OK, "cred admin: re-create ok");
 
     /* new credential works */
     test_cred_ctx lctx3 = { {0}, {0}, 0 };

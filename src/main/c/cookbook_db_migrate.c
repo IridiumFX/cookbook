@@ -1,5 +1,19 @@
 #include "cookbook_db.h"
 
+#include <stdio.h>
+#include <time.h>
+
+void cookbook_now_iso(char out[20]) {
+    time_t t = time(NULL);
+    struct tm tm;
+#ifdef _WIN32
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    strftime(out, 20, "%Y-%m-%d %H:%M:%S", &tm);
+}
+
 static const char *SCHEMA_SQL =
     "CREATE TABLE IF NOT EXISTS groups ("
     "  group_id    TEXT PRIMARY KEY,"
@@ -61,7 +75,7 @@ static const char *SCHEMA_SQL =
     "  subject     TEXT PRIMARY KEY,"
     "  kind        TEXT NOT NULL DEFAULT 'user',"
     "  pastlet     TEXT NOT NULL,"
-    "  updated_at  TEXT NOT NULL DEFAULT (datetime('now'))"
+    "  updated_at  TEXT NOT NULL"   /* caller binds cookbook_now_iso() */
     ");"
 
     "CREATE TABLE IF NOT EXISTS revocations ("

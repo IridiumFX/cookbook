@@ -13,16 +13,19 @@
 COOKBOOK_API int cookbook_policy_put(cookbook_db *db, const char *subject,
                                     const char *kind, const char *pastlet) {
     if (!db || !subject || !kind || !pastlet) return -1;
+    char now_iso[20];
+    cookbook_now_iso(now_iso);
     cookbook_db_param params[] = {
         COOKBOOK_P_TEXT(subject),
         COOKBOOK_P_TEXT(kind),
-        COOKBOOK_P_TEXT(pastlet)
+        COOKBOOK_P_TEXT(pastlet),
+        COOKBOOK_P_TEXT(now_iso)
     };
     cookbook_db_status st = db->exec_p(db,
         "INSERT OR REPLACE INTO policies "
         "(subject, kind, pastlet, updated_at) "
-        "VALUES (?1, ?2, ?3, datetime('now'))",
-        params, 3);
+        "VALUES (?1, ?2, ?3, ?4)",
+        params, 4);
     return (st == COOKBOOK_DB_OK) ? 0 : -1;
 }
 

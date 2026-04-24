@@ -4318,6 +4318,8 @@ static int handle_admin_peers(struct mg_connection *conn, void *cbdata) {
             pk_sql = public_key;
         }
 
+        char now_iso[20];
+        cookbook_now_iso(now_iso);
         cookbook_db_param pp2[] = {
             COOKBOOK_P_TEXT(peer_id),
             COOKBOOK_P_TEXT(name),
@@ -4325,14 +4327,15 @@ static int handle_admin_peers(struct mg_connection *conn, void *cbdata) {
             COOKBOOK_P_TEXT(mode_str),
             COOKBOOK_P_INT(priority),
             pk_sql ? (cookbook_db_param)COOKBOOK_P_TEXT(pk_sql)
-                   : (cookbook_db_param)COOKBOOK_P_NULL()
+                   : (cookbook_db_param)COOKBOOK_P_NULL(),
+            COOKBOOK_P_TEXT(now_iso)
         };
         /* upsert: try insert, on conflict update */
         cookbook_db_status st = srv->db->exec_p(srv->db,
             "INSERT OR REPLACE INTO peers "
             "(peer_id, name, url, mode, priority, enabled, public_key, added_at) "
-            "VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, datetime('now'))",
-            pp2, 6);
+            "VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7)",
+            pp2, 7);
 
         if (st != COOKBOOK_DB_OK) {
             send_json(conn, 500, "{\"error\":\"Database error\"}\n");
@@ -5119,11 +5122,16 @@ static int handle_admin_credentials(struct mg_connection *conn, void *cbdata) {
 
     if (strcmp(ri->request_method, "POST") == 0 && is_revoke && subject[0]) {
         /* POST /admin/credentials/{subject}/revoke */
-        cookbook_db_param rp[] = { COOKBOOK_P_TEXT(subject) };
+        char now_iso[20];
+        cookbook_now_iso(now_iso);
+        cookbook_db_param rp[] = {
+            COOKBOOK_P_TEXT(now_iso),
+            COOKBOOK_P_TEXT(subject)
+        };
         int rc = srv->db->exec_p(srv->db,
-            "UPDATE credentials SET revoked_at = datetime('now') "
-            "WHERE subject = ?1 AND revoked_at IS NULL",
-            rp, 1);
+            "UPDATE credentials SET revoked_at = ?1 "
+            "WHERE subject = ?2 AND revoked_at IS NULL",
+            rp, 2);
         if (rc == COOKBOOK_DB_OK) {
             METRIC_INC(srv->metrics.responses_2xx);
             audit_log(srv, "admin", subject, "credential-revoke", "ok");
@@ -5204,16 +5212,19 @@ static int handle_admin_credentials(struct mg_connection *conn, void *cbdata) {
         }
 
         /* insert or update */
+        char now_iso[20];
+        cookbook_now_iso(now_iso);
         cookbook_db_param ip[] = {
             COOKBOOK_P_TEXT(cred_sub),
             COOKBOOK_P_TEXT(hash),
-            COOKBOOK_P_TEXT(groups)
+            COOKBOOK_P_TEXT(groups),
+            COOKBOOK_P_TEXT(now_iso)
         };
         int rc = srv->db->exec_p(srv->db,
             "INSERT OR REPLACE INTO credentials "
             "(subject, token_hash, groups, created_at, revoked_at) "
-            "VALUES (?1, ?2, ?3, datetime('now'), NULL)",
-            ip, 3);
+            "VALUES (?1, ?2, ?3, ?4, NULL)",
+            ip, 4);
         free(hash);
 
         if (rc == COOKBOOK_DB_OK) {

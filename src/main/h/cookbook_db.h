@@ -76,4 +76,11 @@ COOKBOOK_API cookbook_db *cookbook_db_open_apennines(const char *path);
 
 COOKBOOK_API cookbook_db_status cookbook_db_migrate(cookbook_db *db);
 
+/* Format current UTC time into out[20] as "YYYY-MM-DD HH:MM:SS\0" —
+ * the exact wire shape sqlite's datetime('now') produces. Used by
+ * cookbook INSERT/UPDATE call sites that store timestamps; keeping it
+ * caller-side means the SQL is portable across all four backends
+ * (sqlite / apennines / PostgreSQL / kv). out must be ≥ 20 bytes. */
+COOKBOOK_API void cookbook_now_iso(char out[20]);
+
 #endif /* COOKBOOK_DB_H */

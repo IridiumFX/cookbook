@@ -229,6 +229,14 @@ int main(int argc, char **argv) {
             return 1;
         }
         printf("cookbook: database: KV store (%s)\n", db_url);
+    } else if (db_url && strstr(db_url, "apennines-btree://") == db_url) {
+        const char *ap_path = db_url + strlen("apennines-btree://");
+        db = cookbook_db_open_apennines_btree(ap_path);
+        if (!db) {
+            fprintf(stderr, "cookbook: failed to open apennines-btree DB: %s\n", ap_path);
+            return 1;
+        }
+        printf("cookbook: database: apennines t4/db/database (btree, %s)\n", ap_path);
     } else if (db_url && (strstr(db_url, "apennines://") == db_url ||
                           strstr(db_url, ".apennines") != NULL)) {
         const char *ap_path = (strstr(db_url, "apennines://") == db_url)
@@ -239,7 +247,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "cookbook: failed to open apennines DB: %s\n", ap_path);
             return 1;
         }
-        printf("cookbook: database: apennines t4/db/database (%s)\n", ap_path);
+        printf("cookbook: database: apennines t4/db/database (hash-kv, %s)\n", ap_path);
     } else {
         const char *sqlite_path = db_url ? db_url : "cookbook.db";
         db = cookbook_db_open_sqlite(sqlite_path);

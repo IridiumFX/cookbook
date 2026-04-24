@@ -75,6 +75,80 @@ static unsigned long kv_vt_iter_create(db_storage_iter **out, void *handle,
     *out = it;
     return 0;
 }
+/* probe_first/last for kv: scan prefix (hash-bucket order) and
+ * track lex-extreme. O(N) in matching-set size. */
+static unsigned long kv_vt_probe_first(u8 **out_k, u64 *out_kl,
+                                        u8 **out_v, u64 *out_vl,
+                                        void *handle,
+                                        const u8 *prefix, u64 plen) {
+    kv_iter *it = NULL;
+    if (kv_iter_create(&it, (kv_store *)handle, prefix, plen) != 0) return 5;
+    const u8 *k; u64 kl;
+    const u8 *v; u64 vl;
+    u8 *best_k = NULL; u64 best_kl = 0;
+    u8 *best_v = NULL; u64 best_vl = 0;
+    while (kv_iter_next(&k, &kl, &v, &vl, it) == 0) {
+        int take;
+        if (!best_k) take = 1;
+        else {
+            u64 cmp_len = kl < best_kl ? kl : best_kl;
+            int c = memcmp(k, best_k, cmp_len);
+            if (c < 0)      take = 1;
+            else if (c > 0) take = 0;
+            else            take = (kl < best_kl);
+        }
+        if (take) {
+            u8 *nk = (u8 *)realloc(best_k, kl ? kl : 1);
+            u8 *nv = (u8 *)realloc(best_v, vl ? vl : 1);
+            if (!nk || !nv) { free(nk ? nk : best_k); free(nv ? nv : best_v); kv_iter_destroy(it); return 4; }
+            best_k = nk; best_v = nv;
+            memcpy(best_k, k, kl); best_kl = kl;
+            if (vl) memcpy(best_v, v, vl); best_vl = vl;
+        }
+    }
+    kv_iter_destroy(it);
+    if (!best_k) return 5;
+    *out_k = best_k; *out_kl = best_kl;
+    *out_v = best_v; *out_vl = best_vl;
+    return 0;
+}
+
+static unsigned long kv_vt_probe_last(u8 **out_k, u64 *out_kl,
+                                       u8 **out_v, u64 *out_vl,
+                                       void *handle,
+                                       const u8 *prefix, u64 plen) {
+    kv_iter *it = NULL;
+    if (kv_iter_create(&it, (kv_store *)handle, prefix, plen) != 0) return 5;
+    const u8 *k; u64 kl;
+    const u8 *v; u64 vl;
+    u8 *best_k = NULL; u64 best_kl = 0;
+    u8 *best_v = NULL; u64 best_vl = 0;
+    while (kv_iter_next(&k, &kl, &v, &vl, it) == 0) {
+        int take;
+        if (!best_k) take = 1;
+        else {
+            u64 cmp_len = kl < best_kl ? kl : best_kl;
+            int c = memcmp(k, best_k, cmp_len);
+            if (c > 0)      take = 1;
+            else if (c < 0) take = 0;
+            else            take = (kl > best_kl);
+        }
+        if (take) {
+            u8 *nk = (u8 *)realloc(best_k, kl ? kl : 1);
+            u8 *nv = (u8 *)realloc(best_v, vl ? vl : 1);
+            if (!nk || !nv) { free(nk ? nk : best_k); free(nv ? nv : best_v); kv_iter_destroy(it); return 4; }
+            best_k = nk; best_v = nv;
+            memcpy(best_k, k, kl); best_kl = kl;
+            if (vl) memcpy(best_v, v, vl); best_vl = vl;
+        }
+    }
+    kv_iter_destroy(it);
+    if (!best_k) return 5;
+    *out_k = best_k; *out_kl = best_kl;
+    *out_v = best_v; *out_vl = best_vl;
+    return 0;
+}
+
 static unsigned long kv_vt_compact(void *handle) {
     return kv_compact((kv_store *)handle);
 }
@@ -87,6 +161,8 @@ static const db_storage_vt KV_VT = {
     kv_vt_open, kv_vt_close,
     kv_vt_put, kv_vt_get, kv_vt_del,
     kv_vt_iter_create,
+    kv_vt_probe_first, kv_vt_probe_last,
+    0,   /* sorted_iter = false — kv_iter is hash-bucket order */
     kv_vt_compact, kv_vt_flush
 };
 
@@ -189,6 +265,97 @@ static unsigned long bt_iter_next_impl(const u8 **out_k, u64 *out_kl,
     *out_v = e->v;  *out_vl = e->vl;
     return 0;
 }
+/* btree probe_first: single seek GE(prefix). Returns if the seek lands
+ * on a key that starts with `prefix`, else miss. O(log N). */
+static unsigned long bt_vt_probe_first(u8 **out_k, u64 *out_kl,
+                                        u8 **out_v, u64 *out_vl,
+                                        void *handle,
+                                        const u8 *prefix, u64 plen) {
+    dbtree_cursor *cur = NULL;
+    unsigned long rc;
+    if (prefix && plen > 0) {
+        rc = dbtree_seek(&cur, (dbtree *)handle, prefix, plen, DBTREE_SEEK_GE);
+    } else {
+        rc = dbtree_seek(&cur, (dbtree *)handle, NULL, 0, DBTREE_SEEK_FIRST);
+    }
+    if (rc == 6) return 5;     /* empty tree / no match */
+    if (rc) return rc;
+
+    const u8 *k; u64 kl;
+    if (dbtree_cursor_key(&k, &kl, cur) != 0) { dbtree_cursor_close(cur); return 5; }
+    if (!prefix_matches(k, kl, prefix, plen)) { dbtree_cursor_close(cur); return 5; }
+
+    u8 *kcp = (u8 *)malloc(kl ? kl : 1);
+    if (!kcp) { dbtree_cursor_close(cur); return 4; }
+    memcpy(kcp, k, kl);
+
+    u8 *vbuf = NULL; u64 vl = 0;
+    if (dbtree_cursor_value(&vbuf, &vl, cur) != 0) {
+        free(kcp); dbtree_cursor_close(cur); return 5;
+    }
+    dbtree_cursor_close(cur);
+
+    *out_k = kcp; *out_kl = kl;
+    *out_v = vbuf; *out_vl = vl;
+    return 0;
+}
+
+/* btree probe_last: construct an upper bound by bumping the last
+ * non-0xFF byte of `prefix`, then SEEK_LT to that bound and step back.
+ * If no such bound exists (prefix is all 0xFF), fall back to SEEK_LAST
+ * and verify the prefix. O(log N). */
+static unsigned long bt_vt_probe_last(u8 **out_k, u64 *out_kl,
+                                       u8 **out_v, u64 *out_vl,
+                                       void *handle,
+                                       const u8 *prefix, u64 plen) {
+    dbtree_cursor *cur = NULL;
+    unsigned long rc;
+    if (prefix && plen > 0) {
+        /* Compute successor bound. */
+        u8 upper[512];
+        if (plen > sizeof(upper)) return 5;  /* too long — caller unlikely */
+        memcpy(upper, prefix, plen);
+        u64 ulen = plen;
+        int bumped = 0;
+        while (ulen > 0) {
+            if (upper[ulen - 1] != 0xFF) { upper[ulen - 1]++; bumped = 1; break; }
+            ulen--;
+        }
+        if (bumped) {
+            rc = dbtree_seek(&cur, (dbtree *)handle, upper, ulen, DBTREE_SEEK_LT);
+            if (rc == 6) return 5;
+            if (rc) return rc;
+        } else {
+            /* All 0xFF — fall back to LAST */
+            rc = dbtree_seek(&cur, (dbtree *)handle, NULL, 0, DBTREE_SEEK_LAST);
+            if (rc == 6) return 5;
+            if (rc) return rc;
+        }
+    } else {
+        rc = dbtree_seek(&cur, (dbtree *)handle, NULL, 0, DBTREE_SEEK_LAST);
+        if (rc == 6) return 5;
+        if (rc) return rc;
+    }
+
+    const u8 *k; u64 kl;
+    if (dbtree_cursor_key(&k, &kl, cur) != 0) { dbtree_cursor_close(cur); return 5; }
+    if (!prefix_matches(k, kl, prefix, plen)) { dbtree_cursor_close(cur); return 5; }
+
+    u8 *kcp = (u8 *)malloc(kl ? kl : 1);
+    if (!kcp) { dbtree_cursor_close(cur); return 4; }
+    memcpy(kcp, k, kl);
+
+    u8 *vbuf = NULL; u64 vl = 0;
+    if (dbtree_cursor_value(&vbuf, &vl, cur) != 0) {
+        free(kcp); dbtree_cursor_close(cur); return 5;
+    }
+    dbtree_cursor_close(cur);
+
+    *out_k = kcp; *out_kl = kl;
+    *out_v = vbuf; *out_vl = vl;
+    return 0;
+}
+
 static unsigned long bt_vt_compact(void *handle) {
     (void)handle;
     return 0;    /* btree has no append-only log to compact */
@@ -201,6 +368,8 @@ static const db_storage_vt BTREE_VT = {
     bt_vt_open, bt_vt_close,
     bt_vt_put, bt_vt_get, bt_vt_del,
     bt_vt_iter_create,
+    bt_vt_probe_first, bt_vt_probe_last,
+    1,   /* sorted_iter = true — btree iterates in lex order */
     bt_vt_compact, bt_vt_flush
 };
 

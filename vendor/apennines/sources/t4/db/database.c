@@ -58,6 +58,18 @@ typedef struct {
     int   primary_key;  /* 1 if PRIMARY KEY */
     int   not_null;     /* 1 if NOT NULL */
     int   unique;       /* 1 if column-level UNIQUE */
+    /* DEFAULT clause — applied when INSERT omits the column.
+     * has_default=0 leaves the column NULL (current default).
+     * For literal defaults like `DEFAULT 0` or `DEFAULT 'active'`
+     * the literal text is stored verbatim (quotes handled by the
+     * tokenizer). For function defaults like `DEFAULT (datetime('now'))`
+     * we store the function name in default_fn plus the inner arg
+     * (typically 'now') in default_text; exec_insert evaluates via
+     * the same eval_func_call helper used for inline VALUES. */
+    int   has_default;
+    int   default_is_fn;   /* 1 if default is a function call */
+    char  default_text[128];  /* literal text OR function's arg */
+    char  default_fn[32];     /* function name if default_is_fn */
 } db_col_def;
 
 /* Composite UNIQUE constraint. Up to DB_MAX_UNIQUE_SETS per table,
@@ -118,6 +130,11 @@ typedef struct {
     u32           fk_count;
     db_index      indexes[DB_MAX_INDEXES];
     u32           index_count;
+    /* Cached row count — O(1) for COUNT(*). Maintained by INSERT/
+     * DELETE; recomputed from a scan on db_open and on rollback
+     * (because mid-txn mutations got discarded). Not serialised in
+     * meta: keeping it derivable avoids meta-format migration. */
+    i64           row_count;
 } db_table;
 
 /* ------------------------------------------------------------------ */
@@ -227,6 +244,12 @@ typedef struct {
     i64        imin, imax;
     double     fmin, fmax;
     int        have_any;    /* 1 once MIN/MAX has seen at least one value */
+    /* TEXT/BLOB MIN/MAX: lex-compare bytes, track current extreme.
+     * saw_text is 1 when the tracked column is text — at resolve time
+     * we emit TEXT instead of INTEGER/REAL. */
+    int        saw_text;
+    u8        *tmin;  u64 tmin_len;
+    u8        *tmax;  u64 tmax_len;
 } db_agg_spec;
 
 struct db_stmt {
@@ -253,6 +276,19 @@ struct db_stmt {
     char         *sel_cols[DB_MAX_COLUMNS];
     u32           sel_col_count;
     int           sel_star;     /* 1 if SELECT * */
+
+    /* SELECT DISTINCT state. Streaming dedup: each row that would
+     * otherwise be emitted gets a fingerprint built from its
+     * projected columns (or full row for *). The fingerprint is
+     * compared against previously-seen keys; duplicates are skipped.
+     * Linear scan is fine for typical distinct cardinalities (tens
+     * to low thousands); a consumer pushing on very large distinct
+     * sets would motivate a hash-set upgrade. */
+    int           is_distinct;
+    u8          **distinct_keys;
+    u64          *distinct_key_lens;
+    u64           distinct_count;
+    u64           distinct_cap;
 
     /* LIMIT / OFFSET. has_limit=0 means unlimited. */
     int           has_limit;
@@ -691,11 +727,18 @@ static u64 row_serialize(const db_row *r, u8 *buf, u64 cap) {
 }
 
 static int row_deserialize(db_row *r, const u8 *buf, u64 len) {
-    memset(r, 0, sizeof(*r));
     u64 pos = 0;
     if (pos + 2 > len) return -1;
     r->col_count = read_u16_le(buf + pos); pos += 2;
     if (r->col_count > DB_MAX_COLUMNS) return -1;
+    /* row_free iterates 0..col_count-1 and calls free on any non-NULL
+     * bvals[i]. We must ensure bvals is NULL for non-TEXT/BLOB cols so
+     * that invariant holds. types/ivals/fvals get fully written in the
+     * loop below; no need to pre-zero them. Narrowing this from the
+     * whole db_row (2.3 KB with DB_MAX_COLUMNS=64) to just the pointer
+     * array (512 bytes max) is the big win in the aggregate-scan
+     * hot loop — previously ~30% of per-row cost. */
+    memset(r->bvals, 0, (size_t)r->col_count * sizeof(r->bvals[0]));
     for (u32 i = 0; i < r->col_count; ++i) {
         if (pos + 1 > len) return -1;
         r->types[i] = buf[pos++];
@@ -877,6 +920,22 @@ static void push_undo(db_conn *db, const u8 *key, u64 klen);
 static unsigned long wal_put(db_conn *db, const u8 *key, u64 klen,
                                const u8 *val, u64 vlen);
 static unsigned long wal_del(db_conn *db, const u8 *key, u64 klen);
+static void recompute_row_count(db_conn *db, db_table *t);
+/* Used by exec_update / exec_delete to reuse the SELECT-path query
+ * planner for index-backed WHERE evaluation. Defined further down
+ * alongside the SELECT planner code. */
+static int planner_build(const sql_ast *where, const db_table *t,
+                           const db_index **out_ix,
+                           int *kind, int *col_type,
+                           char *eq_val, u64 eq_val_cap,
+                           int *has_lower, int *lower_inclusive,
+                           char *lower, u64 lower_cap,
+                           int *has_upper, int *upper_inclusive,
+                           char *upper, u64 upper_cap);
+static int idx_val_compare(int col_type, const char *a, const char *b);
+static int extract_first_val_from_idx_key(const u8 *k, u64 kl,
+                                            u64 prefix_len,
+                                            char *out, u64 cap);
 
 static unsigned long flush_meta(db_conn *db, db_table *t) {
     u8 key_buf[DB_MAX_KEY_LEN];
@@ -1838,6 +1897,7 @@ static unsigned long apply_fk_on_delete(db_conn *db,
                     }
                     delete_row_indexes(db, child, &row, matches[i].rowid);
                     wal_del(db, matches[i].k, matches[i].kl);
+                    child->row_count--;
                     db->changes++;
                 } else if (fk->on_delete == DB_FK_SETNULL
                            || fk->on_delete == DB_FK_SETDEFAULT) {
@@ -2098,7 +2158,7 @@ static int eval_func_call(char *buf, u64 buf_cap, const sql_ast *call) {
  * Used by INSERT OR REPLACE. Walks all rows, finds the colliding one,
  * deletes it (row + indexes). Returns 0 if no collision found or a row
  * was deleted; non-zero on storage error. */
-static unsigned long delete_conflicting_rows(db_conn *db, const db_table *t,
+static unsigned long delete_conflicting_rows(db_conn *db, db_table *t,
                                               const db_row *new_row) {
     if (t->unique_set_count == 0) return 0;
 
@@ -2164,6 +2224,7 @@ static unsigned long delete_conflicting_rows(db_conn *db, const db_table *t,
         if (wal_del(db, del_keys[i], del_klens[i]) != 0) rc = 1;
         row_free(&del_rows[i]);
         free(del_keys[i]);
+        t->row_count--;
     }
     return rc;
 }
@@ -2274,6 +2335,7 @@ static unsigned long exec_insert(db_conn *db, const sql_ast *ast) {
     rc = flush_meta(db, t);
     if (rc) return 8;
 
+    t->row_count++;
     db->last_insert_id = rowid;
     db->changes++;
     return 0;
@@ -2312,9 +2374,42 @@ static unsigned long exec_update(db_conn *db, const sql_ast *ast) {
         }
     }
 
-    /* Iterate rows */
+    /* Try planner: UPDATE ... WHERE indexed_col = lit can use the
+     * index to find matching rows directly instead of scanning.
+     * Cookbook's "UPDATE credentials SET ... WHERE subject = ?1"
+     * shape is the target — O(1) via index lookup vs O(N) table scan. */
+    const db_index *plan_ix = NULL;
+    int plan_kind = IDX_USE_NONE;
+    int plan_col_type = 0;
+    char plan_eq_val[256] = {0};
+    int plan_has_lower = 0, plan_lower_inc = 0;
+    int plan_has_upper = 0, plan_upper_inc = 0;
+    char plan_lower[256] = {0}, plan_upper[256] = {0};
+    int using_index = planner_build(where_node, t, &plan_ix, &plan_kind,
+                                      &plan_col_type,
+                                      plan_eq_val, sizeof(plan_eq_val),
+                                      &plan_has_lower, &plan_lower_inc,
+                                      plan_lower, sizeof(plan_lower),
+                                      &plan_has_upper, &plan_upper_inc,
+                                      plan_upper, sizeof(plan_upper));
+
     u8 prefix[DB_MAX_KEY_LEN];
-    u64 plen = build_prefix_key(prefix, sizeof(prefix), t->name);
+    u64 plen;
+    u64 idx_prefix_len = 0;
+    if (using_index && plan_kind == IDX_USE_EQ) {
+        const char *vs[1] = { plan_eq_val };
+        plen = build_idx_val_prefix_composite(prefix, sizeof(prefix),
+                                                t->name, plan_ix->name,
+                                                vs, 1);
+        idx_prefix_len = plen;
+    } else if (using_index && plan_kind == IDX_USE_RANGE) {
+        plen = build_idx_all_prefix(prefix, sizeof(prefix),
+                                      t->name, plan_ix->name);
+        idx_prefix_len = plen;
+    } else {
+        using_index = 0;
+        plen = build_prefix_key(prefix, sizeof(prefix), t->name);
+    }
     if (plen == 0) return 4;
 
     db_storage_iter *it = NULL;
@@ -2330,7 +2425,43 @@ static unsigned long exec_update(db_conn *db, const sql_ast *ast) {
     const u8 *v; u64 vl;
     while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) {
         db_row row;
-        if (row_deserialize(&row, v, vl) != 0) continue;
+        u8 row_key_buf[DB_MAX_KEY_LEN];
+        u64 row_key_len;
+        const u8 *eff_k = k;
+        u64 eff_kl = kl;
+
+        if (using_index) {
+            /* RANGE filter check against index entry's first-col value
+             * before we pay for the row fetch. */
+            if (plan_kind == IDX_USE_RANGE) {
+                char ev[256];
+                if (extract_first_val_from_idx_key(k, kl, idx_prefix_len,
+                                                     ev, sizeof(ev)) != 0) continue;
+                if (plan_has_lower) {
+                    int c = idx_val_compare(plan_col_type, ev, plan_lower);
+                    if (plan_lower_inc ? (c < 0) : (c <= 0)) continue;
+                }
+                if (plan_has_upper) {
+                    int c = idx_val_compare(plan_col_type, ev, plan_upper);
+                    if (plan_upper_inc ? (c > 0) : (c >= 0)) continue;
+                }
+            }
+            i64 rid = parse_rowid_from_idx_key(k, kl);
+            if (rid < 0) continue;
+            row_key_len = build_row_key(row_key_buf, sizeof(row_key_buf),
+                                         t->name, rid);
+            if (row_key_len == 0) continue;
+            u8 *rv = NULL; u64 rvl = 0;
+            if (db->vt->get(&rv, &rvl, db->storage, row_key_buf, row_key_len) != 0
+                || !rv) continue;
+            int drc = row_deserialize(&row, rv, rvl);
+            free(rv);
+            if (drc != 0) continue;
+            eff_k = row_key_buf;
+            eff_kl = row_key_len;
+        } else {
+            if (row_deserialize(&row, v, vl) != 0) continue;
+        }
 
         if (!eval_where(where_node, &row, t)) {
             row_free(&row);
@@ -2351,7 +2482,7 @@ static unsigned long exec_update(db_conn *db, const sql_ast *ast) {
          * bail the whole UPDATE with hatch 9 (transactionally, every
          * pending change is discarded because we haven't applied them
          * yet). */
-        if (check_unique_constraints(db, t, &row, k, kl) != 0) {
+        if (check_unique_constraints(db, t, &row, eff_k, eff_kl) != 0) {
             row_free(&row);
             for (u64 p = 0; p < pend_count; ++p) {
                 free(pending[p].key);
@@ -2388,11 +2519,11 @@ static unsigned long exec_update(db_conn *db, const sql_ast *ast) {
             pending = tmp;
             pend_cap = nc;
         }
-        pending[pend_count].key = malloc(kl);
+        pending[pend_count].key = malloc(eff_kl);
         pending[pend_count].val = malloc(rlen);
         if (pending[pend_count].key && pending[pend_count].val) {
-            memcpy(pending[pend_count].key, k, kl);
-            pending[pend_count].klen = kl;
+            memcpy(pending[pend_count].key, eff_k, eff_kl);
+            pending[pend_count].klen = eff_kl;
             memcpy(pending[pend_count].val, row_buf, rlen);
             pending[pend_count].vlen = rlen;
             pend_count++;
@@ -2461,8 +2592,41 @@ static unsigned long exec_delete(db_conn *db, const sql_ast *ast) {
 
     const sql_ast *where_node = find_where(ast);
 
+    /* Same planner reuse as exec_update — DELETE with indexed-col
+     * WHERE hits the index instead of scanning. Covers the common
+     * "DELETE FROM credentials WHERE subject = ?1" pattern. */
+    const db_index *plan_ix = NULL;
+    int plan_kind = IDX_USE_NONE;
+    int plan_col_type = 0;
+    char plan_eq_val[256] = {0};
+    int plan_has_lower = 0, plan_lower_inc = 0;
+    int plan_has_upper = 0, plan_upper_inc = 0;
+    char plan_lower[256] = {0}, plan_upper[256] = {0};
+    int using_index = planner_build(where_node, t, &plan_ix, &plan_kind,
+                                      &plan_col_type,
+                                      plan_eq_val, sizeof(plan_eq_val),
+                                      &plan_has_lower, &plan_lower_inc,
+                                      plan_lower, sizeof(plan_lower),
+                                      &plan_has_upper, &plan_upper_inc,
+                                      plan_upper, sizeof(plan_upper));
+
     u8 prefix[DB_MAX_KEY_LEN];
-    u64 plen = build_prefix_key(prefix, sizeof(prefix), t->name);
+    u64 plen;
+    u64 idx_prefix_len = 0;
+    if (using_index && plan_kind == IDX_USE_EQ) {
+        const char *vs[1] = { plan_eq_val };
+        plen = build_idx_val_prefix_composite(prefix, sizeof(prefix),
+                                                t->name, plan_ix->name,
+                                                vs, 1);
+        idx_prefix_len = plen;
+    } else if (using_index && plan_kind == IDX_USE_RANGE) {
+        plen = build_idx_all_prefix(prefix, sizeof(prefix),
+                                      t->name, plan_ix->name);
+        idx_prefix_len = plen;
+    } else {
+        using_index = 0;
+        plen = build_prefix_key(prefix, sizeof(prefix), t->name);
+    }
     if (plen == 0) return 3;
 
     db_storage_iter *it = NULL;
@@ -2482,7 +2646,40 @@ static unsigned long exec_delete(db_conn *db, const sql_ast *ast) {
     unsigned long fk_rc = 0;
     while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) {
         db_row row;
-        if (row_deserialize(&row, v, vl) != 0) continue;
+        u8 row_key_buf[DB_MAX_KEY_LEN];
+        u64 row_key_len = 0;
+        const u8 *eff_k = k;
+        u64 eff_kl = kl;
+        if (using_index) {
+            if (plan_kind == IDX_USE_RANGE) {
+                char ev[256];
+                if (extract_first_val_from_idx_key(k, kl, idx_prefix_len,
+                                                     ev, sizeof(ev)) != 0) continue;
+                if (plan_has_lower) {
+                    int c = idx_val_compare(plan_col_type, ev, plan_lower);
+                    if (plan_lower_inc ? (c < 0) : (c <= 0)) continue;
+                }
+                if (plan_has_upper) {
+                    int c = idx_val_compare(plan_col_type, ev, plan_upper);
+                    if (plan_upper_inc ? (c > 0) : (c >= 0)) continue;
+                }
+            }
+            i64 rid = parse_rowid_from_idx_key(k, kl);
+            if (rid < 0) continue;
+            row_key_len = build_row_key(row_key_buf, sizeof(row_key_buf),
+                                         t->name, rid);
+            if (row_key_len == 0) continue;
+            u8 *rv = NULL; u64 rvl = 0;
+            if (db->vt->get(&rv, &rvl, db->storage, row_key_buf, row_key_len) != 0
+                || !rv) continue;
+            int drc = row_deserialize(&row, rv, rvl);
+            free(rv);
+            if (drc != 0) continue;
+            eff_k = row_key_buf;
+            eff_kl = row_key_len;
+        } else {
+            if (row_deserialize(&row, v, vl) != 0) continue;
+        }
         int match = eval_where(where_node, &row, t);
         if (match) {
             unsigned long fk_apply = apply_fk_on_delete(db, t, &row);
@@ -2496,10 +2693,10 @@ static unsigned long exec_delete(db_conn *db, const sql_ast *ast) {
         if (!match) continue;
 
         if (del_count < 4096) {
-            del_keys[del_count] = malloc(kl);
+            del_keys[del_count] = malloc(eff_kl);
             if (del_keys[del_count]) {
-                memcpy(del_keys[del_count], k, kl);
-                del_klens[del_count] = kl;
+                memcpy(del_keys[del_count], eff_k, eff_kl);
+                del_klens[del_count] = eff_kl;
                 del_count++;
             }
         }
@@ -2540,6 +2737,7 @@ static unsigned long exec_delete(db_conn *db, const sql_ast *ast) {
         }
         wal_del(db, del_keys[i], del_klens[i]);
         free(del_keys[i]);
+        t->row_count--;
         db->changes++;
     }
 
@@ -2739,6 +2937,11 @@ APENNINES_API unsigned long db_open_ex(db_conn **out, const char *path, u32 back
         db_storage_iter_destroy(it);
     }
 
+    /* Populate cached row counts. */
+    for (u32 i = 0; i < db->table_count; ++i) {
+        recompute_row_count(db, &db->tables[i]);
+    }
+
     *out = db;
     return 0;
 }
@@ -2831,6 +3034,25 @@ static int planner_build(const sql_ast *where, const db_table *t,
     *kind = IDX_USE_NONE;
     *has_lower = *has_upper = 0;
     if (!where || !t) return 0;
+
+    /* Compound AND: try each branch; first one that plans wins.
+     * The outer eval_where re-runs the full predicate on every row
+     * we pull via the index, so non-indexed branches still filter.
+     * OR isn't handled — would need result-set union. */
+    if (where->type == SQL_AST_AND) {
+        if (where->left && planner_build(where->left, t, out_ix, kind, col_type,
+                                           eq_val, eq_val_cap,
+                                           has_lower, lower_inclusive, lower, lower_cap,
+                                           has_upper, upper_inclusive, upper, upper_cap))
+            return 1;
+        if (where->right && planner_build(where->right, t, out_ix, kind, col_type,
+                                            eq_val, eq_val_cap,
+                                            has_lower, lower_inclusive, lower, lower_cap,
+                                            has_upper, upper_inclusive, upper, upper_cap))
+            return 1;
+        return 0;
+    }
+
     if (where->type != SQL_AST_BINARY_OP || !where->text) return 0;
 
     const char *op = where->text;
@@ -2844,6 +3066,60 @@ static int planner_build(const sql_ast *where, const db_table *t,
         if (where->child_count < 2) return 0;
         lo = where->children[0].text;
         hi = where->children[1].text;
+    } else if (strcmp(op, "LIKE") == 0) {
+        /* Trailing-% prefix pattern → index range scan.
+         * 'foo%' decomposes to col >= 'foo' AND col < <next-after-foo>.
+         * Leading-% or embedded-% can't be turned into a range here,
+         * so we return 0 and let the row-level LIKE eval handle it. */
+        if (!where->left || where->left->type != SQL_AST_COLUMN_REF
+            || !where->right || where->right->type != SQL_AST_LITERAL) return 0;
+        const char *pat = where->right->text;
+        if (!pat) return 0;
+        u64 plen = strlen(pat);
+        if (plen == 0) return 0;
+        if (pat[0] == '%') return 0;                 /* leading wildcard */
+        if (pat[plen - 1] != '%') return 0;          /* needs trailing % */
+        /* No embedded % in the prefix portion */
+        for (u64 i = 0; i + 1 < plen; ++i) if (pat[i] == '%') return 0;
+
+        /* Build static buffers for the bounds (must outlive this
+         * function; the caller copies into its own storage). */
+        static char s_lower[256];
+        static char s_upper[256];
+        u64 pref_len = plen - 1;
+        if (pref_len + 1 > sizeof(s_lower)) return 0;
+        memcpy(s_lower, pat, pref_len); s_lower[pref_len] = '\0';
+        /* Compute upper bound by bumping the last non-0xFF byte. If
+         * all bytes are 0xFF, we can't form a tight bound — skip. */
+        memcpy(s_upper, pat, pref_len); s_upper[pref_len] = '\0';
+        int bumped = 0;
+        for (i64 i = (i64)pref_len - 1; i >= 0; --i) {
+            unsigned char b = (unsigned char)s_upper[i];
+            if (b != 0xFF) { s_upper[i] = (char)(b + 1); bumped = 1; break; }
+            s_upper[i] = 0;
+        }
+        if (!bumped) return 0;
+
+        col_name = where->left->text;
+        int ci2 = col_index(t, col_name);
+        if (ci2 < 0) return 0;
+        const db_index *ix2 = NULL;
+        for (u32 i = 0; i < t->index_count; ++i) {
+            if (t->indexes[i].col_count > 0
+                && t->indexes[i].col_idx[0] == (u32)ci2) {
+                ix2 = &t->indexes[i]; break;
+            }
+        }
+        if (!ix2) return 0;
+
+        *out_ix = ix2;
+        *col_type = t->cols[ci2].type;
+        *kind = IDX_USE_RANGE;
+        *has_lower = 1; *lower_inclusive = 1;
+        snprintf(lower, lower_cap, "%s", s_lower);
+        *has_upper = 1; *upper_inclusive = 0;
+        snprintf(upper, upper_cap, "%s", s_upper);
+        return 1;
     } else if (strcmp(op, "=")  == 0 || strcmp(op, "<") == 0
             || strcmp(op, "<=") == 0 || strcmp(op, ">") == 0
             || strcmp(op, ">=") == 0) {
@@ -3031,9 +3307,48 @@ static void agg_update(db_agg_spec *spec, const db_row *row) {
     double dv = 0.0;
     i64 iv = 0;
     int is_real = 0;
+    int is_text = 0;
     if (ty == DB_TYPE_INTEGER) { iv = row->ivals[spec->col_idx]; dv = (double)iv; }
     else if (ty == DB_TYPE_REAL) { dv = row->fvals[spec->col_idx]; is_real = 1; }
-    else return;  /* TEXT/BLOB: ignore for numeric aggregates */
+    else if (ty == DB_TYPE_TEXT || ty == DB_TYPE_BLOB) {
+        /* TEXT/BLOB meaningful only for MIN/MAX; SUM/AVG skip. */
+        if (spec->fn != DB_AGG_MIN && spec->fn != DB_AGG_MAX) return;
+        is_text = 1;
+        spec->saw_text = 1;
+    } else return;
+
+    if (is_text) {
+        const u8 *tv = row->bvals[spec->col_idx];
+        u64 tl = row->blens[spec->col_idx];
+        if (!tv || tl == 0) { tv = (const u8 *)""; tl = 0; }
+        spec->count_nonnull++;
+        if (spec->fn == DB_AGG_MIN) {
+            int take = !spec->have_any;
+            if (!take && spec->tmin) {
+                u64 m = tl < spec->tmin_len ? tl : spec->tmin_len;
+                int c = memcmp(tv, spec->tmin, m);
+                if (c < 0) take = 1;
+                else if (c == 0 && tl < spec->tmin_len) take = 1;
+            }
+            if (take) {
+                u8 *nb = (u8 *)realloc(spec->tmin, tl ? tl : 1);
+                if (nb) { spec->tmin = nb; memcpy(spec->tmin, tv, tl); spec->tmin_len = tl; spec->have_any = 1; }
+            }
+        } else if (spec->fn == DB_AGG_MAX) {
+            int take = !spec->have_any;
+            if (!take && spec->tmax) {
+                u64 m = tl < spec->tmax_len ? tl : spec->tmax_len;
+                int c = memcmp(tv, spec->tmax, m);
+                if (c > 0) take = 1;
+                else if (c == 0 && tl > spec->tmax_len) take = 1;
+            }
+            if (take) {
+                u8 *nb = (u8 *)realloc(spec->tmax, tl ? tl : 1);
+                if (nb) { spec->tmax = nb; memcpy(spec->tmax, tv, tl); spec->tmax_len = tl; spec->have_any = 1; }
+            }
+        }
+        return;
+    }
 
     spec->count_nonnull++;
     switch (spec->fn) {
@@ -3100,7 +3415,15 @@ static void agg_resolve_into_row(const db_agg_spec *spec, db_row *out, u32 col) 
         break;
     case DB_AGG_MIN:
         if (!spec->have_any) { out->types[col] = DB_TYPE_NULL; break; }
-        if (spec->saw_real) {
+        if (spec->saw_text) {
+            out->types[col] = DB_TYPE_TEXT;
+            out->bvals[col] = (u8 *)malloc(spec->tmin_len + 1);
+            if (out->bvals[col]) {
+                memcpy(out->bvals[col], spec->tmin, spec->tmin_len);
+                out->bvals[col][spec->tmin_len] = '\0';
+                out->blens[col] = spec->tmin_len;
+            }
+        } else if (spec->saw_real) {
             out->types[col] = DB_TYPE_REAL;
             out->fvals[col] = spec->fmin;
         } else {
@@ -3110,7 +3433,15 @@ static void agg_resolve_into_row(const db_agg_spec *spec, db_row *out, u32 col) 
         break;
     case DB_AGG_MAX:
         if (!spec->have_any) { out->types[col] = DB_TYPE_NULL; break; }
-        if (spec->saw_real) {
+        if (spec->saw_text) {
+            out->types[col] = DB_TYPE_TEXT;
+            out->bvals[col] = (u8 *)malloc(spec->tmax_len + 1);
+            if (out->bvals[col]) {
+                memcpy(out->bvals[col], spec->tmax, spec->tmax_len);
+                out->bvals[col][spec->tmax_len] = '\0';
+                out->blens[col] = spec->tmax_len;
+            }
+        } else if (spec->saw_real) {
             out->types[col] = DB_TYPE_REAL;
             out->fvals[col] = spec->fmax;
         } else {
@@ -3333,6 +3664,80 @@ static unsigned long materialise_grouped_result(db_stmt *s,
 
 /* Walk every matching row, feed each to every agg_spec, build the
  * synthetic one-row result into *out. Returns 0 on success. */
+/* Find a single-column index on `col_idx`, or NULL if none exists. */
+static const db_index *find_single_col_index(const db_table *t, u32 col_idx) {
+    for (u32 i = 0; i < t->index_count; ++i) {
+        if (t->indexes[i].col_count == 1 && t->indexes[i].col_idx[0] == col_idx) {
+            return &t->indexes[i];
+        }
+    }
+    return NULL;
+}
+
+/* Phase C fast path: every agg is MIN or MAX, no WHERE, every target
+ * column has a single-column index. Resolve each agg with one
+ * probe_first/probe_last + row fetch instead of scanning the table.
+ * Returns 0 on success with specs populated; returns 99 if not eligible
+ * (caller falls back to full scan). */
+static unsigned long evaluate_aggregates_minmax_fastpath(db_stmt *s,
+                                                          const sql_ast *where_node) {
+    if (where_node) return 99;
+    if (s->agg_count == 0) return 99;
+    for (u32 i = 0; i < s->agg_count; ++i) {
+        db_agg_spec *sp = &s->agg_specs[i];
+        if (sp->fn != DB_AGG_MIN && sp->fn != DB_AGG_MAX) return 99;
+        if (sp->star) return 99;
+        if (sp->col_idx < 0) return 99;
+        if (!find_single_col_index(s->table, (u32)sp->col_idx)) return 99;
+        /* Only TEXT columns get the fast path: the index key stores
+         * column values as ASCII text with '/' delimiters, so lex
+         * order of the key matches SQL order for TEXT but NOT for
+         * INTEGER/REAL (decimal string "1000" < "999"). Numeric fast
+         * path would need sortable-encoded keys — deferred. */
+        int col_ty = s->table->cols[sp->col_idx].type;
+        if (col_ty != DB_TYPE_TEXT && col_ty != DB_TYPE_BLOB) return 99;
+    }
+
+    for (u32 i = 0; i < s->agg_count; ++i) {
+        db_agg_spec *sp = &s->agg_specs[i];
+        const db_index *ix = find_single_col_index(s->table, (u32)sp->col_idx);
+        u8 pfx[DB_MAX_KEY_LEN];
+        u64 pl = build_idx_all_prefix(pfx, sizeof(pfx), s->table->name, ix->name);
+        if (pl == 0) return 99;
+
+        u8 *ek = NULL; u64 ekl = 0;
+        u8 *ev = NULL; u64 evl = 0;
+        unsigned long rc = (sp->fn == DB_AGG_MIN)
+            ? s->db->vt->probe_first(&ek, &ekl, &ev, &evl, s->db->storage, pfx, pl)
+            : s->db->vt->probe_last (&ek, &ekl, &ev, &evl, s->db->storage, pfx, pl);
+        if (rc == 5) {
+            /* empty set — spec stays have_any=0 */
+            continue;
+        }
+        if (rc) { free(ek); free(ev); return 99; }
+        free(ev);  /* index entry value is empty-string padding */
+
+        /* Parse rowid from tail of ek, load the row by rowid, update spec. */
+        i64 rid = parse_rowid_from_idx_key(ek, ekl);
+        free(ek);
+        if (rid < 0) return 99;
+
+        u8 rkey[DB_MAX_KEY_LEN];
+        u64 rkl = build_row_key(rkey, sizeof(rkey), s->table->name, rid);
+        if (rkl == 0) return 99;
+        u8 *rv = NULL; u64 rvl = 0;
+        if (s->db->vt->get(&rv, &rvl, s->db->storage, rkey, rkl) != 0 || !rv) {
+            return 99;
+        }
+        db_row row;
+        if (row_deserialize(&row, rv, rvl) != 0) { free(rv); return 99; }
+        agg_update(sp, &row);
+        row_free(&row);
+        free(rv);
+    }
+    return 0;
+}
+
 static unsigned long evaluate_aggregates(db_stmt *s,
                                            const sql_ast *where_node,
                                            db_row *out) {
@@ -3346,6 +3751,215 @@ static unsigned long evaluate_aggregates(db_stmt *s,
         sp->imin = 0; sp->imax = 0;
         sp->fmin = 0; sp->fmax = 0;
         sp->have_any = 0;
+        sp->saw_text = 0;
+        free(sp->tmin); sp->tmin = NULL; sp->tmin_len = 0;
+        free(sp->tmax); sp->tmax = NULL; sp->tmax_len = 0;
+    }
+
+    /* Try MIN/MAX-via-index fast path first. Returns 99 when not
+     * eligible; any other return means the fast path populated specs. */
+    if (evaluate_aggregates_minmax_fastpath(s, where_node) == 0) {
+        memset(out, 0, sizeof(*out));
+        out->col_count = s->agg_count;
+        for (u32 i = 0; i < s->agg_count; ++i) {
+            agg_resolve_into_row(&s->agg_specs[i], out, i);
+        }
+        return 0;
+    }
+
+    /* COUNT(*) fast path: single aggregate that's COUNT(*) with no
+     * WHERE. Use the cached t->row_count directly — O(1). */
+    if (!where_node && s->agg_count == 1
+        && s->agg_specs[0].fn == DB_AGG_COUNT
+        && s->agg_specs[0].star) {
+        s->agg_specs[0].count_nonnull = s->table->row_count;
+        memset(out, 0, sizeof(*out));
+        out->col_count = 1;
+        agg_resolve_into_row(&s->agg_specs[0], out, 0);
+        return 0;
+    }
+
+    /* COUNT(*) with indexable WHERE: count index entries, skip row
+     * fetches + deserialization. Covers cookbook's admin patterns
+     * like "SELECT COUNT(*) FROM artifacts WHERE kind = 'blob'" or
+     * range-filtered audit counts. */
+    if (where_node && s->agg_count == 1
+        && s->agg_specs[0].fn == DB_AGG_COUNT
+        && s->agg_specs[0].star) {
+        const db_index *plan_ix = NULL;
+        int plan_kind = IDX_USE_NONE, plan_col_type = 0;
+        char p_eq[256] = {0};
+        int p_hl = 0, p_li = 0, p_hu = 0, p_ui = 0;
+        char p_lo[256] = {0}, p_up[256] = {0};
+        if (planner_build(where_node, s->table, &plan_ix, &plan_kind, &plan_col_type,
+                           p_eq, sizeof(p_eq),
+                           &p_hl, &p_li, p_lo, sizeof(p_lo),
+                           &p_hu, &p_ui, p_up, sizeof(p_up))) {
+            u8 pfx[DB_MAX_KEY_LEN];
+            u64 pl = 0;
+            u64 idx_plen = 0;
+            if (plan_kind == IDX_USE_EQ) {
+                const char *vs[1] = { p_eq };
+                pl = build_idx_val_prefix_composite(pfx, sizeof(pfx),
+                                                      s->table->name,
+                                                      plan_ix->name, vs, 1);
+                idx_plen = pl;
+            } else if (plan_kind == IDX_USE_RANGE) {
+                pl = build_idx_all_prefix(pfx, sizeof(pfx),
+                                            s->table->name, plan_ix->name);
+                idx_plen = pl;
+            }
+            if (pl > 0) {
+                /* If WHERE is compound (AND), we need to re-run
+                 * eval_where per row because planner only covers one
+                 * branch. For a simple top-level predicate we can
+                 * count index entries directly — pure index hit. */
+                int compound = (where_node->type == SQL_AST_AND
+                             || where_node->type == SQL_AST_OR);
+                db_storage_iter *it = NULL;
+                if (s->db->vt->iter_create(&it, s->db->storage, pfx, pl) == 0) {
+                    i64 n = 0;
+                    const u8 *k; u64 kl;
+                    const u8 *v; u64 vl;
+                    while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) {
+                        if (plan_kind == IDX_USE_RANGE) {
+                            char ev[256];
+                            if (extract_first_val_from_idx_key(k, kl, idx_plen,
+                                                                 ev, sizeof(ev)) != 0) continue;
+                            if (p_hl) {
+                                int c = idx_val_compare(plan_col_type, ev, p_lo);
+                                if (p_li ? (c < 0) : (c <= 0)) continue;
+                            }
+                            if (p_hu) {
+                                int c = idx_val_compare(plan_col_type, ev, p_up);
+                                if (p_ui ? (c > 0) : (c >= 0)) continue;
+                            }
+                        }
+                        if (compound) {
+                            /* Fetch row, apply the full WHERE. */
+                            i64 rid = parse_rowid_from_idx_key(k, kl);
+                            if (rid < 0) continue;
+                            u8 rk[DB_MAX_KEY_LEN];
+                            u64 rkl = build_row_key(rk, sizeof(rk),
+                                                     s->table->name, rid);
+                            if (rkl == 0) continue;
+                            u8 *rv = NULL; u64 rvl = 0;
+                            if (s->db->vt->get(&rv, &rvl, s->db->storage,
+                                                rk, rkl) != 0 || !rv) continue;
+                            db_row row;
+                            int drc = row_deserialize(&row, rv, rvl);
+                            free(rv);
+                            if (drc != 0) continue;
+                            int match = eval_where(where_node, &row, s->table);
+                            row_free(&row);
+                            if (!match) continue;
+                        }
+                        n++;
+                    }
+                    db_storage_iter_destroy(it);
+                    s->agg_specs[0].count_nonnull = n;
+                    memset(out, 0, sizeof(*out));
+                    out->col_count = 1;
+                    agg_resolve_into_row(&s->agg_specs[0], out, 0);
+                    return 0;
+                }
+            }
+        }
+    }
+
+    /* Fused-scan fast path: no WHERE, every non-COUNT(*) agg targets
+     * the same INTEGER column. Skip row_deserialize entirely — stream
+     * the serialized row bytes and read only the target col. Typical
+     * shape is "SELECT COUNT(*), SUM(v), MIN(v), MAX(v), AVG(v) FROM t"
+     * which agg-5xN bench exercises: 5 aggs collapse to one pass
+     * with one column read per row. */
+    if (!where_node && s->agg_count > 0) {
+        int target_col = -1;
+        int ok = 1;
+        for (u32 i = 0; i < s->agg_count; ++i) {
+            const db_agg_spec *sp = &s->agg_specs[i];
+            if (sp->fn == DB_AGG_COUNT && sp->star) continue;  /* count* is free */
+            if (sp->col_idx < 0) { ok = 0; break; }
+            int ct = s->table->cols[sp->col_idx].type;
+            if (ct != DB_TYPE_INTEGER) { ok = 0; break; }
+            if (target_col < 0) target_col = sp->col_idx;
+            else if (target_col != sp->col_idx) { ok = 0; break; }
+        }
+        if (ok && target_col >= 0) {
+            /* Streaming pass: we read each row's serialized bytes and
+             * walk to the target col without populating a db_row. */
+            i64 count_rows = s->table->row_count;  /* for COUNT(*) */
+            i64 count_nn = 0;
+            i64 vsum = 0;
+            i64 vmin = 0, vmax = 0;
+            int have_any = 0;
+
+            u8 prefix[DB_MAX_KEY_LEN];
+            u64 plen = build_prefix_key(prefix, sizeof(prefix), s->table->name);
+            if (plen == 0) return 1;
+            db_storage_iter *it = NULL;
+            if (s->db->vt->iter_create(&it, s->db->storage, prefix, plen) != 0) return 2;
+
+            const u8 *k; u64 kl;
+            const u8 *v; u64 vl;
+            while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) {
+                if (vl < 2) continue;
+                u16 ncols = (u16)v[0] | ((u16)v[1] << 8);
+                if ((int)ncols <= target_col) continue;
+                u64 p = 2;
+                int skipped_ok = 1;
+                for (int c = 0; c < target_col; c++) {
+                    if (p >= vl) { skipped_ok = 0; break; }
+                    u8 ty = v[p++];
+                    if (ty == DB_TYPE_INTEGER || ty == DB_TYPE_REAL) p += 8;
+                    else if (ty == DB_TYPE_TEXT || ty == DB_TYPE_BLOB) {
+                        if (p + 4 > vl) { skipped_ok = 0; break; }
+                        u32 slen = (u32)v[p] | ((u32)v[p+1] << 8) | ((u32)v[p+2] << 16) | ((u32)v[p+3] << 24);
+                        p += 4 + slen;
+                    }
+                }
+                if (!skipped_ok || p >= vl) continue;
+                u8 ty = v[p++];
+                if (ty == DB_TYPE_NULL) continue;
+                if (ty != DB_TYPE_INTEGER || p + 8 > vl) continue;
+                i64 iv = read_i64_le(v + p);
+                count_nn++;
+                vsum += iv;
+                if (!have_any) { vmin = iv; vmax = iv; have_any = 1; }
+                else {
+                    if (iv < vmin) vmin = iv;
+                    if (iv > vmax) vmax = iv;
+                }
+            }
+            db_storage_iter_destroy(it);
+
+            /* Populate specs per aggregate fn. All non-COUNT(*) aggs
+             * share the same column, so min/max/sum/avg all come from
+             * the single streaming pass above. */
+            for (u32 i = 0; i < s->agg_count; ++i) {
+                db_agg_spec *sp = &s->agg_specs[i];
+                if (sp->fn == DB_AGG_COUNT) {
+                    sp->count_nonnull = sp->star ? count_rows : count_nn;
+                    continue;
+                }
+                sp->count_nonnull = count_nn;
+                sp->isum = vsum;
+                sp->dsum = (double)vsum;
+                sp->saw_real = 0;
+                if (have_any) {
+                    sp->have_any = 1;
+                    sp->imin = vmin; sp->fmin = (double)vmin;
+                    sp->imax = vmax; sp->fmax = (double)vmax;
+                }
+            }
+
+            memset(out, 0, sizeof(*out));
+            out->col_count = s->agg_count;
+            for (u32 i = 0; i < s->agg_count; ++i) {
+                agg_resolve_into_row(&s->agg_specs[i], out, i);
+            }
+            return 0;
+        }
     }
 
     u8 prefix[DB_MAX_KEY_LEN];
@@ -3424,8 +4038,89 @@ static int cmp_rows_by_order(const void *a, const void *b) {
  * to sorted_rows — the array must be freed via db_stmt finalisation
  * (any unconsumed slots get row_free'd; consumed slots were zeroed
  * during db_step so they don't double-free).  Returns 0 on success. */
+/* Phase C.3: ORDER BY via index scan. When the order is single-col
+ * ASC on an indexed column and the backend reports sorted_iter=1
+ * (btree), iterating the index prefix yields rowids in sorted-by-
+ * column order directly. We skip the qsort entirely — and if there's
+ * a LIMIT we can stop after collecting the first N matches.
+ *
+ * Returns 99 if the query isn't eligible; caller falls back to the
+ * scan+sort path. */
+static unsigned long materialise_ordered_via_index(db_stmt *s,
+                                                    const sql_ast *where_node) {
+    if (!s->db->vt->sorted_iter) return 99;
+    if (s->order_count != 1) return 99;
+    if (s->order_specs[0].descending) return 99;   /* DESC not yet wired */
+
+    u32 oc = s->order_specs[0].col_idx;
+    const db_index *ix = find_single_col_index(s->table, oc);
+    if (!ix) return 99;
+
+    u8 idx_pfx[DB_MAX_KEY_LEN];
+    u64 ipl = build_idx_all_prefix(idx_pfx, sizeof(idx_pfx),
+                                    s->table->name, ix->name);
+    if (ipl == 0) return 99;
+
+    db_storage_iter *it = NULL;
+    if (s->db->vt->iter_create(&it, s->db->storage, idx_pfx, ipl) != 0) return 99;
+
+    u64 cap = 16;
+    db_row *rows = (db_row *)calloc(cap, sizeof(db_row));
+    if (!rows) { db_storage_iter_destroy(it); return 3; }
+    u64 n = 0;
+    u64 skipped = 0;
+
+    const u8 *k; u64 kl;
+    const u8 *v; u64 vl;
+    while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) {
+        /* Parse rowid from index key tail, fetch the row. */
+        i64 rid = parse_rowid_from_idx_key(k, kl);
+        if (rid < 0) continue;
+        u8 rkey[DB_MAX_KEY_LEN];
+        u64 rkl = build_row_key(rkey, sizeof(rkey), s->table->name, rid);
+        if (rkl == 0) continue;
+        u8 *rv = NULL; u64 rvl = 0;
+        if (s->db->vt->get(&rv, &rvl, s->db->storage, rkey, rkl) != 0 || !rv) continue;
+        db_row row;
+        if (row_deserialize(&row, rv, rvl) != 0) { free(rv); continue; }
+        free(rv);
+        if (!eval_where(where_node, &row, s->table)) { row_free(&row); continue; }
+
+        /* Inline OFFSET drop — cheaper than materialising + discarding. */
+        if (skipped < s->offset_n) { row_free(&row); skipped++; continue; }
+
+        if (n == cap) {
+            u64 nc = cap * 2;
+            db_row *nr = (db_row *)realloc(rows, nc * sizeof(db_row));
+            if (!nr) {
+                row_free(&row);
+                for (u64 i = 0; i < n; ++i) row_free(&rows[i]);
+                free(rows);
+                db_storage_iter_destroy(it);
+                return 4;
+            }
+            rows = nr;
+            cap = nc;
+        }
+        rows[n++] = row;
+
+        /* Early-terminate once LIMIT satisfied. */
+        if (s->has_limit && n >= s->limit_n) break;
+    }
+    db_storage_iter_destroy(it);
+
+    s->sorted_rows = rows;
+    s->sorted_count = n;
+    s->sorted_pos = 0;
+    return 0;
+}
+
 static unsigned long materialise_ordered_result(db_stmt *s,
                                                   const sql_ast *where_node) {
+    /* Try the index fast path first. On 99 (not eligible), fall back
+     * to the scan+sort path below. */
+    if (materialise_ordered_via_index(s, where_node) == 0) return 0;
+
     db_storage_iter *it = NULL;
     u8 prefix[DB_MAX_KEY_LEN];
     u64 plen = build_prefix_key(prefix, sizeof(prefix), s->table->name);
@@ -3617,6 +4312,11 @@ static unsigned long db_prepare_locked(db_stmt **out, db_conn *db, const char *s
     /* For SELECT, pre-parse columns and table */
     if (s->ast->type == SQL_AST_SELECT) {
         /* calloc zeroed group_col_count already; no other init needed. */
+        /* Detect DISTINCT prefix before extract_table_name strips it. */
+        if (s->ast->text
+            && strncasecmp_a(s->ast->text, "DISTINCT ", 9) == 0) {
+            s->is_distinct = 1;
+        }
         const char *tname = extract_table_name(s->ast->text);
         if (tname) s->table = find_table(db, tname);
 
@@ -3982,6 +4682,65 @@ static unsigned long db_step_locked(db_stmt *s) {
             continue;
         }
 
+        /* SELECT DISTINCT: streaming dedup over projected columns.
+         * Build a fingerprint for the row's selected fields, compare
+         * against prior seen. Skip duplicates, record first-seen. */
+        if (s->is_distinct) {
+            /* Serialise projected cols into a scratch buffer.
+             * Format: for each selected col, type byte then payload
+             * (8B fixed for INT/REAL; u32 len + bytes for TEXT/BLOB). */
+            u8 fp[DB_MAX_ROW_SIZE];
+            u64 fp_len = 0;
+            u32 n_out = s->sel_star ? row.col_count : s->sel_col_count;
+            for (u32 i = 0; i < n_out && fp_len + 16 < sizeof(fp); ++i) {
+                u32 ci;
+                if (s->sel_star) ci = i;
+                else {
+                    int c = col_index(s->table, s->sel_cols[i]);
+                    if (c < 0) { fp_len = 0; break; }
+                    ci = (u32)c;
+                }
+                if (ci >= row.col_count) continue;
+                fp[fp_len++] = (u8)row.types[ci];
+                if (row.types[ci] == DB_TYPE_INTEGER) {
+                    memcpy(fp + fp_len, &row.ivals[ci], 8);
+                    fp_len += 8;
+                } else if (row.types[ci] == DB_TYPE_REAL) {
+                    memcpy(fp + fp_len, &row.fvals[ci], 8);
+                    fp_len += 8;
+                } else if (row.types[ci] == DB_TYPE_TEXT
+                           || row.types[ci] == DB_TYPE_BLOB) {
+                    u32 l = (u32)row.blens[ci];
+                    if (fp_len + 4 + l > sizeof(fp)) { fp_len = 0; break; }
+                    memcpy(fp + fp_len, &l, 4); fp_len += 4;
+                    if (l) { memcpy(fp + fp_len, row.bvals[ci], l); fp_len += l; }
+                }
+            }
+
+            int seen = 0;
+            for (u64 i = 0; i < s->distinct_count && !seen; ++i) {
+                if (s->distinct_key_lens[i] == fp_len
+                    && memcmp(s->distinct_keys[i], fp, fp_len) == 0) seen = 1;
+            }
+            if (seen) { row_free(&row); continue; }
+
+            if (s->distinct_count == s->distinct_cap) {
+                u64 nc = s->distinct_cap ? s->distinct_cap * 2 : 16;
+                u8 **nk = realloc(s->distinct_keys, nc * sizeof(u8 *));
+                u64 *nl = realloc(s->distinct_key_lens, nc * sizeof(u64));
+                if (nk) s->distinct_keys = nk;
+                if (nl) s->distinct_key_lens = nl;
+                s->distinct_cap = nc;
+            }
+            u8 *copy = (u8 *)malloc(fp_len ? fp_len : 1);
+            if (copy) {
+                memcpy(copy, fp, fp_len);
+                s->distinct_keys[s->distinct_count] = copy;
+                s->distinct_key_lens[s->distinct_count] = fp_len;
+                s->distinct_count++;
+            }
+        }
+
         /* OFFSET pre-skip. */
         if (s->rows_skipped < s->offset_n) {
             s->rows_skipped++;
@@ -4200,6 +4959,17 @@ APENNINES_API unsigned long db_finalize(db_stmt *s) {
         if (s->binds[i].bval) free(s->binds[i].bval);
     }
 
+    /* Free per-spec TEXT MIN/MAX buffers (no-op for numeric aggregates). */
+    for (u32 i = 0; i < s->agg_count; ++i) {
+        free(s->agg_specs[i].tmin);
+        free(s->agg_specs[i].tmax);
+    }
+
+    /* DISTINCT dedup state. */
+    for (u64 i = 0; i < s->distinct_count; ++i) free(s->distinct_keys[i]);
+    free(s->distinct_keys);
+    free(s->distinct_key_lens);
+
     free(s);
     rwlock_write_unlock(&db->conn_lock);
     return 0;
@@ -4234,6 +5004,8 @@ APENNINES_API unsigned long db_reset(db_stmt *s) {
     s->rows_returned = 0;
     s->rows_skipped = 0;
     s->agg_produced = 0;
+    for (u64 i = 0; i < s->distinct_count; ++i) free(s->distinct_keys[i]);
+    s->distinct_count = 0;
     s->using_index = 0;
     s->done = 0;
     rwlock_write_unlock(&s->db->conn_lock);
@@ -4285,6 +5057,23 @@ out:
  * fully reverted in-memory — CREATE'd tables disappear, DROP'd
  * tables come back, and the column/index/FK/unique metadata is
  * re-read from the now-authoritative meta rows). */
+/* Scan `__row__/<table>/` and count entries. Used by open + rollback
+ * since row_count isn't persisted. O(N) per table — only pays on
+ * lifecycle events, not in the hot SELECT COUNT(*) path. */
+static void recompute_row_count(db_conn *db, db_table *t) {
+    u8 prefix[DB_MAX_KEY_LEN];
+    u64 plen = build_prefix_key(prefix, sizeof(prefix), t->name);
+    if (plen == 0) return;
+    db_storage_iter *it = NULL;
+    if (db->vt->iter_create(&it, db->storage, prefix, plen) != 0) return;
+    const u8 *k; u64 kl;
+    const u8 *v; u64 vl;
+    i64 n = 0;
+    while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) n++;
+    db_storage_iter_destroy(it);
+    t->row_count = n;
+}
+
 static unsigned long rebuild_tables_from_meta(db_conn *db) {
     db->table_count = 0;
     db_storage_iter *it = NULL;
@@ -4306,6 +5095,10 @@ static unsigned long rebuild_tables_from_meta(db_conn *db) {
         if (meta_deserialize(t, v, vl) == 0) db->table_count++;
     }
     db_storage_iter_destroy(it);
+    /* Populate cached row counts by scanning each table's rows. */
+    for (u32 i = 0; i < db->table_count; ++i) {
+        recompute_row_count(db, &db->tables[i]);
+    }
     return 0;
 }
 

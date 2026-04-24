@@ -46,6 +46,7 @@
  */
 
 #include "apennines/t3/db/dbtree.h"
+#include "apennines/t1/sync/mutex/mutex.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -113,6 +114,20 @@ struct dbtree {
     u32         num_pages;
     int         dirty_header;
     u64         num_keys;
+    /* Phase D concurrency model:
+     *   tree_rwlock — readers (get/seek/cursor_*) take the read side;
+     *     writers (put/delete/close) take the write side. Lets
+     *     concurrent SELECTs parallelise end-to-end.
+     *   cache_mutex — protects page_cache's LRU list, slot reuse, and
+     *     pin refcounts. Held only across cache_pin / cache_unpin /
+     *     eviction; released while actually reading page bytes.
+     *     Writers already hold the tree write-lock exclusively, so
+     *     they don't contend on cache_mutex.
+     * This split gives parallel readers without per-page latching
+     * (crabbing), which is fine for our page count. */
+    rwlock      tree_rwlock;
+    mutex       cache_mutex;
+    int         lock_initialised;
 };
 
 struct dbtree_cursor {
@@ -233,7 +248,8 @@ static void lru_push_front(page_cache *c, u32 idx) {
     if (c->lru_tail == NO_IDX) c->lru_tail = idx;
 }
 
-static unsigned long cache_pin(page_buf **out, dbtree *bt, u32 page_no) {
+/* Must be called with bt->cache_mutex held. */
+static unsigned long cache_pin_locked(page_buf **out, dbtree *bt, u32 page_no) {
     page_cache *c = &bt->cache;
     for (u32 i = 0; i < c->capacity; i++) {
         if (c->slots[i].in_use && c->slots[i].page_no == page_no) {
@@ -276,7 +292,20 @@ static unsigned long cache_pin(page_buf **out, dbtree *bt, u32 page_no) {
     return 0;
 }
 
+/* Public wrapper: grab cache_mutex, do the pin, release. Safe to call
+ * under either a tree read-lock or write-lock (both are held by the
+ * public API wrappers before any cache_pin). */
+static unsigned long cache_pin(page_buf **out, dbtree *bt, u32 page_no) {
+    if (bt->lock_initialised) mutex_lock(&bt->cache_mutex);
+    unsigned long rc = cache_pin_locked(out, bt, page_no);
+    if (bt->lock_initialised) mutex_unlock(&bt->cache_mutex);
+    return rc;
+}
+
 static void cache_unpin(page_buf *b) {
+    /* Single-slot decrement; atomic enough on native word. A torn
+     * refcount would imply two threads racing on the same page_buf
+     * without any tree-level lock — we don't expose that surface. */
     if (b && b->pinned > 0) b->pinned--;
 }
 
@@ -1143,7 +1172,7 @@ static unsigned long insert_into_internal(dbtree *bt,
 
 /* ---- public: dbtree_put ---- */
 
-APENNINES_API unsigned long dbtree_put(dbtree *bt,
+static unsigned long dbtree_put_impl(dbtree *bt,
                                        const u8 *key, u64 key_len,
                                        const u8 *value, u64 val_len) {
     if (!bt) return 1;
@@ -1245,7 +1274,7 @@ APENNINES_API unsigned long dbtree_put(dbtree *bt,
 
 /* ---- public: dbtree_get ---- */
 
-APENNINES_API unsigned long dbtree_get(u8 **out, u64 *out_len,
+static unsigned long dbtree_get_impl(u8 **out, u64 *out_len,
                                        dbtree *bt,
                                        const u8 *key, u64 key_len) {
     if (!out) return 1;
@@ -1297,7 +1326,7 @@ APENNINES_API unsigned long dbtree_get(u8 **out, u64 *out_len,
 
 /* ---- public: dbtree_delete ---- */
 
-APENNINES_API unsigned long dbtree_delete(dbtree *bt,
+static unsigned long dbtree_delete_impl(dbtree *bt,
                                           const u8 *key, u64 key_len) {
     if (!bt) return 1;
     if (!key) return 2;
@@ -1359,6 +1388,15 @@ static unsigned long init_empty_tree(dbtree *bt) {
     return write_file_header(bt);
 }
 
+/* Phase D lock helpers. Reads take the rwlock's read side — multiple
+ * concurrent readers allowed; writes take the write side for exclusive
+ * access. Cache-internal serialisation (LRU, pin/unpin, eviction,
+ * file I/O) is handled separately by cache_mutex inside cache_pin. */
+#define BT_RLOCK(bt)   do { if ((bt)->lock_initialised) rwlock_read_lock (&(bt)->tree_rwlock); } while (0)
+#define BT_RUNLOCK(bt) do { if ((bt)->lock_initialised) rwlock_read_unlock(&(bt)->tree_rwlock); } while (0)
+#define BT_WLOCK(bt)   do { if ((bt)->lock_initialised) rwlock_write_lock (&(bt)->tree_rwlock); } while (0)
+#define BT_WUNLOCK(bt) do { if ((bt)->lock_initialised) rwlock_write_unlock(&(bt)->tree_rwlock); } while (0)
+
 APENNINES_API unsigned long dbtree_open(dbtree **out, const char *path) {
     if (!out) return 1;
     if (!path) return 2;
@@ -1382,6 +1420,19 @@ APENNINES_API unsigned long dbtree_open(dbtree **out, const char *path) {
 
     unsigned long rc = cache_init(&bt->cache, DEFAULT_CACHE_PAGES);
     if (rc) { fclose(fp); free(bt->path); free(bt); return 4; }
+
+    if (rwlock_create(&bt->tree_rwlock) != 0) {
+        cache_free(&bt->cache);
+        fclose(fp); free(bt->path); free(bt);
+        return 4;
+    }
+    if (mutex_create(&bt->cache_mutex) != 0) {
+        rwlock_destroy(&bt->tree_rwlock);
+        cache_free(&bt->cache);
+        fclose(fp); free(bt->path); free(bt);
+        return 4;
+    }
+    bt->lock_initialised = 1;
 
     if (created) {
         rc = init_empty_tree(bt);
@@ -1458,6 +1509,7 @@ APENNINES_API unsigned long dbtree_open(dbtree **out, const char *path) {
 
 APENNINES_API unsigned long dbtree_close(dbtree *bt) {
     if (!bt) return 1;
+    BT_WLOCK(bt);
     unsigned long rc = 0;
     if (bt->dirty_header) {
         unsigned long r2 = write_file_header(bt);
@@ -1469,11 +1521,16 @@ APENNINES_API unsigned long dbtree_close(dbtree *bt) {
     cache_free(&bt->cache);
     if (bt->fp) fclose(bt->fp);
     free(bt->path);
+    if (bt->lock_initialised) {
+        rwlock_write_unlock(&bt->tree_rwlock);
+        rwlock_destroy(&bt->tree_rwlock);
+        mutex_destroy(&bt->cache_mutex);
+    }
     free(bt);
     return rc;
 }
 
-APENNINES_API unsigned long dbtree_flush(dbtree *bt) {
+static unsigned long dbtree_flush_impl(dbtree *bt) {
     if (!bt) return 1;
     if (bt->dirty_header) {
         if (write_file_header(bt) != 0) return 2;
@@ -1483,7 +1540,7 @@ APENNINES_API unsigned long dbtree_flush(dbtree *bt) {
     return 0;
 }
 
-APENNINES_API unsigned long dbtree_sync(dbtree *bt) {
+static unsigned long dbtree_sync_impl(dbtree *bt) {
     if (!bt) return 1;
     unsigned long rc = dbtree_flush(bt);
     if (rc) return 2;
@@ -1496,7 +1553,7 @@ APENNINES_API unsigned long dbtree_sync(dbtree *bt) {
     return 0;
 }
 
-APENNINES_API unsigned long dbtree_cache_pages(dbtree *bt, u32 n) {
+static unsigned long dbtree_cache_pages_impl(dbtree *bt, u32 n) {
     if (!bt) return 1;
     if (n == 0 || n > 65536) return 2;
     /* Only valid on freshly opened dbtree (no dirty pages). */
@@ -1506,7 +1563,7 @@ APENNINES_API unsigned long dbtree_cache_pages(dbtree *bt, u32 n) {
     return cache_init(&bt->cache, n);
 }
 
-APENNINES_API unsigned long dbtree_stats(dbtree *bt,
+static unsigned long dbtree_stats_impl(dbtree *bt,
                                          u64 *out_num_pages,
                                          u64 *out_num_keys,
                                          u64 *out_cache_hits,
@@ -1583,7 +1640,13 @@ static unsigned long descend_rightmost(u32 *out_leaf, dbtree *bt, u32 start) {
     return 2;
 }
 
-APENNINES_API unsigned long dbtree_seek(dbtree_cursor **out, dbtree *bt,
+/* Forward declarations so dbtree_seek_impl can chain to the cursor
+ * advance helpers without bouncing through the public locked wrappers
+ * (which would try to re-acquire the already-held mutex). */
+static unsigned long dbtree_cursor_next_impl(dbtree_cursor *c);
+static unsigned long dbtree_cursor_prev_impl(dbtree_cursor *c);
+
+static unsigned long dbtree_seek_impl(dbtree_cursor **out, dbtree *bt,
                                         const u8 *key, u64 key_len,
                                         dbtree_seek_mode mode) {
     if (!out) return 1;
@@ -1655,7 +1718,7 @@ APENNINES_API unsigned long dbtree_seek(dbtree_cursor **out, dbtree *bt,
             c->valid = 1;
         } else {
             c->slot_idx = pos;
-            if (dbtree_cursor_next(c) != 0) { free(c); return 6; }
+            if (dbtree_cursor_next_impl(c) != 0) { free(c); return 6; }
         }
         break;
     case DBTREE_SEEK_GT:
@@ -1667,7 +1730,7 @@ APENNINES_API unsigned long dbtree_seek(dbtree_cursor **out, dbtree *bt,
             /* step to next leaf */
             c->slot_idx = c->slot_idx - 1 >= nslots ? nslots : c->slot_idx;
             c->valid = 1;
-            if (dbtree_cursor_next(c) != 0) { free(c); return 6; }
+            if (dbtree_cursor_next_impl(c) != 0) { free(c); return 6; }
         }
         break;
     case DBTREE_SEEK_LE:
@@ -1677,7 +1740,7 @@ APENNINES_API unsigned long dbtree_seek(dbtree_cursor **out, dbtree *bt,
             /* step to prev leaf */
             c->slot_idx = 0;
             c->valid = 1;
-            if (dbtree_cursor_prev(c) != 0) { free(c); return 6; }
+            if (dbtree_cursor_prev_impl(c) != 0) { free(c); return 6; }
         }
         break;
     case DBTREE_SEEK_LT:
@@ -1685,7 +1748,7 @@ APENNINES_API unsigned long dbtree_seek(dbtree_cursor **out, dbtree *bt,
         else {
             c->slot_idx = 0;
             c->valid = 1;
-            if (dbtree_cursor_prev(c) != 0) { free(c); return 6; }
+            if (dbtree_cursor_prev_impl(c) != 0) { free(c); return 6; }
         }
         break;
     default:
@@ -1700,7 +1763,7 @@ APENNINES_API unsigned long dbtree_seek(dbtree_cursor **out, dbtree *bt,
     return 0;
 }
 
-APENNINES_API unsigned long dbtree_cursor_next(dbtree_cursor *c) {
+static unsigned long dbtree_cursor_next_impl(dbtree_cursor *c) {
     if (!c) return 1;
     page_buf *b;
     unsigned long rc = cache_pin(&b, c->bt, c->leaf_page);
@@ -1734,7 +1797,7 @@ APENNINES_API unsigned long dbtree_cursor_next(dbtree_cursor *c) {
     return 2;
 }
 
-APENNINES_API unsigned long dbtree_cursor_prev(dbtree_cursor *c) {
+static unsigned long dbtree_cursor_prev_impl(dbtree_cursor *c) {
     if (!c) return 1;
     if (c->slot_idx > 0) {
         c->slot_idx--;
@@ -1777,7 +1840,7 @@ APENNINES_API unsigned long dbtree_cursor_key(const u8 **out, u64 *out_len,
     return 0;
 }
 
-APENNINES_API unsigned long dbtree_cursor_value(u8 **out, u64 *out_len,
+static unsigned long dbtree_cursor_value_impl(u8 **out, u64 *out_len,
                                                 dbtree_cursor *c) {
     if (!out) return 1;
     if (!out_len) return 2;
@@ -1820,4 +1883,115 @@ APENNINES_API unsigned long dbtree_cursor_close(dbtree_cursor *c) {
     free(c->key_buf);
     free(c);
     return 0;
+}
+
+/* ================================================================
+ *  Lock-wrapping public entry points (Phase B + D).
+ *
+ *  Writers take the write side of tree_rwlock (put/delete/flush/sync/
+ *  cache_pages). Readers take the read side (get/seek/stats/cursor_*).
+ *  Concurrent readers parallelise end-to-end; they serialise only
+ *  inside cache_pin on cache_mutex, held briefly across the LRU +
+ *  file-I/O critical section.
+ * ================================================================ */
+
+APENNINES_API unsigned long dbtree_put(dbtree *bt,
+                                       const u8 *key, u64 key_len,
+                                       const u8 *value, u64 val_len) {
+    if (!bt) return 1;
+    BT_WLOCK(bt);
+    unsigned long rc = dbtree_put_impl(bt, key, key_len, value, val_len);
+    BT_WUNLOCK(bt);
+    return rc;
+}
+
+APENNINES_API unsigned long dbtree_get(u8 **out, u64 *out_len,
+                                       dbtree *bt,
+                                       const u8 *key, u64 key_len) {
+    if (!bt) return 3;
+    BT_RLOCK(bt);
+    unsigned long rc = dbtree_get_impl(out, out_len, bt, key, key_len);
+    BT_RUNLOCK(bt);
+    return rc;
+}
+
+APENNINES_API unsigned long dbtree_delete(dbtree *bt,
+                                          const u8 *key, u64 key_len) {
+    if (!bt) return 1;
+    BT_WLOCK(bt);
+    unsigned long rc = dbtree_delete_impl(bt, key, key_len);
+    BT_WUNLOCK(bt);
+    return rc;
+}
+
+APENNINES_API unsigned long dbtree_flush(dbtree *bt) {
+    if (!bt) return 1;
+    BT_WLOCK(bt);
+    unsigned long rc = dbtree_flush_impl(bt);
+    BT_WUNLOCK(bt);
+    return rc;
+}
+
+APENNINES_API unsigned long dbtree_sync(dbtree *bt) {
+    if (!bt) return 1;
+    BT_WLOCK(bt);
+    unsigned long rc = dbtree_sync_impl(bt);
+    BT_WUNLOCK(bt);
+    return rc;
+}
+
+APENNINES_API unsigned long dbtree_cache_pages(dbtree *bt, u32 n) {
+    if (!bt) return 1;
+    BT_WLOCK(bt);
+    unsigned long rc = dbtree_cache_pages_impl(bt, n);
+    BT_WUNLOCK(bt);
+    return rc;
+}
+
+APENNINES_API unsigned long dbtree_stats(dbtree *bt,
+                                         u64 *out_num_pages,
+                                         u64 *out_num_keys,
+                                         u64 *out_cache_hits,
+                                         u64 *out_cache_misses) {
+    if (!bt) return 1;
+    BT_RLOCK(bt);
+    unsigned long rc = dbtree_stats_impl(bt, out_num_pages, out_num_keys,
+                                          out_cache_hits, out_cache_misses);
+    BT_RUNLOCK(bt);
+    return rc;
+}
+
+APENNINES_API unsigned long dbtree_seek(dbtree_cursor **out, dbtree *bt,
+                                        const u8 *key, u64 key_len,
+                                        dbtree_seek_mode mode) {
+    if (!bt) return 2;
+    BT_RLOCK(bt);
+    unsigned long rc = dbtree_seek_impl(out, bt, key, key_len, mode);
+    BT_RUNLOCK(bt);
+    return rc;
+}
+
+APENNINES_API unsigned long dbtree_cursor_next(dbtree_cursor *c) {
+    if (!c) return 1;
+    BT_RLOCK(c->bt);
+    unsigned long rc = dbtree_cursor_next_impl(c);
+    BT_RUNLOCK(c->bt);
+    return rc;
+}
+
+APENNINES_API unsigned long dbtree_cursor_prev(dbtree_cursor *c) {
+    if (!c) return 1;
+    BT_RLOCK(c->bt);
+    unsigned long rc = dbtree_cursor_prev_impl(c);
+    BT_RUNLOCK(c->bt);
+    return rc;
+}
+
+APENNINES_API unsigned long dbtree_cursor_value(u8 **out, u64 *out_len,
+                                                dbtree_cursor *c) {
+    if (!c) return 3;
+    BT_RLOCK(c->bt);
+    unsigned long rc = dbtree_cursor_value_impl(out, out_len, c);
+    BT_RUNLOCK(c->bt);
+    return rc;
 }

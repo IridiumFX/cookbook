@@ -40,6 +40,26 @@ typedef struct db_storage_vt {
     unsigned long (*iter_create) (db_storage_iter **out, void *handle,
                                    const u8 *prefix, u64 prefix_len);
 
+    /* probe_first / probe_last — return the lex-smallest / lex-largest
+     * key that matches `prefix`, plus its value. Used by the engine's
+     * MIN/MAX aggregate fast path when the column has an index. btree
+     * answers in O(log N); kv falls back to a full-scan because its
+     * iter order is hash-bucket not lex. Caller owns *out_k / *out_v
+     * buffers (malloc'd). Hatch 5 if no key matches the prefix. */
+    unsigned long (*probe_first)(u8 **out_k, u64 *out_kl,
+                                  u8 **out_v, u64 *out_vl,
+                                  void *handle,
+                                  const u8 *prefix, u64 prefix_len);
+    unsigned long (*probe_last) (u8 **out_k, u64 *out_kl,
+                                  u8 **out_v, u64 *out_vl,
+                                  void *handle,
+                                  const u8 *prefix, u64 prefix_len);
+
+    /* sorted_iter — 1 iff iter_create returns keys in lex-ascending
+     * order. The query planner gates ORDER BY-via-index + BETWEEN
+     * early-terminate optimisations on this. */
+    int sorted_iter;
+
     unsigned long (*compact)    (void *handle);
     unsigned long (*flush)      (void *handle);
 } db_storage_vt;

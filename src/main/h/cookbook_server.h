@@ -50,8 +50,9 @@ COOKBOOK_API void cookbook_server_stop(cookbook_server *srv);
 COOKBOOK_API size_t cookbook_validate_ascii(const char *data, size_t len);
 
 /* Serialize a PastaValue tree to JSON. Returns malloc'd string, NULL on error.
-   PastaValue is a typedef for BastaValue (basta is a superset of pasta). */
-struct BastaValue;
-COOKBOOK_API char *cookbook_pasta_to_json(const struct BastaValue *v);
+   PastaValue is a forward-declared struct from the pasta_compat shim
+   (backed by apennines t4/pasta since rc4). */
+struct PastaValue;
+COOKBOOK_API char *cookbook_pasta_to_json(const struct PastaValue *v);
 
 #endif /* COOKBOOK_SERVER_H */

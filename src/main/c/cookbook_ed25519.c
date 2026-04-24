@@ -182,32 +182,15 @@ void cookbook_ed25519_sha512_test(const void *data, size_t len, unsigned char ou
 
 
 /* ------------------------------------------------------------------ */
-/*  2. CSPRNG                                                          */
+/*  2. CSPRNG — via apennines/t1/random/entropy                         */
 /* ------------------------------------------------------------------ */
 
-#ifdef _WIN32
-#include <windows.h>
-#include <bcrypt.h>
-#pragma comment(lib, "bcrypt")
+#include "apennines/t1/random/entropy.h"
 
 static int csprng_bytes(void *buf, size_t n)
 {
-    NTSTATUS status = BCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)n,
-                                       BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-    return (status >= 0) ? 0 : -1;
+    return entropy_get_system((unsigned char *)buf, (unsigned long long)n) == 0 ? 0 : -1;
 }
-#else
-#include <stdio.h>
-
-static int csprng_bytes(void *buf, size_t n)
-{
-    FILE *f = fopen("/dev/urandom", "rb");
-    if (!f) return -1;
-    size_t rd = fread(buf, 1, n, f);
-    fclose(f);
-    return (rd == n) ? 0 : -1;
-}
-#endif
 
 /* ------------------------------------------------------------------ */
 /*  3. Field arithmetic - fe = uint64_t[5], 5x51-bit limbs            */

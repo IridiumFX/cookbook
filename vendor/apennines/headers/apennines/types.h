@@ -12,6 +12,9 @@ typedef int16_t   i16;
 typedef int32_t   i32;
 typedef int64_t   i64;
 
+typedef float     f32;
+typedef double    f64;
+
 typedef struct { u64 lo; u64 hi; } u128;
 
 #endif /* APENNINES_TYPES_H */

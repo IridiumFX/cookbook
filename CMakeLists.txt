@@ -9,55 +9,18 @@ set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
 include(GNUInstallDirs)
 
-# ---------- vendor: basta (static, no tests) ----------
-# Basta is a strict superset of Pasta (adds BASTA_BLOB for binary data).
-# We use basta as the single text/binary format library — cookbook code
-# includes a compat pasta.h header (src/main/h/pasta.h) that maps the
-# pasta_* API to basta_*.  Basta's CMakeLists.txt hardcodes SHARED, so
-# we build it manually as STATIC.
-
-set(BASTA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-add_library(basta STATIC
-    vendor/basta/src/main/c/basta_lexer.c
-    vendor/basta/src/main/c/basta_parser.c
-    vendor/basta/src/main/c/basta_value.c
-    vendor/basta/src/main/c/basta_writer.c
-)
-target_include_directories(basta
-    PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/vendor/basta/src/main/h>
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vendor/basta/src/main/c
-)
-target_compile_definitions(basta PUBLIC BASTA_STATIC)
-target_compile_definitions(basta PRIVATE BASTA_BUILDING)
-
-# ---------- vendor: alforno (static, no tests, uses basta via ALF_USE_BASTA) ----------
-# ALF_USE_BASTA tells alforno to use basta instead of pasta.  The basta
-# target already exists (defined above as STATIC), so mark it as populated
-# for FetchContent so alforno doesn't try to add_subdirectory it again.
-
-include(FetchContent)
-FetchContent_SetPopulated(basta
-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/basta"
-    BINARY_DIR "${CMAKE_BINARY_DIR}/_deps/basta-build"
-)
-
-set(BUILD_SHARED_LIBS_SAVED ${BUILD_SHARED_LIBS})
-set(BUILD_SHARED_LIBS OFF)
-set(ALF_USE_BASTA ON CACHE BOOL "" FORCE)
-set(ALF_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-add_subdirectory(vendor/alforno)
-set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_SAVED})
-target_compile_definitions(alforno PUBLIC ALF_STATIC)
-
-# ---------- vendor: apennines (TLS 1.3 building blocks) ----------
+# ---------- vendor: apennines (TLS 1.3 building blocks + pasta/alforno) ----------
 # Crypto/encoding/math modules from the apennines project.
 # Used for: AES-GCM, ChaCha20-Poly1305, X25519, ECDH P-256,
 # RSA verify, X.509 cert parsing, HKDF, ASN.1/DER, PEM, bigint.
 
 add_library(apennines STATIC
     vendor/apennines/sources/t1/buffer/buf.c
+    vendor/apennines/sources/t1/buffer/utf8.c
     vendor/apennines/sources/t1/random/entropy.c
+    vendor/apennines/sources/t1/sync/mutex/mutex.c
     vendor/apennines/sources/t1/sync/thread/thread.c
+    vendor/apennines/sources/t2/random/rng.c
     vendor/apennines/sources/t2/crypto/argon2.c
     vendor/apennines/sources/t2/crypto/blake2b.c
     vendor/apennines/sources/t2/crypto/cipher.c
@@ -74,6 +37,8 @@ add_library(apennines STATIC
     vendor/apennines/sources/t2/math/bigint/bigint.c
     vendor/apennines/sources/t2/compress/compress.c
     vendor/apennines/sources/t2/net/addr.c
+    vendor/apennines/sources/t2/string/fmt.c
+    vendor/apennines/sources/t2/string/str.c
     vendor/apennines/sources/t3/async/threadpool.c
     vendor/apennines/sources/t3/crypto/pki.c
     vendor/apennines/sources/t3/db/kv.c
@@ -86,14 +51,20 @@ add_library(apennines STATIC
     vendor/apennines/sources/t4/net/http_client.c
     vendor/apennines/sources/t4/net/https_client.c
     vendor/apennines/sources/t4/net/http_server.c
+    vendor/apennines/sources/t4/pasta/pasta_parser.c
+    vendor/apennines/sources/t4/pasta/pasta_writer.c
+    vendor/apennines/sources/t4/pasta/pasta_value.c
+    vendor/apennines/sources/t4/pasta/alforno.c
 )
 target_include_directories(apennines
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/vendor/apennines/headers>
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vendor/apennines/sources/t4/pasta
 )
 target_compile_definitions(apennines PUBLIC APENNINES_STATIC)
 target_compile_definitions(apennines PRIVATE APENNINES_BUILDING)
 if(WIN32)
-    target_link_libraries(apennines PUBLIC ws2_32)
+    # bcrypt: apennines/t1/random/entropy calls BCryptGenRandom.
+    target_link_libraries(apennines PUBLIC ws2_32 bcrypt)
 endif()
 
 # ---------- vendor: sqlite ----------
@@ -146,20 +117,21 @@ target_include_directories(cookbook
 
 target_compile_definitions(cookbook PUBLIC COOKBOOK_STATIC)
 target_compile_definitions(cookbook PRIVATE BUILDING_COOKBOOK)
-target_link_libraries(cookbook PUBLIC sqlite3 basta alforno apennines)
-if(WIN32)
-    target_link_libraries(cookbook PUBLIC bcrypt)
-endif()
-
+target_link_libraries(cookbook PUBLIC sqlite3 apennines)
+# alforno_compat.c needs pasta_internal.h for in-place include stripping.
+target_include_directories(cookbook PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/apennines/sources/t4/pasta
+)
 
 if(COOKBOOK_HAS_POSTGRES)
     target_compile_definitions(cookbook PRIVATE COOKBOOK_HAS_POSTGRES)
     target_link_libraries(cookbook PRIVATE PostgreSQL::PostgreSQL)
 endif()
 
-# S3 store needs ws2_32 on Windows for sockets; Ed25519 CSPRNG needs bcrypt
+# S3 store + socket layer still call Winsock directly on Windows.
+# (bcrypt now pulled in transitively via apennines.)
 if(WIN32)
-    target_link_libraries(cookbook PRIVATE ws2_32 bcrypt)
+    target_link_libraries(cookbook PRIVATE ws2_32)
 endif()
 
 # ---------- server executable ----------
@@ -191,7 +163,6 @@ list(FILTER COOKBOOK_TEST_SOURCES EXCLUDE REGEX ".*cookbook_stress\\.c$")
 
 add_executable(cookbook_test ${COOKBOOK_TEST_SOURCES})
 target_link_libraries(cookbook_test PRIVATE cookbook)
-target_compile_definitions(cookbook_test PRIVATE COOKBOOK_HAS_BASTA)
 if(WIN32)
     target_link_options(cookbook_test PRIVATE -Wl,--stack,8388608)
 endif()

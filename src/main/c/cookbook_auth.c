@@ -1,5 +1,6 @@
 #include "cookbook_auth.h"
 #include "cookbook_ed25519.h"
+#include "apennines/t1/random/entropy.h"
 #include "apennines/t2/crypto/argon2.h"
 #include "apennines/t2/crypto/ct.h"
 #include <stdio.h>
@@ -7,24 +8,14 @@
 #include <string.h>
 #include <time.h>
 #ifdef _WIN32
-#include <windows.h>
-#include <bcrypt.h>
-#pragma comment(lib, "bcrypt")
-#else
-#include <stdio.h>
+  /* for InterlockedIncrement used by the jti counter below */
+  #include <windows.h>
 #endif
 
 static int cookbook_random_bytes(void *buf, size_t n) {
-#ifdef _WIN32
-    return (BCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)n,
-                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0) ? 0 : -1;
-#else
-    FILE *f = fopen("/dev/urandom", "rb");
-    if (!f) return -1;
-    size_t rd = fread(buf, 1, n, f);
-    fclose(f);
-    return (rd == n) ? 0 : -1;
-#endif
+    /* entropy_get_system wraps BCryptGenRandom on Windows and
+     * getentropy(2) / /dev/urandom on Unix — Nova-portable. */
+    return entropy_get_system((unsigned char *)buf, (unsigned long long)n) == 0 ? 0 : -1;
 }
 
 /* ==== Base64url ==== */

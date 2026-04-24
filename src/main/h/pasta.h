@@ -1,83 +1,81 @@
 /*
- * Pasta compatibility header — maps Pasta API to Basta.
+ * pasta.h — cookbook's handler-facing pasta API.
  *
- * Basta is a strict superset of Pasta (adds BASTA_BLOB for binary data).
- * All Pasta documents parse identically through Basta.  This header lets
- * existing code that uses pasta_* names compile and link against libbasta
- * without modification.
+ * Redirects to the pasta_compat shim, which implements the sibling-project
+ * pasta_* / PastaValue API on top of apennines `t4/pasta`. Cookbook code
+ * compiles unchanged; the pasta_compat.c wrappers translate each call to
+ * the apennines native pasta_value / out-param / hatch-code shape.
  *
- * The only API difference: basta_write() takes an extra size_t *out_len
- * parameter (for blob byte-count reporting).  The macro below passes NULL
- * so the caller signature stays pasta_write(v, flags).
+ * Also provides basta_* aliases for call sites that went through the
+ * rc1-era `basta.h` superset header. Semantically basta is pasta with
+ * the added BASTA_BLOB type — cookbook doesn't use blobs, so the alias
+ * is a straight rename.
+ *
+ * History: basta superseded pasta in rc1-era; rc4 switched the backend to
+ * apennines' native t4/pasta, with pasta_compat as the thin adapter.
  */
 #ifndef PASTA_H
 #define PASTA_H
 
-#include "basta.h"
+#include "pasta_compat.h"
 
-/* ---- Types ---- */
-typedef BastaValue   PastaValue;
-typedef BastaResult  PastaResult;
+/* ---- Basta-name aliases (cookbook legacy — rc1 era) ------------------- */
 
-/* ---- Error codes ---- */
-typedef BastaError   PastaError;
-#define PASTA_OK                 BASTA_OK
-#define PASTA_ERR_ALLOC          BASTA_ERR_ALLOC
-#define PASTA_ERR_SYNTAX         BASTA_ERR_SYNTAX
-#define PASTA_ERR_UNEXPECTED_TOKEN BASTA_ERR_UNEXPECTED_TOKEN
-#define PASTA_ERR_UNEXPECTED_EOF BASTA_ERR_UNEXPECTED_EOF
+typedef PastaValue  BastaValue;
+typedef PastaType   BastaType;
+typedef PastaError  BastaError;
+typedef PastaResult BastaResult;
 
-/* ---- Value types ---- */
-typedef BastaType    PastaType;
-#define PASTA_NULL    BASTA_NULL
-#define PASTA_BOOL    BASTA_BOOL
-#define PASTA_NUMBER  BASTA_NUMBER
-#define PASTA_STRING  BASTA_STRING
-#define PASTA_ARRAY   BASTA_ARRAY
-#define PASTA_MAP     BASTA_MAP
-#define PASTA_LABEL   BASTA_LABEL
+#define BASTA_NULL    PASTA_NULL
+#define BASTA_BOOL    PASTA_BOOL
+#define BASTA_NUMBER  PASTA_NUMBER
+#define BASTA_STRING  PASTA_STRING
+#define BASTA_ARRAY   PASTA_ARRAY
+#define BASTA_MAP     PASTA_MAP
+#define BASTA_LABEL   PASTA_LABEL
 
-/* ---- Parsing / lifetime ---- */
-#define pasta_parse           basta_parse
-#define pasta_parse_cstr      basta_parse_cstr
-#define pasta_free            basta_free
+#define BASTA_OK                   PASTA_OK
+#define BASTA_ERR_ALLOC            PASTA_ERR_ALLOC
+#define BASTA_ERR_SYNTAX           PASTA_ERR_SYNTAX
+#define BASTA_ERR_UNEXPECTED_TOKEN PASTA_ERR_UNEXPECTED_TOKEN
+#define BASTA_ERR_UNEXPECTED_EOF   PASTA_ERR_UNEXPECTED_EOF
 
-/* ---- Writing ---- */
-/* basta_write takes an extra out_len param; wrap to match pasta_write(v, flags) */
-#define pasta_write(v, flags) basta_write((v), (flags), NULL)
-#define pasta_write_fp        basta_write_fp
-#define PASTA_PRETTY          BASTA_PRETTY
-#define PASTA_COMPACT         BASTA_COMPACT
-#define PASTA_SECTIONS        BASTA_SECTIONS
-#define PASTA_SORTED          BASTA_SORTED
+#define BASTA_PRETTY   PASTA_PRETTY
+#define BASTA_COMPACT  PASTA_COMPACT
+#define BASTA_SECTIONS PASTA_SECTIONS
+#define BASTA_SORTED   PASTA_SORTED
 
-/* ---- Query ---- */
-#define pasta_type            basta_type
-#define pasta_is_null         basta_is_null
-#define pasta_get_bool        basta_get_bool
-#define pasta_get_number      basta_get_number
-#define pasta_get_string      basta_get_string
-#define pasta_get_string_len  basta_get_string_len
-#define pasta_get_label       basta_get_label
-#define pasta_get_label_len   basta_get_label_len
-#define pasta_count           basta_count
-#define pasta_array_get       basta_array_get
-#define pasta_map_get         basta_map_get
-#define pasta_map_key         basta_map_key
-#define pasta_map_value       basta_map_value
-
-/* ---- Building ---- */
-#define pasta_new_null        basta_new_null
-#define pasta_new_bool        basta_new_bool
-#define pasta_new_number      basta_new_number
-#define pasta_new_string      basta_new_string
-#define pasta_new_string_len  basta_new_string_len
-#define pasta_new_label       basta_new_label
-#define pasta_new_label_len   basta_new_label_len
-#define pasta_new_array       basta_new_array
-#define pasta_new_map         basta_new_map
-#define pasta_push            basta_push
-#define pasta_set             basta_set
-#define pasta_set_len         basta_set_len
+#define basta_parse           pasta_parse
+#define basta_parse_cstr      pasta_parse_cstr
+#define basta_free            pasta_free
+#define basta_type            pasta_type
+#define basta_is_null         pasta_is_null
+#define basta_get_bool        pasta_get_bool
+#define basta_get_number      pasta_get_number
+#define basta_get_string      pasta_get_string
+#define basta_get_string_len  pasta_get_string_len
+#define basta_get_label       pasta_get_label
+#define basta_get_label_len   pasta_get_label_len
+#define basta_count           pasta_count
+#define basta_array_get       pasta_array_get
+#define basta_map_get         pasta_map_get
+#define basta_map_key         pasta_map_key
+#define basta_map_value       pasta_map_value
+#define basta_new_null        pasta_new_null
+#define basta_new_bool        pasta_new_bool
+#define basta_new_number      pasta_new_number
+#define basta_new_string      pasta_new_string
+#define basta_new_string_len  pasta_new_string_len
+#define basta_new_label       pasta_new_label
+#define basta_new_label_len   pasta_new_label_len
+#define basta_new_array       pasta_new_array
+#define basta_new_map         pasta_new_map
+#define basta_push            pasta_push
+#define basta_set             pasta_set
+#define basta_set_len         pasta_set_len
+/* basta_write takes an extra out_len param for blob-byte reporting;
+ * wrap to match the pasta_write(v, flags) shape that cookbook uses. */
+#define basta_write(v, flags) pasta_write((v), (flags))
+#define basta_write_fp        pasta_write_fp
 
 #endif /* PASTA_H */

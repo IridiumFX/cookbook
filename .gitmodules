@@ -1,6 +1,0 @@
-[submodule "vendor/basta"]
-	path = vendor/basta
-	url = https://github.com/IridiumFX/Basta.git
-[submodule "vendor/alforno"]
-	path = vendor/alforno
-	url = https://github.com/IridiumFX/alforno.git

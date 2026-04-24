@@ -1,6 +1,6 @@
 # cookbook — Roadmap
 
-**Version**: 1.0-rc3
+**Version**: 1.0-rc4
 **Status as of**: 2026-03-22
 **Spec reference**: cookbook-architecture-M1.docx (d3 final)
 
@@ -327,3 +327,37 @@ Nova-alignment milestone. Civetweb is gone; the organization-wide push to apenni
 - Public HTTP API surface
 - Database schema / credential format
 - Environment variable names and semantics
+
+---
+
+## 1.0-rc4 Summary
+
+Apennines-consolidation milestone. basta + alforno submodules are gone, replaced by apennines' native `t4/pasta` + `t4/pasta/alforno`. Platform-lib calls (`BCryptGenRandom`, `pthread_mutex_t`, `CreateThread`) swapped for apennines wrappers so cookbook source is now single-platform-shape and Nova-portable at the call-site level.
+
+**Key deltas vs rc3:**
+
+- **basta submodule removed.** `vendor/basta/` gone. Vendored apennines' `t4/pasta` as the successor (5 files: `pasta.h`, `pasta_parser.c`, `pasta_writer.c`, `pasta_value.c`, `pasta_internal.h`). New apennines-side dependencies also vendored: `t1/buffer/utf8`, `t2/string/fmt`, `t2/string/str`. Our `src/main/h/pasta.h` now redirects to `pasta_compat.h` (our new in-tree adapter) which wraps apennines' native `pasta_*` API to preserve the `PastaValue` / `pasta_parse_cstr` / etc. surface cookbook handlers use. Legacy `basta_*` names in a handful of call sites aliased to `pasta_*` via macros.
+
+- **alforno submodule removed.** `vendor/alforno/` gone. Vendored apennines' `t4/pasta/alforno.{c,h}`. `src/main/h/alforno.h` redirects to `alforno_compat.h`. The `alf_*` / `AlfContext` / `ALF_CONFLATE` API our policy resolver uses is preserved verbatim through the compat wrapper.
+
+- **`vendor/` is now just `apennines + sqlite`.** Sqlite is the last pure external third-party (optional `libpq` doesn't count — it's system-provided, not apennines territory).
+
+- **Platform-lib ride-along:** cookbook source no longer calls `BCryptGenRandom`, `/dev/urandom`, `pthread_mutex_t` / `pthread_mutex_{init,lock,unlock,destroy}`, `CRITICAL_SECTION` / `EnterCriticalSection` / `LeaveCriticalSection`, `pthread_t` / `pthread_create` / `pthread_join`, `CreateThread` / `WaitForSingleObject` / `CloseHandle`, `Sleep` / `nanosleep`. All replaced by apennines wrappers:
+    - `BCryptGenRandom` / `/dev/urandom` → `entropy_get_system` (t1/random/entropy) — 2 call sites (cookbook_auth salt, cookbook_ed25519 seed)
+    - `pthread_mutex_t` + `CRITICAL_SECTION` → `mutex` (t1/sync/mutex/mutex) — 3 locks (rate_lock, audit_lock, connpool)
+    - `pthread_t` + `HANDLE` + thread creation → `thread_handle` + `thread_create` + `thread_join` (t1/sync/thread) — 1 thread (reconcile)
+    - `Sleep` / `nanosleep` → `thread_sleep` — server poll + reconcile loop
+
+- **Reconcile thread function signature unified.** Was dual `DWORD WINAPI (LPVOID)` + `void *(void *)` behind `#ifdef _WIN32`; now single `unsigned long (void *)` matching apennines' `thread_fn`.
+
+- **Tests:** 597/597 pass. (-20 vs rc3: the `test_basta_integration` block under `#ifdef COOKBOOK_HAS_BASTA` went away with the basta submodule. Those 20 asserts exercised basta's direct API; they're redundant now that pasta/alforno are apennines-native, and the remaining tests cover the same semantics through cookbook's normal code paths.)
+
+- **`now` build: 2.0MB → 2.1MB** (basta+alforno sources removed but apennines pasta + utf8 + str + fmt + mutex + rng vendored added; roughly balanced, +90KB net).
+
+- **Nova-readiness:** every line of cookbook source that used to have a `#ifdef _WIN32` / `#else` branch for threading or CSPRNG is now a single portable call. Nova cutover will swap the `#ifdef` bodies inside apennines, cookbook source stays untouched.
+
+**What did NOT change:**
+- Public HTTP API surface
+- Database schema / credential format
+- Environment variable names and semantics
+- Handler code (PastaValue / pasta_* calls still work unchanged via compat)

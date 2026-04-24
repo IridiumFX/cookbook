@@ -10,6 +10,8 @@
 #include "cookbook_tls.h"
 #include <apennines/t1/buffer/buf.h>
 #include <apennines/t1/random/entropy.h>
+#include <apennines/t1/sync/mutex/mutex.h>
+#include <apennines/t1/sync/thread/thread.h>
 #include <apennines/t2/encoding/pem.h>
 #include <apennines/t3/crypto/pki.h>
 #include <apennines/t3/db/wal.h>
@@ -34,10 +36,8 @@
 
 #include <time.h>
 #ifdef _WIN32
+  /* for Interlocked* atomics used by METRIC_INC / METRIC_ADD below */
   #include <windows.h>
-#else
-  #include <pthread.h>
-  #include <unistd.h>
 #endif
 
 /* #28: rate limit bucket */
@@ -106,15 +106,9 @@ struct cookbook_server {
     int device_code_count;
 
     volatile int        reconcile_running;
-#ifdef _WIN32
-    HANDLE              reconcile_thread;
-    CRITICAL_SECTION    rate_lock;
-    CRITICAL_SECTION    audit_lock;
-#else
-    pthread_t           reconcile_thread;
-    pthread_mutex_t     rate_lock;
-    pthread_mutex_t     audit_lock;
-#endif
+    thread_handle       reconcile_thread;
+    mutex               rate_lock;
+    mutex               audit_lock;
 };
 
 /* ==== metrics helpers ==== */
@@ -521,11 +515,7 @@ static int check_rate_limit(cookbook_server *srv, const char *sub) {
 
     int64_t now = (int64_t)time(NULL);
 
-#ifdef _WIN32
-    EnterCriticalSection(&srv->rate_lock);
-#else
-    pthread_mutex_lock(&srv->rate_lock);
-#endif
+    mutex_lock(&srv->rate_lock);
 
     rate_bucket *b = srv->rate_buckets;
     while (b) {
@@ -555,11 +545,7 @@ static int check_rate_limit(cookbook_server *srv, const char *sub) {
             blocked = 1;
     }
 
-#ifdef _WIN32
-    LeaveCriticalSection(&srv->rate_lock);
-#else
-    pthread_mutex_unlock(&srv->rate_lock);
-#endif
+    mutex_unlock(&srv->rate_lock);
 
     return blocked;
 }
@@ -1021,11 +1007,7 @@ static void audit_log(cookbook_server *srv, const char *event,
     }
 
     if (n > 0) {
-#ifdef _WIN32
-        EnterCriticalSection(&srv->audit_lock);
-#else
-        pthread_mutex_lock(&srv->audit_lock);
-#endif
+        mutex_lock(&srv->audit_lock);
         /* write to flat file (human-readable) */
         if (f) {
             fwrite(line, 1, (size_t)n, f);
@@ -1036,11 +1018,7 @@ static void audit_log(cookbook_server *srv, const char *event,
             u64 seq;
             wal_append(&seq, w, (const u8 *)line, (u64)n);
         }
-#ifdef _WIN32
-        LeaveCriticalSection(&srv->audit_lock);
-#else
-        pthread_mutex_unlock(&srv->audit_lock);
-#endif
+        mutex_unlock(&srv->audit_lock);
     }
 }
 
@@ -1243,11 +1221,12 @@ static void evict_expired_objects(cookbook_server *srv) {
     free(ctx.cache_keys);
 }
 
-#ifdef _WIN32
-static DWORD WINAPI reconcile_thread_fn(LPVOID arg) {
+/* Apennines thread_fn signature: unsigned long (*)(void *). 60-second sleep
+ * uses thread_sleep (nanoseconds) so we don't need platform sleep calls. */
+static unsigned long reconcile_thread_fn(void *arg) {
     cookbook_server *srv = (cookbook_server *)arg;
     while (srv->reconcile_running) {
-        Sleep(60000);  /* check every 60 seconds */
+        thread_sleep(60ULL * 1000ULL * 1000ULL * 1000ULL);  /* 60 seconds */
         if (srv->reconcile_running) {
             reconcile_stale_pending(srv);
             evict_expired_objects(srv);
@@ -1255,19 +1234,6 @@ static DWORD WINAPI reconcile_thread_fn(LPVOID arg) {
     }
     return 0;
 }
-#else
-static void *reconcile_thread_fn(void *arg) {
-    cookbook_server *srv = (cookbook_server *)arg;
-    while (srv->reconcile_running) {
-        sleep(60);  /* check every 60 seconds */
-        if (srv->reconcile_running) {
-            reconcile_stale_pending(srv);
-            evict_expired_objects(srv);
-        }
-    }
-    return NULL;
-}
-#endif
 
 /* ==== route: GET /healthz ==== */
 
@@ -5561,14 +5527,9 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
             tp, 1);
     }
 
-    /* initialize rate limiter lock */
-#ifdef _WIN32
-    InitializeCriticalSection(&srv->rate_lock);
-    InitializeCriticalSection(&srv->audit_lock);
-#else
-    pthread_mutex_init(&srv->rate_lock, NULL);
-    pthread_mutex_init(&srv->audit_lock, NULL);
-#endif
+    /* initialize locks (apennines mutex: pthread on Unix, CRITICAL_SECTION on Windows, Nova-portable) */
+    mutex_create(&srv->rate_lock);
+    mutex_create(&srv->audit_lock);
 
     /* audit logs — three separate files by category + WAL for durability */
     if (opts->audit_log_dir) {
@@ -5717,14 +5678,9 @@ cookbook_server *cookbook_server_start(const cookbook_server_opts *opts) {
         cookbook_http_register_routes(srv);
     }
 
-    /* #20: start reconciliation thread */
+    /* #20: start reconciliation thread via apennines wrapper */
     srv->reconcile_running = 1;
-#ifdef _WIN32
-    srv->reconcile_thread = CreateThread(NULL, 0, reconcile_thread_fn,
-                                          srv, 0, NULL);
-#else
-    pthread_create(&srv->reconcile_thread, NULL, reconcile_thread_fn, srv);
-#endif
+    thread_create(&srv->reconcile_thread, reconcile_thread_fn, srv);
 
     fprintf(stdout, "cookbook: listening on %s (registry: %s)\n",
             url, srv->registry_id);
@@ -5748,28 +5704,17 @@ int cookbook_server_poll(cookbook_server *srv, int timeout_ms) {
     if (!srv) return -1;
     /* HTTP accept loop runs on its own thread inside apennines http_server.
      * Poll is just a sleep so main() can honour SIGINT/SIGTERM. */
-#ifdef _WIN32
-    Sleep((DWORD)timeout_ms);
-#else
-    struct timespec ts = { timeout_ms / 1000, (timeout_ms % 1000) * 1000000L };
-    nanosleep(&ts, NULL);
-#endif
+    thread_sleep((unsigned long long)timeout_ms * 1000000ULL);  /* ms → ns */
     return 0;
 }
 
 void cookbook_server_stop(cookbook_server *srv) {
     if (!srv) return;
 
-    /* stop reconciliation thread */
+    /* stop reconciliation thread — apennines thread_join handles both
+     * pthread_join and Win32 WaitForSingleObject + CloseHandle. */
     srv->reconcile_running = 0;
-#ifdef _WIN32
-    if (srv->reconcile_thread) {
-        WaitForSingleObject(srv->reconcile_thread, 5000);
-        CloseHandle(srv->reconcile_thread);
-    }
-#else
-    pthread_join(srv->reconcile_thread, NULL);
-#endif
+    thread_join(NULL, &srv->reconcile_thread);
 
     cookbook_grid_destroy_pool();
 
@@ -5789,13 +5734,8 @@ void cookbook_server_stop(cookbook_server *srv) {
         b = next;
     }
 
-#ifdef _WIN32
-    DeleteCriticalSection(&srv->rate_lock);
-    DeleteCriticalSection(&srv->audit_lock);
-#else
-    pthread_mutex_destroy(&srv->rate_lock);
-    pthread_mutex_destroy(&srv->audit_lock);
-#endif
+    mutex_destroy(&srv->rate_lock);
+    mutex_destroy(&srv->audit_lock);
 
     if (srv->audit_auth)   fclose(srv->audit_auth);
     if (srv->audit_access) fclose(srv->audit_access);

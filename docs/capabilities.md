@@ -1,7 +1,7 @@
 # cookbook — Current Capabilities
 
-**Version**: 1.0-rc3
-**Last updated**: 2026-04-19
+**Version**: 1.0-rc4
+**Last updated**: 2026-04-24
 **Phases complete**: A–E (M1 spec), F1–F3 (feature gaps), G1–G5 (grid federation), Auth v2 (Phases 1–4), Auth v2.5, Native Ed25519, Basta migration, Group management, Persistent revocation, Object cache, LDAP, OIDC, TLS 1.3, Build graph cache, Reproducibility, Gzip, Connection pool, KV backend, Audit (3-file split)
 
 ---

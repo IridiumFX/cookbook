@@ -6,18 +6,13 @@
  */
 
 #include "cookbook_connpool.h"
+#include "apennines/t1/sync/mutex/mutex.h"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <pthread.h>
-#endif
 
 #define POOL_MAX_ENTRIES 128
 
@@ -34,11 +29,7 @@ struct cookbook_connpool {
     int        count;
     int        max_idle;
     int        idle_timeout_sec;
-#ifdef _WIN32
-    CRITICAL_SECTION lock;
-#else
-    pthread_mutex_t  lock;
-#endif
+    mutex      lock;
 };
 
 cookbook_connpool *cookbook_connpool_create(int max_idle, int idle_timeout_sec) {
@@ -46,29 +37,12 @@ cookbook_connpool *cookbook_connpool_create(int max_idle, int idle_timeout_sec) 
     if (!pool) return NULL;
     pool->max_idle = max_idle > 0 ? max_idle : 4;
     pool->idle_timeout_sec = idle_timeout_sec > 0 ? idle_timeout_sec : 60;
-#ifdef _WIN32
-    InitializeCriticalSection(&pool->lock);
-#else
-    pthread_mutex_init(&pool->lock, NULL);
-#endif
+    mutex_create(&pool->lock);
     return pool;
 }
 
-static void pool_lock(cookbook_connpool *pool) {
-#ifdef _WIN32
-    EnterCriticalSection(&pool->lock);
-#else
-    pthread_mutex_lock(&pool->lock);
-#endif
-}
-
-static void pool_unlock(cookbook_connpool *pool) {
-#ifdef _WIN32
-    LeaveCriticalSection(&pool->lock);
-#else
-    pthread_mutex_unlock(&pool->lock);
-#endif
-}
+static void pool_lock(cookbook_connpool *pool)   { mutex_lock(&pool->lock); }
+static void pool_unlock(cookbook_connpool *pool) { mutex_unlock(&pool->lock); }
 
 /* Prune expired entries (must be called with lock held) */
 static void pool_prune(cookbook_connpool *pool) {
@@ -158,10 +132,6 @@ void cookbook_connpool_destroy(cookbook_connpool *pool) {
     pool->count = 0;
     pool_unlock(pool);
 
-#ifdef _WIN32
-    DeleteCriticalSection(&pool->lock);
-#else
-    pthread_mutex_destroy(&pool->lock);
-#endif
+    mutex_destroy(&pool->lock);
     free(pool);
 }

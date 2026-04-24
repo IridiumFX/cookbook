@@ -927,14 +927,37 @@ static sql_ast *parse_select(parser *p) {
 }
 
 static sql_ast *parse_insert(parser *p) {
-    /* INSERT already consumed */
+    /* INSERT already consumed. SQLite-style conflict clause: optional
+     * "OR REPLACE|IGNORE|ABORT|ROLLBACK|FAIL". We support REPLACE
+     * (upsert) and treat everything else as plain INSERT. */
+    int or_replace = 0;
+    if (tok_is_keyword(peek(p), "OR")) {
+        advance(p);
+        const sql_token *t = peek(p);
+        /* REPLACE / IGNORE / ABORT / ROLLBACK / FAIL aren't in the
+         * keyword set — they arrive as IDENT. Match case-insensitively. */
+        if (t && (tok_is(t, SQL_TOK_IDENT) || tok_is(t, SQL_TOK_KEYWORD))) {
+            int is_replace = (t->text_len == 7);
+            if (is_replace) {
+                for (int i = 0; i < 7; i++) {
+                    if (toupper((unsigned char)t->text[i]) != "REPLACE"[i]) {
+                        is_replace = 0; break;
+                    }
+                }
+            }
+            if (is_replace) or_replace = 1;
+            advance(p);
+        }
+    }
+
     const sql_token *t = peek(p);
     if (!tok_is_keyword(t, "INTO")) return NULL;
     advance(p);
 
     t = peek(p);
     if (!t || (!tok_is(t, SQL_TOK_IDENT) && !tok_is(t, SQL_TOK_KEYWORD))) return NULL;
-    sql_ast *node = ast_new(SQL_AST_INSERT, t->text);
+    sql_ast *node = ast_new(or_replace ? SQL_AST_INSERT_OR_REPLACE : SQL_AST_INSERT,
+                             t->text);
     if (!node) return NULL;
     advance(p);
 
@@ -970,9 +993,39 @@ static sql_ast *parse_insert(parser *p) {
     for (;;) {
         t = peek(p);
         if (!t || tok_is(t, SQL_TOK_RPAREN)) break;
-        if (tok_is(t, SQL_TOK_NUMBER) || tok_is(t, SQL_TOK_STRING) ||
-            tok_is(t, SQL_TOK_IDENT) || tok_is_keyword(t, "NULL") ||
-            tok_is(t, SQL_TOK_PLACEHOLDER)) {
+
+        /* Function call form: IDENT/KEYWORD followed by LPAREN.
+         * Example: datetime('now'). Emit SQL_AST_FUNC_CALL with the
+         * function name in text and each string/number arg as a
+         * SQL_AST_LITERAL child. */
+        if ((tok_is(t, SQL_TOK_IDENT) || tok_is(t, SQL_TOK_KEYWORD))
+            && p->pos + 1 < p->tokens->count
+            && tok_is(&p->tokens->tokens[p->pos + 1], SQL_TOK_LPAREN)) {
+            sql_ast *call = ast_new(SQL_AST_FUNC_CALL, t->text);
+            if (!call) { sql_ast_destroy(node); return NULL; }
+            advance(p);   /* function name */
+            advance(p);   /* ( */
+            for (;;) {
+                const sql_token *at = peek(p);
+                if (!at || tok_is(at, SQL_TOK_RPAREN)) break;
+                if (tok_is(at, SQL_TOK_STRING) || tok_is(at, SQL_TOK_NUMBER)
+                    || tok_is(at, SQL_TOK_IDENT) || tok_is(at, SQL_TOK_KEYWORD)
+                    || tok_is(at, SQL_TOK_PLACEHOLDER)) {
+                    sql_ast *arg = ast_new(SQL_AST_LITERAL, at->text);
+                    if (!arg) { sql_ast_destroy(call); sql_ast_destroy(node); return NULL; }
+                    if (ast_add_child(call, arg) < 0) {
+                        sql_ast_destroy(call); sql_ast_destroy(node); return NULL;
+                    }
+                    advance(p);
+                }
+                if (tok_is(peek(p), SQL_TOK_COMMA)) advance(p);
+            }
+            if (tok_is(peek(p), SQL_TOK_RPAREN)) advance(p);
+            if (ast_add_child(node, call) < 0) { sql_ast_destroy(node); return NULL; }
+        }
+        else if (tok_is(t, SQL_TOK_NUMBER) || tok_is(t, SQL_TOK_STRING) ||
+                 tok_is(t, SQL_TOK_IDENT) || tok_is_keyword(t, "NULL") ||
+                 tok_is(t, SQL_TOK_PLACEHOLDER)) {
             sql_ast *val = ast_new(SQL_AST_LITERAL, t->text);
             if (!val) { sql_ast_destroy(node); return NULL; }
             if (ast_add_child(node, val) < 0) { sql_ast_destroy(node); return NULL; }

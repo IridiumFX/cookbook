@@ -22,6 +22,12 @@ typedef struct db_stmt db_stmt;
 /* ---- Connection ---- */
 
 APENNINES_API unsigned long db_open(db_conn **out, const char *path);
+
+/* db_open_ex — open with a specific storage backend.
+ * backend: DB_STORAGE_HASHKV (0, default) or DB_STORAGE_BTREE (1).
+ * See apennines/t4/db/db_storage.h for the flag values. */
+APENNINES_API unsigned long db_open_ex(db_conn **out, const char *path, u32 backend);
+
 APENNINES_API unsigned long db_close(db_conn *db);
 
 /* ---- Execute (no result set) ---- */

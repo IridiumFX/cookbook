@@ -64,6 +64,14 @@ typedef struct {
                                    * value in an expression; rewritten at
                                    * prepare time into a COLUMN_REF against
                                    * the stmt's synthetic group-row table */
+#define SQL_AST_INSERT_OR_REPLACE 23  /* sqlite INSERT OR REPLACE upsert.
+                                       * text=table name. Semantics: on any
+                                       * UNIQUE/PK collision, delete the
+                                       * colliding row then insert the new. */
+#define SQL_AST_FUNC_CALL    24   /* "fnname" — a function call in a value
+                                   * position (e.g. datetime('now') inside
+                                   * VALUES). Children are the arg literals.
+                                   * exec_insert evaluates at insert time. */
 
 typedef struct sql_ast sql_ast;
 

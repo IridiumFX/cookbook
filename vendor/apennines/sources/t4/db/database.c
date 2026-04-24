@@ -1,4 +1,5 @@
 #include "apennines/t4/db/database.h"
+#include "apennines/t4/db/db_storage.h"
 #include "apennines/t3/db/kv.h"
 #include "apennines/t3/db/wal.h"
 #include "apennines/t3/db/sql.h"
@@ -9,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ------------------------------------------------------------------ */
 /*  Constants                                                          */
@@ -135,7 +137,8 @@ typedef struct {
 } db_undo_entry;
 
 struct db_conn {
-    kv_store  *kv;
+    const db_storage_vt *vt;
+    void      *storage;
     wal       *log;
     char       path[512];
     db_table   tables[DB_MAX_TABLES];
@@ -240,7 +243,7 @@ struct db_stmt {
     u32           placeholder_count;
 
     /* iteration state for SELECT */
-    kv_iter      *iter;
+    db_storage_iter *iter;
     int           done;         /* 1 when iteration finished */
     db_table     *table;        /* target table for SELECT */
     db_row        cur_row;      /* current row from last db_step */
@@ -891,7 +894,7 @@ static unsigned long flush_meta(db_conn *db, db_table *t) {
      * culprit observed after 000205. kv's own append-only log is the
      * durability path of record. */
     push_undo(db, key_buf, klen);
-    return kv_put(db->kv, key_buf, klen, val_buf, vlen);
+    return db->vt->put(db->storage, key_buf, klen, val_buf, vlen);
 }
 
 /* ------------------------------------------------------------------ */
@@ -932,7 +935,7 @@ static void push_undo(db_conn *db, const u8 *key, u64 klen) {
     e->klen = klen;
 
     u8 *prev = NULL; u64 plen = 0;
-    unsigned long rc = kv_get(&prev, &plen, db->kv, key, klen);
+    unsigned long rc = db->vt->get(&prev, &plen, db->storage, key, klen);
     if (rc == 0 && prev) {
         e->prev_val = prev;   /* allocated by kv_get, we own it */
         e->prev_vlen = plen;
@@ -962,7 +965,7 @@ static unsigned long wal_put(db_conn *db, const u8 *key, u64 klen,
         free(entry);
         if (rc) return 2;
     }
-    return kv_put(db->kv, key, klen, val, vlen);
+    return db->vt->put(db->storage, key, klen, val, vlen);
 }
 
 static unsigned long wal_del(db_conn *db, const u8 *key, u64 klen) {
@@ -980,7 +983,7 @@ static unsigned long wal_del(db_conn *db, const u8 *key, u64 klen) {
         free(entry);
         if (rc) return 2;
     }
-    return kv_delete(db->kv, key, klen);
+    return db->vt->del(db->storage, key, klen);
 }
 
 /* Free undo buffers (commit OR after rollback replay). */
@@ -1474,15 +1477,15 @@ static unsigned long exec_drop_table(db_conn *db, const sql_ast *ast) {
     u8 prefix[DB_MAX_KEY_LEN];
     u64 plen = build_prefix_key(prefix, sizeof(prefix), t->name);
     if (plen > 0) {
-        kv_iter *it = NULL;
-        if (kv_iter_create(&it, db->kv, prefix, plen) == 0) {
+        db_storage_iter *it = NULL;
+        if (db->vt->iter_create(&it, db->storage, prefix, plen) == 0) {
             const u8 *k; u64 kl;
             const u8 *v; u64 vl;
             /* collect keys first to avoid modifying during iteration */
             u8 *keys[4096];
             u64 klens[4096];
             u64 key_count = 0;
-            while (kv_iter_next(&k, &kl, &v, &vl, it) == 0) {
+            while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) {
                 if (key_count < 4096) {
                     keys[key_count] = malloc(kl);
                     if (keys[key_count]) {
@@ -1492,7 +1495,7 @@ static unsigned long exec_drop_table(db_conn *db, const sql_ast *ast) {
                     }
                 }
             }
-            kv_iter_destroy(it);
+            db_storage_iter_destroy(it);
             for (u64 i = 0; i < key_count; ++i) {
                 /* Row-data deletes still route through wal_del —
                  * wal_append + push_undo match how INSERT records are
@@ -1509,7 +1512,7 @@ static unsigned long exec_drop_table(db_conn *db, const sql_ast *ast) {
     u64 mlen = build_meta_key(mkey, sizeof(mkey), t->name);
     if (mlen > 0) {
         push_undo(db, mkey, mlen);
-        kv_delete(db->kv, mkey, mlen);
+        db->vt->del(db->storage, mkey, mlen);
     }
 
     /* Remove from table array */
@@ -1576,13 +1579,13 @@ static unsigned long check_unique_constraints(db_conn *db, const db_table *t,
     u64 plen = build_prefix_key(prefix, sizeof(prefix), t->name);
     if (plen == 0) return 0;
 
-    kv_iter *it = NULL;
-    if (kv_iter_create(&it, db->kv, prefix, plen) != 0) return 0;
+    db_storage_iter *it = NULL;
+    if (db->vt->iter_create(&it, db->storage, prefix, plen) != 0) return 0;
 
     const u8 *k; u64 kl;
     const u8 *v; u64 vl;
     unsigned long rc = 0;
-    while (kv_iter_next(&k, &kl, &v, &vl, it) == 0) {
+    while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) {
         if (skip_key && kl == skip_klen && memcmp(k, skip_key, kl) == 0) continue;
         db_row other;
         if (row_deserialize(&other, v, vl) != 0) continue;
@@ -1595,7 +1598,7 @@ static unsigned long check_unique_constraints(db_conn *db, const db_table *t,
         row_free(&other);
         if (rc) break;
     }
-    kv_iter_destroy(it);
+    db_storage_iter_destroy(it);
     return rc;
 }
 
@@ -1643,13 +1646,13 @@ static int parent_has_matching_row(db_conn *db, const db_table *parent,
     u8 prefix[DB_MAX_KEY_LEN];
     u64 plen = build_prefix_key(prefix, sizeof(prefix), parent->name);
     if (plen == 0) return 0;
-    kv_iter *it = NULL;
-    if (kv_iter_create(&it, db->kv, prefix, plen) != 0) return 0;
+    db_storage_iter *it = NULL;
+    if (db->vt->iter_create(&it, db->storage, prefix, plen) != 0) return 0;
 
     const u8 *k; u64 kl;
     const u8 *v; u64 vl;
     int found = 0;
-    while (kv_iter_next(&k, &kl, &v, &vl, it) == 0) {
+    while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) {
         db_row other;
         if (row_deserialize(&other, v, vl) != 0) continue;
         if (rows_match_on_cols(&other, target_col_indices,
@@ -1659,7 +1662,7 @@ static int parent_has_matching_row(db_conn *db, const db_table *parent,
         row_free(&other);
         if (found) break;
     }
-    kv_iter_destroy(it);
+    db_storage_iter_destroy(it);
     return found;
 }
 
@@ -1759,8 +1762,8 @@ static unsigned long apply_fk_on_delete(db_conn *db,
             u8 prefix[DB_MAX_KEY_LEN];
             u64 plen = build_prefix_key(prefix, sizeof(prefix), child->name);
             if (plen == 0) continue;
-            kv_iter *it = NULL;
-            if (kv_iter_create(&it, db->kv, prefix, plen) != 0) continue;
+            db_storage_iter *it = NULL;
+            if (db->vt->iter_create(&it, db->storage, prefix, plen) != 0) continue;
 
             typedef struct { u8 *k; u64 kl; u8 *v; u64 vl; i64 rowid; } child_match;
             child_match *matches = NULL;
@@ -1768,7 +1771,7 @@ static unsigned long apply_fk_on_delete(db_conn *db,
 
             const u8 *k; u64 kl;
             const u8 *v; u64 vl;
-            while (kv_iter_next(&k, &kl, &v, &vl, it) == 0) {
+            while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) {
                 db_row row;
                 if (row_deserialize(&row, v, vl) != 0) continue;
                 int match = rows_match_on_cols(&row,        fk->local_cols,
@@ -1783,7 +1786,7 @@ static unsigned long apply_fk_on_delete(db_conn *db,
                         free(matches[i].k); free(matches[i].v);
                     }
                     free(matches);
-                    kv_iter_destroy(it);
+                    db_storage_iter_destroy(it);
                     return 11;
                 }
 
@@ -1814,7 +1817,7 @@ static unsigned long apply_fk_on_delete(db_conn *db,
                 mn++;
                 row_free(&row);
             }
-            kv_iter_destroy(it);
+            db_storage_iter_destroy(it);
 
             /* Apply action for each collected match. */
             for (u64 i = 0; i < mn; ++i) {
@@ -1956,11 +1959,11 @@ static unsigned long exec_create_index(db_conn *db, const sql_ast *ast) {
     u8 prefix[DB_MAX_KEY_LEN];
     u64 plen = build_prefix_key(prefix, sizeof(prefix), t->name);
     if (plen > 0) {
-        kv_iter *it = NULL;
-        if (kv_iter_create(&it, db->kv, prefix, plen) == 0) {
+        db_storage_iter *it = NULL;
+        if (db->vt->iter_create(&it, db->storage, prefix, plen) == 0) {
             const u8 *k; u64 kl;
             const u8 *v; u64 vl;
-            while (kv_iter_next(&k, &kl, &v, &vl, it) == 0) {
+            while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) {
                 db_row row;
                 if (row_deserialize(&row, v, vl) != 0) continue;
                 /* Parse rowid from row key tail. */
@@ -1984,7 +1987,7 @@ static unsigned long exec_create_index(db_conn *db, const sql_ast *ast) {
                 if (eklen > 0) wal_put(db, key, eklen, (const u8 *)"", 0);
                 row_free(&row);
             }
-            kv_iter_destroy(it);
+            db_storage_iter_destroy(it);
         }
     }
 
@@ -2020,20 +2023,20 @@ static unsigned long exec_drop_index(db_conn *db, const sql_ast *ast) {
     int np = snprintf((char *)prefix, sizeof(prefix),
                        "%s%s/%s/", DB_IDX_PREFIX, owner->name, idx_name);
     if (np > 0 && (u64)np < sizeof(prefix)) {
-        kv_iter *it = NULL;
-        if (kv_iter_create(&it, db->kv, prefix, (u64)np) == 0) {
+        db_storage_iter *it = NULL;
+        if (db->vt->iter_create(&it, db->storage, prefix, (u64)np) == 0) {
             /* Collect keys first to avoid modifying during iteration. */
             u8 *keys[4096]; u64 klens[4096]; u64 n = 0;
             const u8 *k; u64 kl;
             const u8 *v; u64 vl;
-            while (n < 4096 && kv_iter_next(&k, &kl, &v, &vl, it) == 0) {
+            while (n < 4096 && db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) {
                 keys[n] = (u8 *)malloc(kl);
                 if (!keys[n]) break;
                 memcpy(keys[n], k, kl);
                 klens[n] = kl;
                 n++;
             }
-            kv_iter_destroy(it);
+            db_storage_iter_destroy(it);
             for (u64 i = 0; i < n; ++i) {
                 wal_del(db, keys[i], klens[i]);
                 free(keys[i]);
@@ -2053,6 +2056,118 @@ static unsigned long exec_drop_index(db_conn *db, const sql_ast *ast) {
 /*  Execute INSERT                                                     */
 /* ------------------------------------------------------------------ */
 
+/* Evaluate a SQL_AST_FUNC_CALL node into a caller-owned buffer. Only a
+ * small set of datetime helpers is supported — enough to cover
+ * cookbook's `datetime('now')` / `date('now')` / `time('now')` /
+ * `current_timestamp` usage. Other function names leave the buffer
+ * empty and return non-zero so the caller can surface the gap. */
+static int eval_func_call(char *buf, u64 buf_cap, const sql_ast *call) {
+    if (!buf || buf_cap < 20) return 1;
+    const char *fn = call->text;
+    if (!fn) return 2;
+
+    const char *fmt = NULL;
+    if (strcasecmp_a(fn, "datetime") == 0 ||
+        strcasecmp_a(fn, "current_timestamp") == 0) {
+        fmt = "%Y-%m-%d %H:%M:%S";
+    } else if (strcasecmp_a(fn, "date") == 0) {
+        fmt = "%Y-%m-%d";
+    } else if (strcasecmp_a(fn, "time") == 0) {
+        fmt = "%H:%M:%S";
+    } else {
+        buf[0] = '\0';
+        return 3;  /* unsupported function */
+    }
+
+    /* If an arg is present it must be 'now' (other modifiers not yet
+     * supported — e.g. julianday, weekday, start-of-day). */
+    if (call->child_count > 0) {
+        const char *a = call->children[0].text;
+        if (!a || strcasecmp_a(a, "now") != 0) { buf[0] = '\0'; return 4; }
+    }
+
+    time_t now = time(NULL);
+    struct tm *tm_g = gmtime(&now);
+    if (!tm_g) { buf[0] = '\0'; return 5; }
+    size_t n = strftime(buf, buf_cap, fmt, tm_g);
+    if (n == 0) { buf[0] = '\0'; return 6; }
+    return 0;
+}
+
+/* Drop the first row that collides with `new_row` on any UNIQUE/PK set.
+ * Used by INSERT OR REPLACE. Walks all rows, finds the colliding one,
+ * deletes it (row + indexes). Returns 0 if no collision found or a row
+ * was deleted; non-zero on storage error. */
+static unsigned long delete_conflicting_rows(db_conn *db, const db_table *t,
+                                              const db_row *new_row) {
+    if (t->unique_set_count == 0) return 0;
+
+    u8 prefix[DB_MAX_KEY_LEN];
+    u64 plen = build_prefix_key(prefix, sizeof(prefix), t->name);
+    if (plen == 0) return 0;
+
+    db_storage_iter *it = NULL;
+    if (db->vt->iter_create(&it, db->storage, prefix, plen) != 0) return 0;
+
+    /* Collect conflicting keys first (can't delete while iterating the
+     * engine's snapshot-backed iter, but for safety we collect-then-delete). */
+    u8   *del_keys[DB_MAX_TABLES];
+    u64   del_klens[DB_MAX_TABLES];
+    i64   del_rowids[DB_MAX_TABLES];
+    db_row del_rows[DB_MAX_TABLES];
+    u32   dcount = 0;
+
+    const u8 *k; u64 kl;
+    const u8 *v; u64 vl;
+    while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0
+           && dcount < DB_MAX_TABLES) {
+        db_row other;
+        if (row_deserialize(&other, v, vl) != 0) continue;
+        int collide = 0;
+        for (u32 i = 0; i < t->unique_set_count; ++i) {
+            if (rows_collide_on_set(&t->unique_sets[i], new_row, &other)) {
+                collide = 1; break;
+            }
+        }
+        if (!collide) { row_free(&other); continue; }
+        /* Save for delete */
+        u8 *kcp = (u8 *)malloc(kl);
+        if (!kcp) { row_free(&other); break; }
+        memcpy(kcp, k, kl);
+        del_keys[dcount] = kcp;
+        del_klens[dcount] = kl;
+        /* Parse rowid from key tail for index cleanup */
+        i64 rid = 0;
+        for (i64 j = (i64)kl - 1; j >= 0; --j) {
+            if (k[j] == '/') {
+                char tmp[32]; tmp[0] = '\0';
+                u64 nn = kl - (u64)j - 1;
+                if (nn < sizeof(tmp)) {
+                    memcpy(tmp, k + j + 1, nn); tmp[nn] = '\0';
+                    rid = strtoll(tmp, NULL, 10);
+                }
+                break;
+            }
+        }
+        del_rowids[dcount] = rid;
+        del_rows[dcount] = other;   /* transferred: we free below */
+        dcount++;
+    }
+    db_storage_iter_destroy(it);
+
+    unsigned long rc = 0;
+    for (u32 i = 0; i < dcount; i++) {
+        /* Remove index entries for this row first (same pattern as
+         * exec_delete: drop every index entry tied to this rowid). */
+        delete_row_indexes(db, t, &del_rows[i], del_rowids[i]);
+        /* Then the row itself */
+        if (wal_del(db, del_keys[i], del_klens[i]) != 0) rc = 1;
+        row_free(&del_rows[i]);
+        free(del_keys[i]);
+    }
+    return rc;
+}
+
 static unsigned long exec_insert(db_conn *db, const sql_ast *ast) {
     const char *tname = ast->text;
     if (!tname) return 1;
@@ -2060,21 +2175,36 @@ static unsigned long exec_insert(db_conn *db, const sql_ast *ast) {
     db_table *t = find_table(db, tname);
     if (!t) return 2;
 
-    /* Separate column refs and literal values from children */
+    int is_or_replace = (ast->type == SQL_AST_INSERT_OR_REPLACE);
+
+    /* Separate column refs and literal values from children. FUNC_CALL
+     * children are evaluated into per-slot scratch buffers. */
     u32 col_refs[DB_MAX_COLUMNS];
     const char *vals[DB_MAX_COLUMNS];
+    char func_scratch[DB_MAX_COLUMNS][64];
     u32 ref_count = 0, val_count = 0;
 
     for (u64 i = 0; i < ast->child_count; ++i) {
-        if (ast->children[i].type == SQL_AST_COLUMN_REF) {
+        const sql_ast *child = &ast->children[i];
+        if (child->type == SQL_AST_COLUMN_REF) {
             if (ref_count < DB_MAX_COLUMNS) {
-                int ci = col_index(t, ast->children[i].text);
+                int ci = col_index(t, child->text);
                 if (ci < 0) return 3; /* unknown column */
                 col_refs[ref_count++] = (u32)ci;
             }
-        } else if (ast->children[i].type == SQL_AST_LITERAL) {
+        } else if (child->type == SQL_AST_LITERAL) {
             if (val_count < DB_MAX_COLUMNS) {
-                vals[val_count++] = ast->children[i].text;
+                vals[val_count++] = child->text;
+            }
+        } else if (child->type == SQL_AST_FUNC_CALL) {
+            if (val_count < DB_MAX_COLUMNS) {
+                if (eval_func_call(func_scratch[val_count],
+                                    sizeof(func_scratch[val_count]),
+                                    child) != 0) {
+                    return 10;  /* unsupported or bad function call */
+                }
+                vals[val_count] = func_scratch[val_count];
+                val_count++;
             }
         }
     }
@@ -2099,6 +2229,14 @@ static unsigned long exec_insert(db_conn *db, const sql_ast *ast) {
     /* Fill in provided values */
     for (u32 i = 0; i < val_count; ++i) {
         literal_to_col(&row, col_refs[i], vals[i], t->cols[col_refs[i]].type);
+    }
+
+    /* INSERT OR REPLACE: silently drop any row that would collide with
+     * the new one on a UNIQUE/PK set. Runs before the unique check so
+     * that check sees a clean slate for `row`. */
+    if (is_or_replace) {
+        unsigned long drc = delete_conflicting_rows(db, t, &row);
+        if (drc) { row_free(&row); return drc; }
     }
 
     /* UNIQUE constraint check — all single-column UNIQUE columns and
@@ -2179,8 +2317,8 @@ static unsigned long exec_update(db_conn *db, const sql_ast *ast) {
     u64 plen = build_prefix_key(prefix, sizeof(prefix), t->name);
     if (plen == 0) return 4;
 
-    kv_iter *it = NULL;
-    unsigned long rc = kv_iter_create(&it, db->kv, prefix, plen);
+    db_storage_iter *it = NULL;
+    unsigned long rc = db->vt->iter_create(&it, db->storage, prefix, plen);
     if (rc) return 5;
 
     /* Collect matching keys and updated values */
@@ -2190,7 +2328,7 @@ static unsigned long exec_update(db_conn *db, const sql_ast *ast) {
 
     const u8 *k; u64 kl;
     const u8 *v; u64 vl;
-    while (kv_iter_next(&k, &kl, &v, &vl, it) == 0) {
+    while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) {
         db_row row;
         if (row_deserialize(&row, v, vl) != 0) continue;
 
@@ -2220,7 +2358,7 @@ static unsigned long exec_update(db_conn *db, const sql_ast *ast) {
                 free(pending[p].val);
             }
             free(pending);
-            kv_iter_destroy(it);
+            db_storage_iter_destroy(it);
             return 9;
         }
 
@@ -2232,7 +2370,7 @@ static unsigned long exec_update(db_conn *db, const sql_ast *ast) {
                 free(pending[p].val);
             }
             free(pending);
-            kv_iter_destroy(it);
+            db_storage_iter_destroy(it);
             return 10;
         }
 
@@ -2246,7 +2384,7 @@ static unsigned long exec_update(db_conn *db, const sql_ast *ast) {
         if (pend_count >= pend_cap) {
             u64 nc = pend_cap ? pend_cap * 2 : 32;
             pending_t *tmp = realloc(pending, nc * sizeof(pending_t));
-            if (!tmp) { free(pending); kv_iter_destroy(it); return 6; }
+            if (!tmp) { free(pending); db_storage_iter_destroy(it); return 6; }
             pending = tmp;
             pend_cap = nc;
         }
@@ -2260,7 +2398,7 @@ static unsigned long exec_update(db_conn *db, const sql_ast *ast) {
             pend_count++;
         }
     }
-    kv_iter_destroy(it);
+    db_storage_iter_destroy(it);
 
     /* Apply pending updates. For each row being updated, also sync
      * its secondary-index entries: delete old, write new. */
@@ -2281,7 +2419,7 @@ static unsigned long exec_update(db_conn *db, const sql_ast *ast) {
         /* Read current old value, delete its index entries. */
         if (t->index_count > 0) {
             u8 *ov = NULL; u64 ovl = 0;
-            if (kv_get(&ov, &ovl, db->kv, pending[i].key, pending[i].klen) == 0
+            if (db->vt->get(&ov, &ovl, db->storage, pending[i].key, pending[i].klen) == 0
                 && ov) {
                 db_row oldr;
                 if (row_deserialize(&oldr, ov, ovl) == 0) {
@@ -2327,8 +2465,8 @@ static unsigned long exec_delete(db_conn *db, const sql_ast *ast) {
     u64 plen = build_prefix_key(prefix, sizeof(prefix), t->name);
     if (plen == 0) return 3;
 
-    kv_iter *it = NULL;
-    unsigned long rc = kv_iter_create(&it, db->kv, prefix, plen);
+    db_storage_iter *it = NULL;
+    unsigned long rc = db->vt->iter_create(&it, db->storage, prefix, plen);
     if (rc) return 4;
 
     /* Collect keys to delete. Also verify no child FK references any
@@ -2342,7 +2480,7 @@ static unsigned long exec_delete(db_conn *db, const sql_ast *ast) {
     const u8 *k; u64 kl;
     const u8 *v; u64 vl;
     unsigned long fk_rc = 0;
-    while (kv_iter_next(&k, &kl, &v, &vl, it) == 0) {
+    while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) {
         db_row row;
         if (row_deserialize(&row, v, vl) != 0) continue;
         int match = eval_where(where_node, &row, t);
@@ -2366,7 +2504,7 @@ static unsigned long exec_delete(db_conn *db, const sql_ast *ast) {
             }
         }
     }
-    kv_iter_destroy(it);
+    db_storage_iter_destroy(it);
 
     if (fk_rc) {
         for (u64 i = 0; i < del_count; ++i) free(del_keys[i]);
@@ -2378,7 +2516,7 @@ static unsigned long exec_delete(db_conn *db, const sql_ast *ast) {
          * values, then delete index entries, then delete the row. */
         if (t->index_count > 0) {
             u8 *ov = NULL; u64 ovl = 0;
-            if (kv_get(&ov, &ovl, db->kv, del_keys[i], del_klens[i]) == 0
+            if (db->vt->get(&ov, &ovl, db->storage, del_keys[i], del_klens[i]) == 0
                 && ov) {
                 db_row oldr;
                 if (row_deserialize(&oldr, ov, ovl) == 0) {
@@ -2456,7 +2594,9 @@ static unsigned long exec_single_statement(db_conn *db, const char *sql) {
     case SQL_AST_CREATE_INDEX: rc = exec_create_index(db, ast); break;
     case SQL_AST_DROP_TABLE:   rc = exec_drop_table(db, ast);   break;
     case SQL_AST_DROP_INDEX:   rc = exec_drop_index(db, ast);   break;
-    case SQL_AST_INSERT:       rc = exec_insert(db, ast);       break;
+    case SQL_AST_INSERT:
+    case SQL_AST_INSERT_OR_REPLACE:
+                               rc = exec_insert(db, ast);       break;
     case SQL_AST_UPDATE:       rc = exec_update(db, ast);       break;
     case SQL_AST_DELETE:       rc = exec_delete(db, ast);       break;
     default:                   rc = 3; break;
@@ -2508,7 +2648,7 @@ static unsigned long parse_and_exec(db_conn *db, const char *sql) {
 /*  db_open                                                            */
 /* ------------------------------------------------------------------ */
 
-APENNINES_API unsigned long db_open(db_conn **out, const char *path) {
+APENNINES_API unsigned long db_open_ex(db_conn **out, const char *path, u32 backend) {
     if (!out)  return 1;
     if (!path) return 2;
 
@@ -2517,13 +2657,16 @@ APENNINES_API unsigned long db_open(db_conn **out, const char *path) {
 
     snprintf(db->path, sizeof(db->path), "%s", path);
 
+    if (db_storage_get_vt(&db->vt, backend) != 0) { free(db); return 7; }
+
     if (rwlock_create(&db->conn_lock) != 0) { free(db); return 6; }
     db->conn_lock_initialised = 1;
 
-    /* Open KV store */
+    /* Open storage (backend-specific file layout) */
     char kv_path[560];
-    snprintf(kv_path, sizeof(kv_path), "%s.kv", path);
-    unsigned long rc = kv_open(&db->kv, kv_path);
+    const char *suffix = (backend == DB_STORAGE_BTREE) ? ".btree" : ".kv";
+    snprintf(kv_path, sizeof(kv_path), "%s%s", path, suffix);
+    unsigned long rc = db->vt->open(&db->storage, kv_path);
     if (rc) {
         rwlock_destroy(&db->conn_lock);
         free(db);
@@ -2544,7 +2687,7 @@ APENNINES_API unsigned long db_open(db_conn **out, const char *path) {
      * Refuse to open if the header is present but magic is wrong or the
      * version is ahead of what we understand. */
     u8 *hdr_bytes = NULL; u64 hdr_len = 0;
-    unsigned long hrc = kv_get(&hdr_bytes, &hdr_len, db->kv,
+    unsigned long hrc = db->vt->get(&hdr_bytes, &hdr_len, db->storage,
                                  (const u8 *)DB_HDR_KEY, DB_HDR_KEY_LEN);
     if (hrc == 0 && hdr_bytes) {
         u16 disk_ver = 0;
@@ -2552,7 +2695,7 @@ APENNINES_API unsigned long db_open(db_conn **out, const char *path) {
         free(hdr_bytes);
         if (hpr < 0) {
             if (db->log) wal_close(db->log);
-            kv_close(db->kv);
+            db->vt->close(db->storage);
             rwlock_destroy(&db->conn_lock);
             free(db);
             return 5;  /* unsupported / corrupt header */
@@ -2565,18 +2708,18 @@ APENNINES_API unsigned long db_open(db_conn **out, const char *path) {
          * before we started writing headers. */
         u8 hdr_buf[DB_HDR_SIZE];
         hdr_serialize(hdr_buf);
-        (void)kv_put(db->kv, (const u8 *)DB_HDR_KEY, DB_HDR_KEY_LEN,
+        (void)db->vt->put(db->storage, (const u8 *)DB_HDR_KEY, DB_HDR_KEY_LEN,
                       hdr_buf, DB_HDR_SIZE);
     }
 
     /* Scan metadata keys to rebuild table registry */
-    kv_iter *it = NULL;
-    rc = kv_iter_create(&it, db->kv,
+    db_storage_iter *it = NULL;
+    rc = db->vt->iter_create(&it, db->storage,
                         (const u8 *)DB_META_PREFIX, DB_META_PREFIX_LEN);
     if (rc == 0) {
         const u8 *k; u64 kl;
         const u8 *v; u64 vl;
-        while (kv_iter_next(&k, &kl, &v, &vl, it) == 0) {
+        while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) {
             if (db->table_count >= DB_MAX_TABLES) break;
             if (kl <= DB_META_PREFIX_LEN) continue;
 
@@ -2593,11 +2736,15 @@ APENNINES_API unsigned long db_open(db_conn **out, const char *path) {
                 db->table_count++;
             }
         }
-        kv_iter_destroy(it);
+        db_storage_iter_destroy(it);
     }
 
     *out = db;
     return 0;
+}
+
+APENNINES_API unsigned long db_open(db_conn **out, const char *path) {
+    return db_open_ex(out, path, DB_STORAGE_HASHKV);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2610,7 +2757,7 @@ APENNINES_API unsigned long db_close(db_conn *db) {
     undo_clear(db);
     free(db->undo);
     if (db->log) wal_close(db->log);
-    if (db->kv)  kv_close(db->kv);
+    if (db->storage)  db->vt->close(db->storage);
     if (db->conn_lock_initialised) rwlock_destroy(&db->conn_lock);
     free(db);
     return 0;
@@ -3020,17 +3167,17 @@ static unsigned long materialise_grouped_result(db_stmt *s,
     u8 prefix[DB_MAX_KEY_LEN];
     u64 plen = build_prefix_key(prefix, sizeof(prefix), s->table->name);
     if (plen == 0) return 1;
-    kv_iter *it = NULL;
-    if (kv_iter_create(&it, s->db->kv, prefix, plen) != 0) return 2;
+    db_storage_iter *it = NULL;
+    if (s->db->vt->iter_create(&it, s->db->storage, prefix, plen) != 0) return 2;
 
     u64 cap = 16;
     db_group_bucket *buckets = (db_group_bucket *)calloc(cap, sizeof(*buckets));
-    if (!buckets) { kv_iter_destroy(it); return 3; }
+    if (!buckets) { db_storage_iter_destroy(it); return 3; }
     u64 n_buckets = 0;
 
     const u8 *k; u64 kl;
     const u8 *v; u64 vl;
-    while (kv_iter_next(&k, &kl, &v, &vl, it) == 0) {
+    while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) {
         db_row row;
         if (row_deserialize(&row, v, vl) != 0) continue;
         if (!eval_where(where_node, &row, s->table)) { row_free(&row); continue; }
@@ -3074,7 +3221,7 @@ static unsigned long materialise_grouped_result(db_stmt *s,
                         }
                     }
                     free(buckets);
-                    kv_iter_destroy(it);
+                    db_storage_iter_destroy(it);
                     return 4;
                 }
                 memset(nb + cap, 0, (nc - cap) * sizeof(*buckets));
@@ -3107,7 +3254,7 @@ static unsigned long materialise_grouped_result(db_stmt *s,
         }
         row_free(&row);
     }
-    kv_iter_destroy(it);
+    db_storage_iter_destroy(it);
 
     /* Materialise one db_row per bucket. Cols 0..group_col_count-1 are
      * the group values; the next agg_count cols are the aggregates. */
@@ -3204,19 +3351,19 @@ static unsigned long evaluate_aggregates(db_stmt *s,
     u8 prefix[DB_MAX_KEY_LEN];
     u64 plen = build_prefix_key(prefix, sizeof(prefix), s->table->name);
     if (plen == 0) return 1;
-    kv_iter *it = NULL;
-    if (kv_iter_create(&it, s->db->kv, prefix, plen) != 0) return 2;
+    db_storage_iter *it = NULL;
+    if (s->db->vt->iter_create(&it, s->db->storage, prefix, plen) != 0) return 2;
 
     const u8 *k; u64 kl;
     const u8 *v; u64 vl;
-    while (kv_iter_next(&k, &kl, &v, &vl, it) == 0) {
+    while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) {
         db_row row;
         if (row_deserialize(&row, v, vl) != 0) continue;
         if (!eval_where(where_node, &row, s->table)) { row_free(&row); continue; }
         for (u32 i = 0; i < s->agg_count; ++i) agg_update(&s->agg_specs[i], &row);
         row_free(&row);
     }
-    kv_iter_destroy(it);
+    db_storage_iter_destroy(it);
 
     memset(out, 0, sizeof(*out));
     out->col_count = s->agg_count;
@@ -3279,20 +3426,20 @@ static int cmp_rows_by_order(const void *a, const void *b) {
  * during db_step so they don't double-free).  Returns 0 on success. */
 static unsigned long materialise_ordered_result(db_stmt *s,
                                                   const sql_ast *where_node) {
-    kv_iter *it = NULL;
+    db_storage_iter *it = NULL;
     u8 prefix[DB_MAX_KEY_LEN];
     u64 plen = build_prefix_key(prefix, sizeof(prefix), s->table->name);
     if (plen == 0) return 1;
-    if (kv_iter_create(&it, s->db->kv, prefix, plen) != 0) return 2;
+    if (s->db->vt->iter_create(&it, s->db->storage, prefix, plen) != 0) return 2;
 
     u64 cap = 16;
     db_row *rows = (db_row *)calloc(cap, sizeof(db_row));
-    if (!rows) { kv_iter_destroy(it); return 3; }
+    if (!rows) { db_storage_iter_destroy(it); return 3; }
     u64 n = 0;
 
     const u8 *k; u64 kl;
     const u8 *v; u64 vl;
-    while (kv_iter_next(&k, &kl, &v, &vl, it) == 0) {
+    while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) {
         db_row row;
         if (row_deserialize(&row, v, vl) != 0) continue;
         if (!eval_where(where_node, &row, s->table)) { row_free(&row); continue; }
@@ -3303,7 +3450,7 @@ static unsigned long materialise_ordered_result(db_stmt *s,
                 row_free(&row);
                 for (u64 i = 0; i < n; ++i) row_free(&rows[i]);
                 free(rows);
-                kv_iter_destroy(it);
+                db_storage_iter_destroy(it);
                 return 4;
             }
             rows = nr;
@@ -3311,7 +3458,7 @@ static unsigned long materialise_ordered_result(db_stmt *s,
         }
         rows[n++] = row;
     }
-    kv_iter_destroy(it);
+    db_storage_iter_destroy(it);
 
     /* Sort. */
     if (n > 1) {
@@ -3645,7 +3792,9 @@ static unsigned long db_step_locked(db_stmt *s) {
     if (s->ast->type != SQL_AST_SELECT) {
         unsigned long rc = 0;
         switch (s->ast->type) {
-        case SQL_AST_INSERT:       rc = exec_insert(s->db, s->ast);       break;
+        case SQL_AST_INSERT:
+        case SQL_AST_INSERT_OR_REPLACE:
+                                   rc = exec_insert(s->db, s->ast);       break;
         case SQL_AST_UPDATE:       rc = exec_update(s->db, s->ast);       break;
         case SQL_AST_DELETE:       rc = exec_delete(s->db, s->ast);       break;
         case SQL_AST_CREATE_TABLE: rc = exec_create_table(s->db, s->ast); break;
@@ -3758,7 +3907,7 @@ static unsigned long db_step_locked(db_stmt *s) {
                 plen = build_idx_all_prefix(prefix, sizeof(prefix),
                                              s->table->name, ix->name);
             }
-            if (plen > 0 && kv_iter_create(&s->iter, s->db->kv,
+            if (plen > 0 && s->db->vt->iter_create(&s->iter, s->db->storage,
                                              prefix, plen) == 0) {
                 s->using_index = 1;
                 s->idx_plan.kind = kind;
@@ -3776,7 +3925,7 @@ static unsigned long db_step_locked(db_stmt *s) {
             u8 prefix[DB_MAX_KEY_LEN];
             u64 plen = build_prefix_key(prefix, sizeof(prefix), s->table->name);
             if (plen == 0) return 5;
-            unsigned long rc = kv_iter_create(&s->iter, s->db->kv, prefix, plen);
+            unsigned long rc = s->db->vt->iter_create(&s->iter, s->db->storage, prefix, plen);
             if (rc) return 6;
         }
     }
@@ -3793,7 +3942,7 @@ static unsigned long db_step_locked(db_stmt *s) {
      * might have further AND conditions. */
     const u8 *k; u64 kl;
     const u8 *v; u64 vl;
-    while (kv_iter_next(&k, &kl, &v, &vl, s->iter) == 0) {
+    while (db_storage_iter_next(&k, &kl, &v, &vl, s->iter) == 0) {
         db_row row;
         if (s->using_index) {
             /* RANGE plan: filter the index entry's first-col value
@@ -3820,7 +3969,7 @@ static unsigned long db_step_locked(db_stmt *s) {
                                      s->table->name, rowid);
             if (rkl == 0) continue;
             u8 *rv = NULL; u64 rvl = 0;
-            if (kv_get(&rv, &rvl, s->db->kv, row_key, rkl) != 0 || !rv) continue;
+            if (s->db->vt->get(&rv, &rvl, s->db->storage, row_key, rkl) != 0 || !rv) continue;
             int drc = row_deserialize(&row, rv, rvl);
             free(rv);
             if (drc != 0) continue;
@@ -4034,7 +4183,7 @@ APENNINES_API unsigned long db_finalize(db_stmt *s) {
     rwlock_write_lock(&db->conn_lock);
 
     if (s->have_row) row_free(&s->cur_row);
-    if (s->iter) kv_iter_destroy(s->iter);
+    if (s->iter) db_storage_iter_destroy(s->iter);
     if (s->ast) sql_ast_destroy(s->ast);
     sql_token_list_free(&s->tokens);
 
@@ -4069,7 +4218,7 @@ APENNINES_API unsigned long db_reset(db_stmt *s) {
         s->have_row = 0;
     }
     if (s->iter) {
-        kv_iter_destroy(s->iter);
+        db_storage_iter_destroy(s->iter);
         s->iter = NULL;
     }
     /* Drop any materialised ordered-result buffer — next step will
@@ -4138,14 +4287,14 @@ out:
  * re-read from the now-authoritative meta rows). */
 static unsigned long rebuild_tables_from_meta(db_conn *db) {
     db->table_count = 0;
-    kv_iter *it = NULL;
-    unsigned long rc = kv_iter_create(&it, db->kv,
+    db_storage_iter *it = NULL;
+    unsigned long rc = db->vt->iter_create(&it, db->storage,
                                         (const u8 *)DB_META_PREFIX,
                                         DB_META_PREFIX_LEN);
     if (rc) return rc;
     const u8 *k; u64 kl;
     const u8 *v; u64 vl;
-    while (kv_iter_next(&k, &kl, &v, &vl, it) == 0) {
+    while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) {
         if (db->table_count >= DB_MAX_TABLES) break;
         if (kl <= DB_META_PREFIX_LEN) continue;
         db_table *t = &db->tables[db->table_count];
@@ -4156,7 +4305,7 @@ static unsigned long rebuild_tables_from_meta(db_conn *db) {
         t->name[nlen] = '\0';
         if (meta_deserialize(t, v, vl) == 0) db->table_count++;
     }
-    kv_iter_destroy(it);
+    db_storage_iter_destroy(it);
     return 0;
 }
 
@@ -4167,10 +4316,10 @@ static unsigned long db_rollback_locked(db_conn *db) {
         db_undo_entry *e = &db->undo[(u64)i];
         if (e->existed_before) {
             /* The key had a value before this op — restore it. */
-            kv_put(db->kv, e->key, e->klen, e->prev_val, e->prev_vlen);
+            db->vt->put(db->storage, e->key, e->klen, e->prev_val, e->prev_vlen);
         } else {
             /* The key was absent — ensure it's absent again. */
-            kv_delete(db->kv, e->key, e->klen);
+            db->vt->del(db->storage, e->key, e->klen);
         }
     }
     undo_clear(db);
@@ -4228,25 +4377,25 @@ APENNINES_API unsigned long db_table_exists(int *out, db_conn *db, const char *n
 }
 
 static unsigned long db_backup_locked(db_conn *db, const char *dest_path) {
-    /* Open destination KV */
+    /* Open destination using the same backend as the source */
     char dst_kv[560];
     snprintf(dst_kv, sizeof(dst_kv), "%s.kv", dest_path);
-    kv_store *dst = NULL;
-    unsigned long rc = kv_open(&dst, dst_kv);
+    void *dst = NULL;
+    unsigned long rc = db->vt->open(&dst, dst_kv);
     if (rc) return 3;
 
     /* Copy all keys */
-    kv_iter *it = NULL;
-    rc = kv_iter_create(&it, db->kv, NULL, 0);
-    if (rc) { kv_close(dst); return 4; }
+    db_storage_iter *it = NULL;
+    rc = db->vt->iter_create(&it, db->storage, NULL, 0);
+    if (rc) { db->vt->close(dst); return 4; }
 
     const u8 *k; u64 kl;
     const u8 *v; u64 vl;
-    while (kv_iter_next(&k, &kl, &v, &vl, it) == 0) {
-        kv_put(dst, k, kl, v, vl);
+    while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) {
+        db->vt->put(dst, k, kl, v, vl);
     }
-    kv_iter_destroy(it);
-    kv_close(dst);
+    db_storage_iter_destroy(it);
+    db->vt->close(dst);
     return 0;
 }
 
@@ -4265,8 +4414,8 @@ APENNINES_API unsigned long db_vacuum(db_conn *db) {
     if (!db) return 1;
     rwlock_write_lock(&db->conn_lock);
     unsigned long rc = 0;
-    if (!db->kv) rc = 2;
-    else rc = kv_compact(db->kv);
+    if (!db->storage) rc = 2;
+    else rc = db->vt->compact(db->storage);
     rwlock_write_unlock(&db->conn_lock);
     return rc;
 }
@@ -4284,7 +4433,7 @@ static unsigned long db_integrity_check_locked(int *out_ok, db_conn *db) {
         if (mlen == 0) { *out_ok = 0; return 0; }
 
         u8 *mv = NULL; u64 mvl = 0;
-        unsigned long rc = kv_get(&mv, &mvl, db->kv, mkey, mlen);
+        unsigned long rc = db->vt->get(&mv, &mvl, db->storage, mkey, mlen);
         if (rc) { *out_ok = 0; return 0; }
 
         db_table tmp;
@@ -4301,28 +4450,28 @@ static unsigned long db_integrity_check_locked(int *out_ok, db_conn *db) {
         u64 plen = build_prefix_key(prefix, sizeof(prefix), t->name);
         if (plen == 0) { *out_ok = 0; return 0; }
 
-        kv_iter *it = NULL;
-        rc = kv_iter_create(&it, db->kv, prefix, plen);
+        db_storage_iter *it = NULL;
+        rc = db->vt->iter_create(&it, db->storage, prefix, plen);
         if (rc) { *out_ok = 0; return 0; }
 
         const u8 *k; u64 kl;
         const u8 *v; u64 vl;
-        while (kv_iter_next(&k, &kl, &v, &vl, it) == 0) {
+        while (db_storage_iter_next(&k, &kl, &v, &vl, it) == 0) {
             db_row row;
             if (row_deserialize(&row, v, vl) != 0) {
-                kv_iter_destroy(it);
+                db_storage_iter_destroy(it);
                 *out_ok = 0;
                 return 0;
             }
             if (row.col_count != t->col_count) {
                 row_free(&row);
-                kv_iter_destroy(it);
+                db_storage_iter_destroy(it);
                 *out_ok = 0;
                 return 0;
             }
             row_free(&row);
         }
-        kv_iter_destroy(it);
+        db_storage_iter_destroy(it);
     }
 
     return 0;

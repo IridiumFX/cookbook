@@ -942,20 +942,19 @@ static char *strip_descriptor(const char *body, size_t body_len,
 
 /* ==== #19: two-phase write helpers ==== */
 
-/* Get current UTC timestamp as ISO 8601 string. */
+/* Get current UTC timestamp as ISO 8601 with `T`/`Z` separators
+ * (audit log + grid signing format). cookbook_now_iso (cookbook_db.h)
+ * is the space-separated DB-bind variant; both go through the same
+ * portable strftime path, just with a different format string. */
 static void utc_now(char *buf, size_t sz) {
-#ifdef _WIN32
-    SYSTEMTIME st;
-    GetSystemTime(&st);
-    snprintf(buf, sz, "%04d-%02d-%02dT%02d:%02d:%02dZ",
-             st.wYear, st.wMonth, st.wDay,
-             st.wHour, st.wMinute, st.wSecond);
-#else
     time_t t = time(NULL);
     struct tm tm;
+#ifdef _WIN32
+    gmtime_s(&tm, &t);
+#else
     gmtime_r(&t, &tm);
-    strftime(buf, sz, "%Y-%m-%dT%H:%M:%SZ", &tm);
 #endif
+    strftime(buf, sz, "%Y-%m-%dT%H:%M:%SZ", &tm);
 }
 
 /* ==== audit log (pasta format) ==== */

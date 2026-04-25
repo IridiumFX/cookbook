@@ -1,6 +1,6 @@
 # cookbook — Roadmap
 
-**Version**: 1.0-rc4
+**Version**: 1.0-rc5
 **Status as of**: 2026-03-22
 **Spec reference**: cookbook-architecture-M1.docx (d3 final)
 
@@ -361,3 +361,36 @@ Apennines-consolidation milestone. basta + alforno submodules are gone, replaced
 - Database schema / credential format
 - Environment variable names and semantics
 - Handler code (PastaValue / pasta_* calls still work unchanged via compat)
+
+---
+
+## 1.0-rc5 Summary
+
+Pre-golden cleanup milestone. The DB story rounds out (4th backend, fully production-ready) and the SQL surface becomes truly backend-portable.
+
+**Key deltas vs rc4:**
+
+- **Apennines DB backend wired** as the 4th `cookbook_db` vtable. Two storage modes selectable via URL prefix:
+  - `apennines://<path>` — hash-KV storage. Optimised for INSERT-heavy workloads. Files: `<path>.kv` + `<path>.wal`.
+  - `apennines-btree://<path>` — B+-tree storage (apennines 000218+). Files: `<path>.btree` + `<path>.wal`. Beats sqlite on indexed SELECT (~4×), ORDER BY LIMIT (~22×), and SELECT COUNT(*) (O(1) via cached row_count). Still-3× sqlite gap on pure aggregate-scan, down from 34×.
+  - Default backend stays sqlite — opt-in for apennines per deployment.
+
+- **SQL is now backend-portable.** The 8 inline `datetime('now')` sites that used to be sqlite-specific (1 column DEFAULT + 7 INSERT/UPDATE values) are now caller-side ISO-8601 binds via the new `cookbook_now_iso(char[20])` helper in `cookbook_db.h`. Same wire format sqlite produced (`"YYYY-MM-DD HH:MM:SS"`), so existing rows stored under sqlite read back unchanged. PostgreSQL backend's `translate_sql()` no longer needs to grow rewrites for `datetime` — neutral SQL flows to all four backends. PG was previously partially broken (would fail at migration on `policies.updated_at DEFAULT (datetime('now'))`); not a regression of recent rc-work but now actually fixable.
+
+- **Apennines vendor refresh** — 15 commits across 000213–000224:
+  - `INSERT OR REPLACE` parser support; `datetime`/`date`/`time`/`current_timestamp` evaluator
+  - B+-tree storage backend with rwlock + cache_mutex split
+  - Query planner: `UPDATE`/`DELETE` via index, `LIKE 'prefix%'` index range, compound `AND` indexed-branch selection, COUNT(*) on index entries, MIN/MAX TEXT correctness
+  - SELECT DISTINCT (was parsed-but-ignored — silent gap before 000224)
+
+- **Tidy:** `utc_now()` (audit + grid timestamp helper) collapsed from a `#ifdef _WIN32 / #else` two-implementation function to a single `strftime` call with the existing `gmtime_s`/`gmtime_r` shim. Same output format, less duplicate code.
+
+- **Tests:** 597/597 pass on the default sqlite build. Live smoke green on all three apennines variants (sqlite default + apennines hash-KV + apennines-btree) — INSERT, GET, UPDATE (revoke), JWT issuance, /mirror/manifest (DISTINCT path).
+
+- **Build hygiene:** zero warnings on cookbook source (single pre-existing `__declspec(thread)` warning from apennines on MinGW, harmless).
+
+**What did NOT change:**
+- Public HTTP API surface
+- Stored DB row format (timestamps remain `"YYYY-MM-DD HH:MM:SS"` — historical sqlite values read back unchanged)
+- Handler code
+- Default backend (sqlite — flip per deploy if you want apennines)

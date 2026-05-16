@@ -1,3 +1,10 @@
+/* Feature-test macros for the Unix socket APIs we use (getaddrinfo,
+ * sockaddr_in, htons). Strict-POSIX builds on glibc/musl need these
+ * before any system header gets pulled in. Matches the apennines +
+ * iridium-store convention (see lab's recovered portability patch). */
+#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE
+
 /* cookbook-import: Import artifacts from a local directory into a cookbook
    registry. Designed for air-gapped environments (spec §A.4).
 
@@ -35,6 +42,9 @@
 #else
   #include <dirent.h>
   #include <unistd.h>
+  #include <netdb.h>          /* getaddrinfo, struct addrinfo */
+  #include <sys/socket.h>     /* socket, connect, AF_INET */
+  #include <netinet/in.h>     /* struct sockaddr_in, htons */
   #define stat_func stat
   #define stat_type struct stat
   #define PATH_SEP '/'
